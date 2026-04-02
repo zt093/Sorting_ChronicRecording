@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda / venv
+.conda/
+env/
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
