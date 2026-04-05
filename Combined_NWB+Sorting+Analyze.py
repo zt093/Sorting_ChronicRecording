@@ -1,10 +1,14 @@
+# Input files should be from a same day
+
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 from time import perf_counter
 import traceback
 
@@ -16,10 +20,10 @@ import spikeinterface.preprocessing as preproc
 import spikeinterface.sorters as ss
 import spikeinterface.widgets as sw
 
+from File_Organize import normalize_day_code
 from rec2nwb import (
     EphysToNWBConverter,
     _build_electrode_df,
-    _build_output_folder,
     _collect_data_files,
     _format_elapsed_time,
     _print_recording_channel_id_preview,
@@ -43,9 +47,6 @@ MS_BEFORE = 1.0
 MS_AFTER = 2.0
 MAX_SPIKES_PER_UNIT = 500
 MATERIALIZE_SHANK_RECORDING_AS_NUMPY = True
-ENABLE_NOISY_SEGMENT_CLEANING = False
-NOISY_SEGMENT_DURATION_SEC = 0.05
-NOISY_SEGMENT_THRESHOLD_MAD_MULTIPLIER = 6.0
 
 MS5_SORTER_PARAMS = {
     "scheme": "2",
@@ -71,6 +72,14 @@ def save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def cleanup_preprocessed_recording_folder(output_folder: Path) -> None:
+    preprocessed_folder = output_folder / "preprocessed_recording"
+    if not preprocessed_folder.exists():
+        return
+    shutil.rmtree(preprocessed_folder, ignore_errors=True)
+    print(f"Removed temporary preprocessed recording folder: {preprocessed_folder}")
 
 
 def format_elapsed_time(elapsed_sec: float) -> str:
@@ -102,75 +111,6 @@ def time_step(step_name: str, callback, *args, **kwargs):
     return result, elapsed_sec
 
 
-def infer_sorter_failure_reasons(
-    exc: Exception,
-    recording,
-    sorter_params: dict,
-    input_sources: list[Path],
-    shank_id: str,
-    window_label: str,
-) -> list[str]:
-    reasons = []
-    exc_text = f"{type(exc).__name__}: {exc}"
-    exc_text_lower = exc_text.lower()
-
-    try:
-        sampling_frequency = float(recording.get_sampling_frequency())
-    except Exception:
-        sampling_frequency = None
-    try:
-        num_frames = int(recording.get_num_frames())
-    except Exception:
-        num_frames = None
-    try:
-        num_channels = int(recording.get_num_channels())
-    except Exception:
-        num_channels = None
-
-    duration_seconds = None
-    if sampling_frequency and num_frames is not None and sampling_frequency > 0:
-        duration_seconds = float(num_frames / sampling_frequency)
-
-    if "python int too large to convert to c long" in exc_text_lower or "overflowerror" in exc_text_lower:
-        reasons.append(
-            "A large frame/sample index likely overflowed a Windows C long inside the MountainSort5/SpikeInterface stack."
-        )
-        if duration_seconds is not None and duration_seconds > HOUR_DURATION_SEC:
-            reasons.append(
-                f"This run covers about {duration_seconds / 3600.0:.2f} hours for one shank, which is much larger than a 1-hour per-file sort."
-            )
-        if num_frames is not None:
-            reasons.append(
-                f"The sorter saw {num_frames:,} frames for this shank, and some internal index math can overflow at large values."
-            )
-
-    if duration_seconds is not None and duration_seconds > HOUR_DURATION_SEC:
-        reasons.append(
-            "Even when sorting file-by-file, a single input file can still be several hours long, so per-file sorting does not guarantee a 1-hour sort."
-        )
-
-    if num_channels is not None and num_channels > 0 and duration_seconds is not None:
-        reasons.append(
-            f"Each sort processed {num_channels} channels for about {duration_seconds / 60.0:.1f} minutes on shank {shank_id}."
-        )
-
-    if len(input_sources) == 1:
-        reasons.append(
-            f"This sorter run used one input file: {input_sources[0]}"
-        )
-    elif input_sources:
-        reasons.append(
-            f"This sorter run used {len(input_sources)} input files, but the failure happened inside the per-run sorter invocation for window '{window_label}'."
-        )
-
-    if sorter_params.get("scheme2_training_duration_sec") is not None:
-        reasons.append(
-            "The script already limited MountainSort5 training duration, so a remaining overflow more likely comes from frame indexing or spike bookkeeping than from the training window itself."
-        )
-
-    return reasons
-
-
 def _safe_int_label(value) -> str:
     try:
         if value is None:
@@ -184,6 +124,68 @@ def _safe_int_label(value) -> str:
         return str(int(value))
     except Exception:
         return str(value)
+
+
+def is_overflow_sorting_error(exc: Exception) -> bool:
+    exc_text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "python int too large to convert to c long" in exc_text
+        or "overflowerror" in exc_text
+        or "overflow" in exc_text
+    )
+
+
+def parse_input_paths(raw_value: str) -> list[Path]:
+    parts = [part.strip().strip('"').strip("'") for part in re.split(r"[;\n]+", raw_value) if part.strip()]
+    if not parts:
+        raise ValueError("No recording path provided.")
+
+    input_paths = [Path(part) for part in parts]
+    missing_paths = [str(path) for path in input_paths if not path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(f"Recording path(s) not found: {missing_paths}")
+
+    return input_paths
+
+
+def collect_data_files_from_inputs(input_paths: list[Path], recording_method: str) -> list[Path]:
+    data_files = []
+    seen_paths = set()
+
+    for input_path in input_paths:
+        for data_file in _collect_data_files(input_path, recording_method):
+            data_file_resolved = data_file.resolve()
+            if data_file_resolved in seen_paths:
+                continue
+            seen_paths.add(data_file_resolved)
+            data_files.append(data_file)
+
+    if not data_files:
+        raise FileNotFoundError("No data files found in the provided input paths.")
+
+    return sorted(data_files)
+
+
+def build_batch_output_folder_for_inputs(input_paths: list[Path], data_files: list[Path]) -> Path:
+    day_codes = sorted({extract_day_code_from_data_file(data_file) for data_file in data_files})
+    if not day_codes:
+        raise ValueError("Unable to determine day code from the selected data files.")
+    if len(day_codes) != 1:
+        raise ValueError(
+            f"Expected data files from a single day, but found multiple day codes: {day_codes}"
+        )
+
+    try:
+        common_parent = Path(os.path.commonpath([str(data_file.parent) for data_file in data_files]))
+    except ValueError:
+        common_parent = data_files[0].parent
+
+    output_root = common_parent.parent if common_parent.name.endswith("_rec") else common_parent
+    return output_root / f"{day_codes[0]}_Sorting"
+
+
+def get_overflow_report_path(batch_output_folder: Path, session_description: str) -> Path:
+    return batch_output_folder / f"overflow_error_report_{session_description}.json"
 
 
 def get_sorting_unit_property(sorting, unit_id, property_name: str):
@@ -456,27 +458,45 @@ def build_numpy_recording_from_traces(traces_list: list[np.ndarray], sampling_fr
     return attach_shank_metadata(recording, electrode_df)
 
 
-def slice_recording_by_time(recording, start_sec: float, end_sec: float):
+def materialize_recording_as_numpy(recording):
+    traces = recording.get_traces()
+    channel_ids = [str(ch) for ch in recording.get_channel_ids()]
     sampling_frequency = float(recording.get_sampling_frequency())
-    total_frames = int(recording.get_num_frames())
-    start_frame = max(0, int(start_sec * sampling_frequency))
-    end_frame = min(total_frames, int(end_sec * sampling_frequency))
 
-    if end_frame <= start_frame:
-        raise ValueError(
-            f"Invalid recording slice: start_sec={start_sec}, end_sec={end_sec}, "
-            f"total_frames={total_frames}"
-        )
+    numpy_recording = si.NumpyRecording(
+        traces_list=[traces],
+        sampling_frequency=sampling_frequency,
+        channel_ids=channel_ids,
+    )
 
-    sliced_recording = recording.frame_slice(start_frame=start_frame, end_frame=end_frame)
-    return sliced_recording, {
-        "start_sec": float(start_frame / sampling_frequency),
-        "end_sec": float(end_frame / sampling_frequency),
-        "applied_duration_seconds": float((end_frame - start_frame) / sampling_frequency),
-        "start_frame": int(start_frame),
-        "end_frame": int(end_frame),
-        "applied_num_frames": int(end_frame - start_frame),
-    }
+    try:
+        gains = recording.get_channel_gains()
+        if gains is not None:
+            numpy_recording.set_channel_gains(np.asarray(gains))
+    except Exception:
+        pass
+
+    try:
+        offsets = recording.get_channel_offsets()
+        if offsets is not None:
+            numpy_recording.set_channel_offsets(np.asarray(offsets))
+    except Exception:
+        pass
+
+    for prop_key in recording.get_property_keys():
+        try:
+            numpy_recording.set_property(prop_key, recording.get_property(prop_key))
+        except Exception:
+            pass
+
+    try:
+        if hasattr(recording, "has_probe") and recording.has_probe():
+            probe = recording.get_probe()
+            numpy_recording = numpy_recording.set_probe(probe, in_place=False)
+    except Exception:
+        pass
+
+    return numpy_recording
 
 
 def preprocess_recording(recording, window_metadata: dict):
@@ -487,109 +507,19 @@ def preprocess_recording(recording, window_metadata: dict):
         freq_max=6000,
         dtype="float32",
     )
-    rec_preprocessed = rec_filt
-    noisy_segment_cleaning_metadata = {
-        "enabled": bool(ENABLE_NOISY_SEGMENT_CLEANING),
-        "mode": "remove_artifacts_cubic",
-        "segment_duration_s": float(NOISY_SEGMENT_DURATION_SEC),
-        "threshold_mad_multiplier": float(NOISY_SEGMENT_THRESHOLD_MAD_MULTIPLIER),
-        "threshold": None,
-        "num_segments": 0,
-        "num_noisy_segments": 0,
-        "num_noisy_runs": 0,
-        "noisy_segment_indices": [],
-        "noisy_runs": [],
-    }
-
-    if ENABLE_NOISY_SEGMENT_CLEANING:
-        sampling_rate = float(rec_preprocessed.get_sampling_frequency())
-        segment_samples = max(1, int(NOISY_SEGMENT_DURATION_SEC * sampling_rate))
-        total_samples = int(rec_preprocessed.get_num_frames())
-        num_segments = total_samples // segment_samples
-        noisy_segment_cleaning_metadata["num_segments"] = int(num_segments)
-
-        noisy_mask = np.zeros(num_segments, dtype=bool)
-        median_rms_per_segment = []
-
-        for seg_idx in range(num_segments):
-            start_frame = seg_idx * segment_samples
-            traces = rec_preprocessed.get_traces(
-                start_frame=start_frame,
-                end_frame=start_frame + segment_samples,
-                return_scaled=True,
-            )
-            rms_per_channel = np.sqrt(np.mean(traces ** 2, axis=0))
-            median_rms_per_segment.append(float(np.median(rms_per_channel)))
-
-        if median_rms_per_segment:
-            median_rms_per_segment = np.asarray(median_rms_per_segment, dtype=float)
-            median_rms = float(np.median(median_rms_per_segment))
-            mad_rms = float(np.median(np.abs(median_rms_per_segment - median_rms)))
-            threshold = median_rms + (NOISY_SEGMENT_THRESHOLD_MAD_MULTIPLIER * mad_rms)
-            noisy_mask = median_rms_per_segment > threshold
-            noisy_indices = np.where(noisy_mask)[0]
-            noisy_runs = []
-
-            if noisy_indices.size > 0:
-                run_start = int(noisy_indices[0])
-                run_prev = int(noisy_indices[0])
-                for idx in noisy_indices[1:]:
-                    idx = int(idx)
-                    if idx == run_prev + 1:
-                        run_prev = idx
-                    else:
-                        noisy_runs.append((run_start, run_prev))
-                        run_start = idx
-                        run_prev = idx
-                noisy_runs.append((run_start, run_prev))
-
-                for run_start, run_end in noisy_runs:
-                    start_frame = int(run_start * segment_samples)
-                    end_frame = int(min((run_end + 1) * segment_samples, total_samples))
-                    trigger = int((start_frame + end_frame) // 2)
-                    ms_before = (trigger - start_frame) * 1000.0 / sampling_rate
-                    ms_after = (end_frame - trigger) * 1000.0 / sampling_rate
-
-                    rec_preprocessed = preproc.remove_artifacts(
-                        rec_preprocessed,
-                        np.array([trigger], dtype=np.int64),
-                        ms_before=ms_before,
-                        ms_after=ms_after,
-                        mode="cubic",
-                    )
-
-            noisy_segment_cleaning_metadata.update(
-                {
-                    "threshold": float(threshold),
-                    "num_noisy_segments": int(np.sum(noisy_mask)),
-                    "num_noisy_runs": int(len(noisy_runs)),
-                    "noisy_segment_indices": [int(i) for i in np.where(noisy_mask)[0].tolist()],
-                    "noisy_runs": [[int(start), int(end)] for start, end in noisy_runs],
-                }
-            )
-            print(
-                "Noisy-segment cleaning complete: "
-                f"{noisy_segment_cleaning_metadata['num_noisy_segments']} noisy segment(s), "
-                f"{noisy_segment_cleaning_metadata['num_noisy_runs']} noisy run(s), "
-                f"threshold={threshold:.4f}"
-            )
-
     metadata = {
         "steps": ["common_reference", "bandpass_filter"],
         "params": {
             "common_reference": {"operator": "median", "reference": "global"},
             "bandpass_filter": {"freq_min": 300, "freq_max": 6000, "dtype": "float32"},
-            "noisy_segment_cleaning": noisy_segment_cleaning_metadata,
             "window": window_metadata,
         },
     }
-    if ENABLE_NOISY_SEGMENT_CLEANING:
-        metadata["steps"].append("remove_artifacts")
-    return rec_preprocessed, metadata
+    return rec_filt, metadata
 
 
 def build_shank_output_root(batch_output_folder: Path, session_description: str, shank_id: str) -> Path:
-    return batch_output_folder / f"{session_description}_sh{shank_id}"
+    return batch_output_folder / f"sh{shank_id}"
 
 
 def build_hour_output_folder(batch_output_folder: Path, session_description: str, shank_id: str, hour_index: int) -> Path:
@@ -606,7 +536,7 @@ def build_recording_output_folder(
     shank_id: str,
     recording_label: str,
 ) -> Path:
-    return build_shank_output_root(batch_output_folder, session_description, shank_id) / recording_label
+    return build_shank_output_root(batch_output_folder, session_description, shank_id) / f"{recording_label}_sh{shank_id}"
 
 
 def _remove_nwb_from_output_name(folder_name: str) -> str:
@@ -625,18 +555,35 @@ def build_recording_label(data_file: Path) -> str:
     stem = data_file.stem
     match = re.search(r"(?P<date>\d{8})_(?P<time>\d{6})", stem)
     if match:
-        date_value = match.group("date")
+        date_value = normalize_day_code(match.group("date"))
         time_value = match.group("time")
-        return f"{date_value[4:8]}_{time_value[:2]}"
+        return f"{date_value}_{time_value[:2]}"
 
     match = re.search(r"(?P<date>\d{8}).*?(?P<hour>\d{2})", stem)
     if match:
-        date_value = match.group("date")
+        date_value = normalize_day_code(match.group("date"))
         hour_value = match.group("hour")
-        return f"{date_value[4:8]}_{hour_value}"
+        return f"{date_value}_{hour_value}"
 
     sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
     return sanitized or "recording"
+
+
+def extract_day_code_from_data_file(data_file: Path) -> str:
+    label = build_recording_label(data_file)
+    day_code, _, _ = label.partition("_")
+    if not day_code:
+        raise ValueError(f"Unable to determine day code from data file: {data_file}")
+    return day_code
+
+
+def build_session_description(data_files: list[Path]) -> str:
+    recording_labels = sorted(build_recording_label(data_file) for data_file in data_files)
+    if not recording_labels:
+        return "session"
+    if len(recording_labels) == 1:
+        return recording_labels[0]
+    return f"{recording_labels[0]}_to_{recording_labels[-1]}"
 
 
 def create_shank_recording(
@@ -881,14 +828,6 @@ def run_sorter_pipeline(
             "exception_type": type(exc).__name__,
             "exception_message": str(exc),
             "traceback": traceback.format_exc(),
-            "likely_reasons": infer_sorter_failure_reasons(
-                exc=exc,
-                recording=rec_for_sorting,
-                sorter_params=sorter_params,
-                input_sources=input_sources,
-                shank_id=shank_id,
-                window_label=window_label,
-            ),
         }
         failure_summary_path = output_folder / "sorting_failure_summary.json"
         save_json(failure_summary_path, failure_summary)
@@ -1248,6 +1187,8 @@ def run_per_file_batch_for_shank(
             shank_id=shank_id,
             window_label=recording_label,
         )
+        if SAVE_PREPROCESSED_RECORDING:
+            cleanup_preprocessed_recording_folder(output_folder)
         analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(output_folder, sorting, rec_preprocessed)
         run_elapsed_sec = perf_counter() - run_start
         print_timer(f"shank_{shank_id}_{recording_label}_total", run_elapsed_sec)
@@ -1381,7 +1322,10 @@ def run_single_file_for_shank(
             shank_id=shank_id,
             window_label=recording_label,
         )
+        if SAVE_PREPROCESSED_RECORDING:
+            cleanup_preprocessed_recording_folder(output_folder)
         analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(output_folder, sorting, rec_preprocessed)
+
         run_elapsed_sec = perf_counter() - run_start
         print_timer(f"shank_{shank_id}_{recording_label}_total", run_elapsed_sec)
 
@@ -1407,6 +1351,43 @@ def run_single_file_for_shank(
                 "analysis": {
                     key: float(value) for key, value in analysis_step_timings.items()
                 },
+            },
+            "output_folder": str(output_folder),
+        }
+    except Exception as exc:
+        if not is_overflow_sorting_error(exc):
+            raise
+
+        run_elapsed_sec = perf_counter() - run_start
+        failure_summary_path = output_folder / "sorting_failure_summary.json"
+        print(
+            f"Overflow error while sorting shank {shank_id} for recording {recording_label}. "
+            "Recording the failure and continuing with the remaining work."
+        )
+        print_timer(f"shank_{shank_id}_{recording_label}_total", run_elapsed_sec)
+
+        return {
+            "shank_id": shank_id,
+            "recording_label": recording_label,
+            "input_file": str(data_file),
+            "resolved_channel_ids": [str(ch) for ch in resolved_channel_ids] if recording is not None else [],
+            "duration_seconds": float(duration_seconds) if "duration_seconds" in locals() else None,
+            "build_shank_recording_elapsed_sec": float(recording_build_elapsed_sec) if "recording_build_elapsed_sec" in locals() else 0.0,
+            "build_shank_recording_step_timings": build_step_timings if "build_step_timings" in locals() else {},
+            "preprocessing_elapsed_sec": float(preprocessing_elapsed_sec) if "preprocessing_elapsed_sec" in locals() else 0.0,
+            "sorting_elapsed_sec": 0.0,
+            "analysis_elapsed_sec": 0.0,
+            "run_total_elapsed_sec": float(run_elapsed_sec),
+            "status": "overflow_error",
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "failure_summary_path": str(failure_summary_path),
+            "step_timings": {
+                "preprocessing": {
+                    key: float(value) for key, value in (preprocessing_step_timings.items() if "preprocessing_step_timings" in locals() else [])
+                },
+                "sorting": {},
+                "analysis": {},
             },
             "output_folder": str(output_folder),
         }
@@ -1519,13 +1500,11 @@ def main() -> None:
         raise FileNotFoundError(f"Probe file not found: {PROBE_FILE}")
 
     input_start = perf_counter()
-    rec_path_str = input("\nEnter recording file path (or folder): ").strip().strip('"').strip("'")
-    if not rec_path_str:
-        raise ValueError("No recording path provided.")
-
-    rec_path = Path(rec_path_str)
-    if not rec_path.exists():
-        raise FileNotFoundError(f"Recording path not found: {rec_path}")
+    rec_path_str = input(
+        "\nEnter recording file/folder path(s) separated by semicolons: "
+    ).strip()
+    input_paths = parse_input_paths(rec_path_str)
+    rec_path = input_paths[0]
 
     first_file_only_duration_input = input(
         "Enter seconds to use from only the first recording (press Enter for all data): "
@@ -1538,20 +1517,18 @@ def main() -> None:
     print_timer("collect_user_inputs", input_elapsed_sec)
 
     collect_files_start = perf_counter()
-    data_files = _collect_data_files(rec_path, RECORDING_METHOD)
+    data_files = collect_data_files_from_inputs(input_paths, RECORDING_METHOD)
     collect_files_elapsed_sec = perf_counter() - collect_files_start
+    print(f"Input paths: {input_paths}")
     print(f"All data files: {data_files}")
     print_timer("collect_data_files", collect_files_elapsed_sec)
 
     output_setup_start = perf_counter()
-    output_root = rec_path.parent if rec_path.is_file() else rec_path.parent
-    batch_output_folder = _build_output_folder(rec_path, data_files, output_root=output_root)
-    batch_output_folder = batch_output_folder.with_name(
-        _remove_nwb_from_output_name(batch_output_folder.name)
-    )
+    batch_output_folder = build_batch_output_folder_for_inputs(input_paths, data_files)
     batch_output_folder.mkdir(parents=True, exist_ok=True)
-    session_description = batch_output_folder.name
-    print(f"Output folder: {batch_output_folder}")
+    session_description = build_session_description(data_files)
+    print(f"Daily sorting root: {batch_output_folder}")
+    print(f"Session label: {session_description}")
     print("NWB files will not be written. Sorting uses in-memory per-shank recordings.")
     output_setup_elapsed_sec = perf_counter() - output_setup_start
     print_timer("setup_output_folder", output_setup_elapsed_sec)
@@ -1568,6 +1545,7 @@ def main() -> None:
 
     batch_start_time = perf_counter()
     shank_batches = {}
+    overflow_failures = []
     for shank_config in shank_configs:
         shank_id = str(shank_config["shank_id"])
         shank_output_root = build_shank_output_root(batch_output_folder, session_description, shank_id)
@@ -1629,6 +1607,18 @@ def main() -> None:
 
         for result in file_results:
             shank_batches[str(result["shank_id"])]["runs"].append(result)
+            if result.get("status") == "overflow_error":
+                overflow_failures.append(
+                    {
+                        "shank_id": str(result["shank_id"]),
+                        "recording_label": str(result["recording_label"]),
+                        "input_file": str(result["input_file"]),
+                        "output_folder": str(result["output_folder"]),
+                        "exception_type": str(result.get("exception_type", "")),
+                        "exception_message": str(result.get("exception_message", "")),
+                        "failure_summary_path": str(result.get("failure_summary_path", "")),
+                    }
+                )
 
         file_elapsed_sec = perf_counter() - file_batch_start
         print_timer(f"recording_{recording_label}_all_shanks_total", file_elapsed_sec)
@@ -1640,7 +1630,10 @@ def main() -> None:
         wall_clock_elapsed_sec = perf_counter() - batch_summary["_batch_start_time"]
         batch_summary["wall_clock_elapsed_sec"] = float(wall_clock_elapsed_sec)
 
-        summary_path = build_shank_output_root(batch_output_folder, session_description, shank_id) / "batch_summary.json"
+        summary_path = (
+            build_shank_output_root(batch_output_folder, session_description, shank_id)
+            / f"batch_summary_{session_description}_sh{shank_id}.json"
+        )
         save_json(
             summary_path,
             {key: value for key, value in batch_summary.items() if not key.startswith("_")}
@@ -1685,6 +1678,24 @@ def main() -> None:
     batch_results.sort(key=lambda result: int(result["shank_id"]))
     total_wall_clock_elapsed_sec = perf_counter() - batch_start_time
     overall_elapsed_sec = perf_counter() - overall_start
+
+    overflow_report_path = get_overflow_report_path(batch_output_folder, session_description)
+    overflow_report = {
+        "session_description": session_description,
+        "recording_method": RECORDING_METHOD,
+        "report_scope": "batch_output_folder",
+        "report_folder": str(overflow_report_path.parent),
+        "status": "overflow_errors_detected" if overflow_failures else "no_overflow_errors",
+        "message": (
+            f"Detected {len(overflow_failures)} overflow error(s) during sorting."
+            if overflow_failures else
+            "No overflow errors were detected during sorting."
+        ),
+        "num_overflow_failures": int(len(overflow_failures)),
+        "failures": overflow_failures,
+    }
+    save_json(overflow_report_path, overflow_report)
+    print(f"Saved overflow error report to: {overflow_report_path}")
 
     total_build_shank_recording_elapsed_sec = sum(
         result["build_shank_recording_elapsed_sec"] for result in batch_results
@@ -1734,6 +1745,8 @@ def main() -> None:
         "recording_method": RECORDING_METHOD,
         "input_sources": [str(path) for path in data_files],
         "selected_shanks": [result["shank_id"] for result in batch_results],
+        "num_overflow_failures": int(len(overflow_failures)),
+        "overflow_error_report": str(overflow_report_path),
         "timing": {
             "collect_user_inputs_elapsed_sec": float(input_elapsed_sec),
             "collect_data_files_elapsed_sec": float(collect_files_elapsed_sec),
@@ -1750,7 +1763,10 @@ def main() -> None:
         },
         "shanks": batch_results,
     }
-    save_json(batch_output_folder / "combined_batch_summary.json", batch_summary)
+    save_json(
+        batch_output_folder / f"combined_batch_summary_{session_description}.json",
+        batch_summary,
+    )
 
     print(f"\nFinished combined processing in {_format_elapsed_time(total_wall_clock_elapsed_sec)}.")
 
