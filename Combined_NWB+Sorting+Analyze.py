@@ -175,12 +175,15 @@ def build_batch_output_folder_for_inputs(input_paths: list[Path], data_files: li
             f"Expected data files from a single day, but found multiple day codes: {day_codes}"
         )
 
-    try:
-        common_parent = Path(os.path.commonpath([str(data_file.parent) for data_file in data_files]))
-    except ValueError:
-        common_parent = data_files[0].parent
+    drive_roots = {Path(path.anchor) for path in input_paths if path.anchor}
+    if not drive_roots:
+        drive_roots = {Path(data_files[0].anchor)} if data_files[0].anchor else set()
+    if not drive_roots:
+        raise ValueError("Unable to determine the drive root for the selected input path(s).")
+    if len(drive_roots) != 1:
+        raise ValueError(f"Expected input paths on a single drive, but found: {sorted(str(root) for root in drive_roots)}")
 
-    output_root = common_parent.parent if common_parent.name.endswith("_rec") else common_parent
+    output_root = next(iter(drive_roots))
     return output_root / f"{day_codes[0]}_Sorting"
 
 
