@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path(r"W:\\")  # Fallback root when you want one path for both source and target.
+DEFAULT_ROOT = Path(r"H:\\")  # Fallback root when you want one path for both source and target.
 DEFAULT_TARGET_ROOT = DEFAULT_ROOT  # Final write location for organized folders.
 DEFAULT_SHANK_COUNT = 32
-DEFAULT_REC_ORGANIZATION = False  # True: move .rec files into daily *_rec folders.
+DEFAULT_REC_ORGANIZATION = True  # True: move .rec files into daily *_rec folders.
 DEFAULT_SORTING_ORGANIZATION = False  # True: organize sorting results into *_Sorting folders.
 DEFAULT_CLEANUP_EMPTY = False  # True: remove empty folders left behind after moves.
-DEFAULT_DELETE_PREPROCESS = True  # True: delete preprocessed_recording folders after organization.
+DEFAULT_DELETE_PREPROCESS = False  # True: delete preprocessed_recording folders after organization.
 DEFAULT_DELETE_FAILED_SORTING_RESULTS = False  # True: ask for a failed session label to delete.
 DEFAULT_SOURCE_ROOTS = [
     Path(r"W:\260224_Sorting"),

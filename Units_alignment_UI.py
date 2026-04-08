@@ -8,6 +8,8 @@ Usage notes for this script:
 - Merge groups are for duplicate units within the same session.
 - Align groups are for the same neuron across different sessions on the same
   SG channel page.
+- Units that fail the discard thresholds are auto-marked as discarded and
+  shown in a separate review section.
 - Noise units are excluded from the exported summary.
 - Export writes summary files only. This script no longer creates curated session
   analyzers.
@@ -49,6 +51,9 @@ DESIRED_METRICS = [
 ]
 WAVEFORM_SIMILARITY_WEIGHT = 0.8
 AMPLITUDE_SIMILARITY_WEIGHT = 0.2
+DISCARD_ABS_AMPLITUDE_MAX = 15.0
+DISCARD_SNR_MAX = 3.0
+DISCARD_ISI_VIOLATION_MIN = 2.0
 
 if Image is not None:
     try:
@@ -79,6 +84,7 @@ class UnitSummary:
     merge_group: str = ""
     align_group: str = ""
     exclude_from_auto_align: bool = False
+    is_discarded: bool = False
     is_noise: bool = False
 
 
@@ -111,6 +117,7 @@ class PageSummary:
 
 
 REVIEW_PAGE_ID = "__review__"
+DISCARDED_PAGE_ID = "__discarded__"
 
 
 @dataclass
@@ -613,6 +620,67 @@ def compute_similarity(a: UnitSummary, b: UnitSummary) -> float:
     return max(0.0, min(1.0, score))
 
 
+def is_unit_auto_discarded(unit: UnitSummary) -> bool:
+    checks = evaluate_discard_criteria(unit)
+    return checks["all_pass"]
+
+
+def evaluate_discard_criteria(unit: UnitSummary) -> dict[str, bool | float | None]:
+    amplitude = safe_float(unit.amplitude_median)
+    snr = safe_float(unit.snr)
+    isi_ratio = safe_float(unit.isi_violations_ratio)
+    if amplitude is None or snr is None or isi_ratio is None:
+        return {
+            "all_pass": False,
+            "amplitude_pass": False,
+            "snr_pass": False,
+            "isi_pass": False,
+            "amplitude_abs": abs(amplitude) if amplitude is not None else None,
+            "snr": snr,
+            "isi_value": None,
+        }
+    amplitude_pass = abs(amplitude) < DISCARD_ABS_AMPLITUDE_MAX
+    snr_pass = snr < DISCARD_SNR_MAX
+    # Use the exact same ISI value that is shown on the unit card so the
+    # displayed metric and discard logic cannot disagree.
+    isi_pass = isi_ratio > DISCARD_ISI_VIOLATION_MIN
+    return {
+        "all_pass": amplitude_pass or snr_pass or isi_pass,
+        "amplitude_pass": amplitude_pass,
+        "snr_pass": snr_pass,
+        "isi_pass": isi_pass,
+        "amplitude_abs": abs(amplitude),
+        "snr": snr,
+        "isi_value": isi_ratio,
+    }
+
+
+def build_discard_reason(unit: UnitSummary) -> str:
+    if not unit.is_discarded:
+        return ""
+    return (
+        f"|amp|<{DISCARD_ABS_AMPLITUDE_MAX:g}, "
+        f"SNR<{DISCARD_SNR_MAX:g}, "
+        f"ISI>{DISCARD_ISI_VIOLATION_MIN:g}"
+    )
+
+
+def build_discard_check_text(unit: UnitSummary) -> str:
+    checks = evaluate_discard_criteria(unit)
+    amplitude_abs = checks["amplitude_abs"]
+    snr = checks["snr"]
+    isi_value = checks["isi_value"]
+    return (
+        "Discard check: "
+        f"|amp|={format_metric(amplitude_abs)}"
+        f" (<{DISCARD_ABS_AMPLITUDE_MAX:g}: {'yes' if checks['amplitude_pass'] else 'no'}), "
+        f"SNR={format_metric(snr)}"
+        f" (<{DISCARD_SNR_MAX:g}: {'yes' if checks['snr_pass'] else 'no'}), "
+        f"ISI={format_metric(isi_value)}"
+        f" (>{DISCARD_ISI_VIOLATION_MIN:g}: {'yes' if checks['isi_pass'] else 'no'})"
+    )
+
+
 def passes_auto_align_thresholds(
     a: UnitSummary,
     b: UnitSummary,
@@ -799,13 +867,18 @@ def summarize_page_unit_counts(page: PageSummary) -> dict:
         {
             "session_name": session.session_name,
             "unit_count": len(session.units),
+            "discarded_unit_count": sum(
+                1 for unit in session.units if unit.is_discarded and not unit.is_noise
+            ),
         }
         for session in page.sessions
     ]
     total_units = sum(item["unit_count"] for item in session_counts)
+    total_discarded_units = sum(item["discarded_unit_count"] for item in session_counts)
     return {
         "session_counts": session_counts,
         "total_units": total_units,
+        "total_discarded_units": total_discarded_units,
     }
 
 
@@ -839,13 +912,13 @@ def build_page_display_rows(page: PageSummary, min_similarity: float = 0.75) -> 
         )
         return [build_row_from_units(row_units) for row_units in strict_rows], grouped_keys
 
-    non_noise_units = [unit for unit in all_units if not unit.is_noise]
-    noise_units = [unit for unit in all_units if unit.is_noise]
+    kept_units = [unit for unit in all_units if not unit.is_discarded and not unit.is_noise]
+    noise_units = [unit for unit in all_units if unit.is_noise and not unit.is_discarded]
 
     rows: list[dict[int, list[UnitSummary]]] = []
 
     manual_align_rows: dict[str, list[UnitSummary]] = {}
-    for unit in sorted(non_noise_units, key=lambda item: (item.session_index, item.unit_id)):
+    for unit in sorted(kept_units, key=lambda item: (item.session_index, item.unit_id)):
         align_name = unit.align_group.strip()
         if not align_name:
             continue
@@ -863,15 +936,15 @@ def build_page_display_rows(page: PageSummary, min_similarity: float = 0.75) -> 
         )
     )
 
-    auto_align_rows, auto_aligned_keys = build_auto_align_rows(non_noise_units)
+    auto_align_rows, auto_aligned_keys = build_auto_align_rows(kept_units)
     rows.extend(sorted(auto_align_rows, key=row_sort_key))
 
-    remaining_non_noise = [
+    remaining_kept = [
         unit
-        for unit in non_noise_units
+        for unit in kept_units
         if not unit.align_group.strip() and unit_record_key(unit) not in auto_aligned_keys
     ]
-    for unit in sorted(remaining_non_noise, key=lambda item: (item.session_index, item.unit_id)):
+    for unit in sorted(remaining_kept, key=lambda item: (item.session_index, item.unit_id)):
         rows.append(build_row_from_units([unit]))
 
     noise_rows: list[dict[int, list[UnitSummary]]] = []
@@ -930,10 +1003,14 @@ def build_pair_components(pair_ids: list[str]) -> list[set[str]]:
     return components
 
 
-def summarize_decisions(sessions: list[SessionSummary]) -> dict:
+def summarize_decisions(
+    sessions: list[SessionSummary],
+    auto_align_lookup: dict[str, str] | None = None,
+) -> dict:
     totals = {
         "total_units": 0,
         "kept_units": 0,
+        "discarded_units": 0,
         "noise_units": 0,
         "merge_groups": 0,
         "merged_units": 0,
@@ -949,12 +1026,14 @@ def summarize_decisions(sessions: list[SessionSummary]) -> dict:
             totals["total_units"] += 1
             detected_shank_ids.add(int(unit.shank_id))
 
-            if unit.is_noise:
+            if unit.is_discarded:
+                totals["discarded_units"] += 1
+            elif unit.is_noise:
                 totals["noise_units"] += 1
             else:
                 totals["kept_units"] += 1
 
-            if unit.merge_group and not unit.is_noise:
+            if unit.merge_group and not unit.is_discarded and not unit.is_noise:
                 merge_groups_by_session.setdefault(
                     (
                         int(unit.session_index),
@@ -964,12 +1043,17 @@ def summarize_decisions(sessions: list[SessionSummary]) -> dict:
                     set(),
                 ).add(int(unit.unit_id))
 
-            if unit.align_group and not unit.is_noise:
-                scoped_align_key = (
-                    f"sh{unit.shank_id}_sg{unit.sg_channel}::"
-                    f"{sanitize_token(unit.align_group)}"
-                )
-                align_groups.setdefault(scoped_align_key, set()).add(unit_record_key(unit))
+            if not unit.is_discarded and not unit.is_noise:
+                scoped_align_key = ""
+                if unit.align_group:
+                    scoped_align_key = (
+                        f"sh{unit.shank_id}_sg{unit.sg_channel}::"
+                        f"{sanitize_token(unit.align_group)}"
+                    )
+                elif auto_align_lookup is not None:
+                    scoped_align_key = auto_align_lookup.get(unit_record_key(unit), "")
+                if scoped_align_key:
+                    align_groups.setdefault(scoped_align_key, set()).add(unit_record_key(unit))
 
     for (_session_index, _channel_index, _merge_name), unit_ids in merge_groups_by_session.items():
         if len(unit_ids) < 2:
@@ -1003,9 +1087,15 @@ class AlignmentApp:
                 self.pages.values(),
                 key=lambda page: (page.shank_id, page.sg_channel),
             )
-        ] + [REVIEW_PAGE_ID]
+        ] + [DISCARDED_PAGE_ID, REVIEW_PAGE_ID]
         self.image_cache: dict[str, ImageTk.PhotoImage] = {}
         self.unit_control_vars: dict[str, dict[str, tk.Variable]] = {}
+        self._decision_state_version = 0
+        self._page_display_rows_cache: dict[tuple[str, float, int], list[dict[int, list[UnitSummary]]]] = {}
+        self._auto_align_lookup_cache: dict[tuple[float, int], dict[str, str]] = {}
+        self._render_generation = 0
+        self._image_load_job: str | None = None
+        self._pending_image_loads: list[tuple[int, ttk.Frame, str]] = []
 
         self.manifest_path = output_root / DEFAULT_EXPORT_FOLDER_NAME / "alignment_manifest.json"
         self.summary_root = output_root / DEFAULT_EXPORT_FOLDER_NAME
@@ -1033,7 +1123,12 @@ class AlignmentApp:
         self.page_listbox.pack(fill="y", expand=False)
         self.page_listbox.bind("<<ListboxSelect>>", lambda event: self._render_selected_page())
         for page_id in self.page_ids:
-            label = "Final Review" if page_id == REVIEW_PAGE_ID else self.pages[page_id].title
+            if page_id == REVIEW_PAGE_ID:
+                label = "Final Review"
+            elif page_id == DISCARDED_PAGE_ID:
+                label = "Discarded Units"
+            else:
+                label = self.pages[page_id].title
             self.page_listbox.insert("end", label)
 
         controls = ttk.Frame(sidebar)
@@ -1044,12 +1139,13 @@ class AlignmentApp:
         ttk.Button(nav_controls, text="Next", command=self.go_to_next_page, width=12).pack(side="left")
         ttk.Button(controls, text="Save Decisions", command=self.save_manifest, width=24).pack(anchor="w", pady=2)
         ttk.Button(controls, text="Export Summary", command=self.export_summary, width=24).pack(anchor="w", pady=2)
-        ttk.Button(controls, text="Reload Page", command=self._render_selected_page, width=24).pack(anchor="w", pady=2)
+        ttk.Button(controls, text="Reload Page", command=self.reload_current_page, width=24).pack(anchor="w", pady=2)
 
         info_text = (
             "Workflow\n"
             "- Merge Selected: combine units from the same session\n"
             "- Align Selected: same neuron across sessions\n"
+            "- Discarded Units: auto-flagged by amplitude/SNR/ISI thresholds\n"
             "- Mark Selected as Noise: exclude from final summary export"
         )
         ttk.Label(sidebar, text=info_text, justify="left", wraplength=190).pack(anchor="w", pady=(12, 0))
@@ -1079,6 +1175,7 @@ class AlignmentApp:
         ttk.Button(selection_buttons, text="Unalign Selected", command=self.unalign_selected_units).pack(side="left", padx=(8, 0))
         ttk.Button(selection_buttons, text="Mark Selected as Noise", command=self.mark_selected_as_noise).pack(side="left", padx=(8, 0))
         ttk.Button(selection_buttons, text="Clear Noise on Selected", command=self.clear_noise_on_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(selection_buttons, text="Debug Selected QC", command=self.debug_selected_qc).pack(side="left", padx=(8, 0))
         ttk.Button(selection_buttons, text="Clear Selection", command=self.clear_selected_units).pack(side="left", padx=(8, 0))
         self.selection_summary_var = tk.StringVar(value="Select one or more units on the current channel page, then choose an action.")
         ttk.Label(
@@ -1138,7 +1235,7 @@ class AlignmentApp:
         if not selection:
             return None
         page_id = self.page_ids[selection[0]]
-        if page_id == REVIEW_PAGE_ID:
+        if page_id in {REVIEW_PAGE_ID, DISCARDED_PAGE_ID}:
             return None
         return self.pages[page_id]
 
@@ -1147,7 +1244,7 @@ class AlignmentApp:
         if not selection:
             return None
         page_id = self.page_ids[selection[0]]
-        if page_id == REVIEW_PAGE_ID:
+        if page_id in {REVIEW_PAGE_ID, DISCARDED_PAGE_ID}:
             return None
         return page_id
 
@@ -1183,10 +1280,16 @@ class AlignmentApp:
 
     def _render_selected_page(self) -> None:
         self._apply_control_state_to_units()
+        self._start_new_render_cycle()
         selected_index = self._selected_page_index()
-        if selected_index is not None and self.page_ids[selected_index] == REVIEW_PAGE_ID:
-            self._render_review_page()
-            return
+        if selected_index is not None:
+            selected_page_id = self.page_ids[selected_index]
+            if selected_page_id == REVIEW_PAGE_ID:
+                self._render_review_page()
+                return
+            if selected_page_id == DISCARDED_PAGE_ID:
+                self._render_discarded_page()
+                return
 
         page = self._selected_page()
         for child in self.page_content.winfo_children():
@@ -1200,17 +1303,25 @@ class AlignmentApp:
         self.page_title_var.set(page.title)
         page_summary = summarize_page_unit_counts(page)
         summary_parts = [
-            f"{item['session_name']}: {item['unit_count']} unit(s)"
+            (
+                f"{item['session_name']}: {item['unit_count']} unit(s)"
+                + (
+                    f" ({item['discarded_unit_count']} discarded)"
+                    if item["discarded_unit_count"] > 0
+                    else ""
+                )
+            )
             for item in page_summary["session_counts"]
         ]
         self.status_var.set(
-            f"Total on this channel: {page_summary['total_units']} unit(s)\n"
+            f"Total on this channel: {page_summary['total_units']} unit(s)"
+            f" | Discarded on this channel: {page_summary['total_discarded_units']}\n"
             + " | ".join(summary_parts)
         )
         self._update_selection_summary(page)
         self._hide_similarity_results()
 
-        display_rows = build_page_display_rows(page)
+        display_rows = self._get_page_display_rows(page)
 
         grid_wrapper = ttk.Frame(self.page_content)
         grid_wrapper.pack(fill="both", expand=True)
@@ -1313,16 +1424,21 @@ class AlignmentApp:
                 session_card.grid(row=0, column=col_index, sticky="nsew", padx=6, pady=4)
                 units = row_units.get(session.session_index, [])
                 for unit in units:
-                    self._render_unit_card(session_card, unit)
+                    self._render_unit_card(session_card, unit, defer_image=True)
 
         self.canvas.yview_moveto(0.0)
 
+    def reload_current_page(self) -> None:
+        self._invalidate_render_caches()
+        self._render_selected_page()
+
     def _render_review_page(self) -> None:
+        self._start_new_render_cycle()
         for child in self.page_content.winfo_children():
             child.destroy()
         self._hide_similarity_results()
 
-        summary = summarize_decisions(self.sessions)
+        summary = self._summarize_decisions()
         totals = summary["totals"]
         shank_id = summary["shank_id"]
         self.page_title_var.set("Final Review")
@@ -1340,6 +1456,7 @@ class AlignmentApp:
             f"Detected shank: {shank_id if shank_id is not None else 'unknown'}\n"
             f"Total units: {totals['total_units']}\n"
             f"Kept units: {totals['kept_units']}\n"
+            f"Discarded units: {totals['discarded_units']}\n"
             f"Noise units: {totals['noise_units']}\n"
             f"Merge groups: {totals['merge_groups']}\n"
             f"Merged units involved: {totals['merged_units']}\n"
@@ -1348,7 +1465,7 @@ class AlignmentApp:
         )
         ttk.Label(totals_frame, text=totals_text, justify="left").pack(anchor="w")
 
-        kept_groups, noise_groups = self._build_review_groups()
+        kept_groups, discarded_groups, noise_groups = self._build_review_groups()
         self._render_review_group_section(
             parent=review_frame,
             title=f"Kept Final Units ({len(kept_groups)})",
@@ -1368,13 +1485,105 @@ class AlignmentApp:
         ttk.Button(footer, text="Export Summary", command=self.export_summary).pack(side="left", padx=(8, 0))
         self.canvas.yview_moveto(0.0)
 
-    def _build_review_groups(self) -> tuple[list[tuple[str, list[UnitSummary]]], list[tuple[str, list[UnitSummary]]]]:
+    def _render_discarded_page(self) -> None:
+        self._start_new_render_cycle()
+        for child in self.page_content.winfo_children():
+            child.destroy()
+        self._hide_similarity_results()
+
+        summary = self._summarize_decisions()
+        totals = summary["totals"]
+        self.page_title_var.set("Discarded Units")
+        self.status_var.set(
+            f"Auto-discarded units across all channel pages: {totals['discarded_units']}"
+        )
+        self.selection_summary_var.set("Selection actions are available on channel pages.")
+
+        discarded_frame = ttk.Frame(self.page_content, padding=8)
+        discarded_frame.pack(fill="both", expand=True)
+
+        _kept_groups, discarded_groups, _noise_groups = self._build_review_groups()
+        self._render_review_group_section(
+            parent=discarded_frame,
+            title=f"Discarded Units ({len(discarded_groups)})",
+            groups=discarded_groups,
+            empty_text="No units currently meet the discard thresholds.",
+        )
+        self.canvas.yview_moveto(0.0)
+
+    def _summarize_decisions(self) -> dict:
+        return summarize_decisions(
+            self.sessions,
+            auto_align_lookup=self._build_auto_align_lookup(),
+        )
+
+    def _start_new_render_cycle(self) -> None:
+        self._render_generation += 1
+        self._pending_image_loads.clear()
+        if self._image_load_job is not None:
+            try:
+                self.root.after_cancel(self._image_load_job)
+            except Exception:
+                pass
+            self._image_load_job = None
+
+    def _queue_image_load(self, host_frame: ttk.Frame, image_path: str) -> None:
+        self._pending_image_loads.append((self._render_generation, host_frame, image_path))
+        if self._image_load_job is None:
+            self._image_load_job = self.root.after(1, self._drain_pending_image_loads)
+
+    def _drain_pending_image_loads(self) -> None:
+        self._image_load_job = None
+        batch_size = 6
+        processed = 0
+        while self._pending_image_loads and processed < batch_size:
+            generation, host_frame, image_path = self._pending_image_loads.pop(0)
+            if generation != self._render_generation:
+                continue
+            try:
+                if not host_frame.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            try:
+                image = self._get_image(image_path)
+            except Exception:
+                continue
+            image_label = ttk.Label(host_frame, image=image)
+            image_label.image = image
+            image_label.pack(anchor="w", pady=(4, 4))
+            processed += 1
+        if self._pending_image_loads:
+            self._image_load_job = self.root.after(1, self._drain_pending_image_loads)
+
+    def _build_review_groups(
+        self,
+    ) -> tuple[
+        list[tuple[str, list[UnitSummary]]],
+        list[tuple[str, list[UnitSummary]]],
+        list[tuple[str, list[UnitSummary]]],
+    ]:
         auto_align_lookup = self._build_auto_align_lookup()
         kept_groups: dict[str, list[UnitSummary]] = {}
+        discarded_groups: dict[str, list[UnitSummary]] = {}
         noise_groups: dict[str, list[UnitSummary]] = {}
 
         for unit in self._iter_all_units():
-            if unit.is_noise:
+            if unit.is_discarded:
+                if unit.align_group:
+                    group_key = (
+                        f"discarded__sh{unit.shank_id}_sg{unit.sg_channel}"
+                        f"__align__{sanitize_token(unit.align_group)}"
+                    )
+                elif unit.merge_group:
+                    group_key = (
+                        f"discarded__s{unit.session_index:03d}_sh{unit.shank_id}_ch{unit.local_channel_on_shank}"
+                        f"__merge__{sanitize_token(unit.merge_group)}"
+                    )
+                else:
+                    group_key = f"discarded__s{unit.session_index:03d}_u{unit.unit_id}"
+                discarded_groups.setdefault(group_key, []).append(unit)
+            elif unit.is_noise:
                 if unit.align_group:
                     group_key = f"noise__sh{unit.shank_id}_sg{unit.sg_channel}__align__{sanitize_token(unit.align_group)}"
                 elif unit.merge_group:
@@ -1399,7 +1608,11 @@ class AlignmentApp:
                 ),
             )
 
-        return sort_group_items(kept_groups), sort_group_items(noise_groups)
+        return (
+            sort_group_items(kept_groups),
+            sort_group_items(discarded_groups),
+            sort_group_items(noise_groups),
+        )
 
     def _render_review_group_section(
         self,
@@ -1458,7 +1671,7 @@ class AlignmentApp:
                 session_card = ttk.LabelFrame(cells, text=session_name, padding=6)
                 session_card.grid(row=0, column=col_index, sticky="nsew", padx=6, pady=4)
                 for unit in units_by_session[(_session_index, session_name)]:
-                    self._render_unit_card(session_card, unit)
+                    self._render_unit_card(session_card, unit, defer_image=False)
 
     def _get_image(self, image_path: str):
         if image_path not in self.image_cache:
@@ -1529,6 +1742,27 @@ class AlignmentApp:
         if self.results_panel.winfo_manager():
             self.results_panel.pack_forget()
 
+    def _invalidate_render_caches(self) -> None:
+        self._page_display_rows_cache.clear()
+        self._auto_align_lookup_cache.clear()
+
+    def _mark_decisions_changed(self) -> None:
+        self._decision_state_version += 1
+        self._invalidate_render_caches()
+
+    def _get_page_display_rows(
+        self,
+        page: PageSummary,
+        min_similarity: float = 0.75,
+    ) -> list[dict[int, list[UnitSummary]]]:
+        cache_key = (page.page_id, float(min_similarity), self._decision_state_version)
+        cached_rows = self._page_display_rows_cache.get(cache_key)
+        if cached_rows is not None:
+            return cached_rows
+        display_rows = build_page_display_rows(page, min_similarity=min_similarity)
+        self._page_display_rows_cache[cache_key] = display_rows
+        return display_rows
+
     def show_selected_similarity(self) -> None:
         page, selected_units = self._selected_units_for_current_page()
         if page is None:
@@ -1548,6 +1782,45 @@ class AlignmentApp:
                     f"- {left.session_name} u{left.unit_id} <-> {right.session_name} u{right.unit_id}: {score:.3f}"
                 )
         self._show_similarity_results("\n".join(lines))
+
+    def debug_selected_qc(self) -> None:
+        page, selected_units = self._selected_units_for_current_page()
+        if page is None:
+            messagebox.showinfo("No page selected", "Open a channel page first.")
+            return
+        if not selected_units:
+            messagebox.showinfo("No units selected", "Select at least one unit first.")
+            return
+
+        selected_units = sorted(selected_units, key=lambda unit: (unit.session_index, unit.unit_id))
+        lines = [
+            "Selected unit QC debug",
+            "",
+            (
+                "Discard rule requires ANY of these:\n"
+                f"- |amplitude_median| < {DISCARD_ABS_AMPLITUDE_MAX:g}\n"
+                f"- snr < {DISCARD_SNR_MAX:g}\n"
+                f"- isi_violations_ratio > {DISCARD_ISI_VIOLATION_MIN:g}"
+            ),
+            "",
+        ]
+        for unit in selected_units:
+            checks = evaluate_discard_criteria(unit)
+            raw_isi = safe_float(unit.isi_violations_ratio)
+            lines.extend(
+                [
+                    f"{unit.session_name} | unit {unit.unit_id}",
+                    f"raw amplitude_median = {format_metric(unit.amplitude_median)}",
+                    f"raw snr = {format_metric(unit.snr)}",
+                    f"raw isi_violations_ratio = {format_metric(raw_isi)}",
+                    f"|amp| check: {'PASS' if checks['amplitude_pass'] else 'FAIL'}",
+                    f"snr check: {'PASS' if checks['snr_pass'] else 'FAIL'}",
+                    f"isi check: {'PASS' if checks['isi_pass'] else 'FAIL'}",
+                    f"final is_discarded = {'YES' if checks['all_pass'] else 'NO'}",
+                    "",
+                ]
+            )
+        messagebox.showinfo("Selected QC Debug", "\n".join(lines).strip())
 
     def clear_selected_units(self) -> None:
         page, selected_units = self._selected_units_for_current_page()
@@ -1588,6 +1861,7 @@ class AlignmentApp:
             vars_for_unit = self._ensure_unit_vars(unit)
             vars_for_unit["is_noise"].set(True)
             unit.is_noise = True
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1606,6 +1880,7 @@ class AlignmentApp:
             vars_for_unit = self._ensure_unit_vars(unit)
             vars_for_unit["is_noise"].set(False)
             unit.is_noise = False
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1717,6 +1992,7 @@ class AlignmentApp:
         if result is None:
             return
         group_name, unit_count = result
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1749,6 +2025,7 @@ class AlignmentApp:
         if result is None:
             return
         group_name, unit_count = result
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1770,6 +2047,7 @@ class AlignmentApp:
                 cleared_count += 1
             vars_for_unit["merge_group"].set("")
             unit.merge_group = ""
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1792,6 +2070,7 @@ class AlignmentApp:
             vars_for_unit["align_group"].set("")
             unit.align_group = ""
             unit.exclude_from_auto_align = True
+        self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
@@ -1809,7 +2088,7 @@ class AlignmentApp:
             }
         return self.unit_control_vars[key]
 
-    def _render_unit_card(self, parent: ttk.Frame, unit: UnitSummary) -> None:
+    def _render_unit_card(self, parent: ttk.Frame, unit: UnitSummary, *, defer_image: bool) -> None:
         vars_for_unit = self._ensure_unit_vars(unit)
         card = ttk.Frame(parent, relief="solid", padding=6)
         card.pack(fill="x", expand=True, pady=6)
@@ -1822,13 +2101,15 @@ class AlignmentApp:
             variable=vars_for_unit["selected"],
             command=self._update_selection_summary,
         ).pack(side="left")
-        if unit.merge_group or unit.align_group or unit.is_noise:
+        if unit.merge_group or unit.align_group or unit.is_discarded or unit.is_noise:
             tags = []
             if unit.merge_group:
                 tags.append(f"merge={unit.merge_group}")
             if unit.align_group:
                 tags.append(f"align={unit.align_group}")
-            if unit.is_noise:
+            if unit.is_discarded:
+                tags.append(f"discarded ({build_discard_reason(unit)})")
+            if unit.is_noise and not unit.is_discarded:
                 tags.append("noise")
             ttk.Label(select_row, text=" | ".join(tags), justify="right").pack(side="right")
 
@@ -1843,15 +2124,21 @@ class AlignmentApp:
         )
         header.pack(anchor="w")
 
-        image = self._get_image(unit.waveform_image_path)
-        image_label = ttk.Label(card, image=image)
-        image_label.image = image
-        image_label.pack(anchor="w", pady=(4, 4))
+        image_host = ttk.Frame(card)
+        image_host.pack(anchor="w", fill="x")
+        if defer_image:
+            self._queue_image_load(image_host, unit.waveform_image_path)
+        else:
+            image = self._get_image(unit.waveform_image_path)
+            image_label = ttk.Label(image_host, image=image)
+            image_label.image = image
+            image_label.pack(anchor="w", pady=(4, 4))
 
         metrics_text = (
             f"Amplitude median: {format_metric(unit.amplitude_median)}\n"
             f"ISI violation ratio: {format_metric(unit.isi_violations_ratio)}\n"
-            f"Num spikes: {format_metric(unit.num_spikes)}"
+            f"Num spikes: {format_metric(unit.num_spikes)}\n"
+            f"{build_discard_check_text(unit)}"
         )
         ttk.Label(card, text=metrics_text, justify="left").pack(anchor="w")
 
@@ -1871,7 +2158,7 @@ class AlignmentApp:
 
         grouped_units: dict[tuple[int, str], list[UnitSummary]] = {}
         for unit in self._iter_all_units():
-            if unit.is_noise:
+            if unit.is_discarded or unit.is_noise:
                 continue
             align_name = unit.align_group.strip()
             if not align_name:
@@ -1899,6 +2186,7 @@ class AlignmentApp:
             unit.merge_group = vars_for_unit["merge_group"].get().strip()
             unit.align_group = vars_for_unit["align_group"].get().strip()
             unit.is_noise = bool(vars_for_unit["is_noise"].get())
+            unit.is_discarded = is_unit_auto_discarded(unit)
         self._sync_merge_groups_from_align_groups()
 
     def save_manifest(self, show_message: bool = True) -> None:
@@ -1945,11 +2233,13 @@ class AlignmentApp:
             unit.align_group = str(saved.get("align_group", "") or "")
             unit.exclude_from_auto_align = bool(saved.get("exclude_from_auto_align", False))
             unit.is_noise = bool(saved.get("is_noise", False))
+            unit.is_discarded = is_unit_auto_discarded(unit)
             vars_for_unit = self._ensure_unit_vars(unit)
             vars_for_unit["merge_group"].set(unit.merge_group)
             vars_for_unit["align_group"].set(unit.align_group)
             vars_for_unit["is_noise"].set(unit.is_noise)
         self._sync_merge_groups_from_align_groups()
+        self._mark_decisions_changed()
 
     def export_summary(self) -> None:
         self.status_var.set(
@@ -1965,8 +2255,13 @@ class AlignmentApp:
             self._apply_control_state_to_units()
             auto_align_lookup = self._build_auto_align_lookup()
             final_groups: dict[str, list[UnitSummary]] = {}
+            discarded_groups: dict[str, list[UnitSummary]] = {}
 
             for unit in self._iter_all_units():
+                if unit.is_discarded:
+                    discard_key = self._discard_group_key_for_unit(unit)
+                    discarded_groups.setdefault(discard_key, []).append(unit)
+                    continue
                 if unit.is_noise:
                     continue
 
@@ -1975,6 +2270,7 @@ class AlignmentApp:
 
             manifest_rows = []
             unique_unit_rows = []
+            discarded_unit_rows = []
             total_groups = len(final_groups)
             for group_index, (group_key, units) in enumerate(sorted(final_groups.items()), start=1):
                 self.status_var.set(
@@ -2033,6 +2329,14 @@ class AlignmentApp:
                     }
                 )
 
+            for group_key, units in sorted(discarded_groups.items()):
+                discarded_unit_rows.append(
+                    self._build_discarded_unit_summary_row(
+                        group_key=group_key,
+                        units=units,
+                    )
+                )
+
             unique_units_json_path = self.summary_root / "unique_units_summary.json"
             unique_units_json_path.write_text(
                 json.dumps(unique_unit_rows, indent=2),
@@ -2040,6 +2344,13 @@ class AlignmentApp:
             )
             unique_units_csv_path = self.summary_root / "unique_units_summary.csv"
             self._write_unique_units_summary_csv(unique_units_csv_path, unique_unit_rows)
+            discarded_units_json_path = self.summary_root / "discarded_units_summary.json"
+            discarded_units_json_path.write_text(
+                json.dumps(discarded_unit_rows, indent=2),
+                encoding="utf-8",
+            )
+            discarded_units_csv_path = self.summary_root / "discarded_units_summary.csv"
+            self._write_discarded_units_summary_csv(discarded_units_csv_path, discarded_unit_rows)
 
             export_manifest_path = self.summary_root / "export_summary.json"
             export_manifest_path.write_text(
@@ -2048,6 +2359,8 @@ class AlignmentApp:
                         "output_root": str(self.output_root),
                         "unique_units_summary_json": str(unique_units_json_path),
                         "unique_units_summary_csv": str(unique_units_csv_path),
+                        "discarded_units_summary_json": str(discarded_units_json_path),
+                        "discarded_units_summary_csv": str(discarded_units_csv_path),
                         "cross_session_alignment_groups": manifest_rows,
                     },
                     indent=2,
@@ -2064,8 +2377,11 @@ class AlignmentApp:
                 f"- {export_manifest_path.name}\n"
                 f"- {unique_units_json_path.name}\n"
                 f"- {unique_units_csv_path.name}\n"
+                f"- {discarded_units_json_path.name}\n"
+                f"- {discarded_units_csv_path.name}\n"
                 f"- exported_units\\\n\n"
                 f"Unique final units: {len(unique_unit_rows)}\n"
+                f"Discarded groups: {len(discarded_unit_rows)}\n"
                 f"Cross-session groups kept: {len(manifest_rows)}",
             )
         except Exception as exc:
@@ -2138,6 +2454,11 @@ class AlignmentApp:
         }
 
     def _build_auto_align_lookup(self, min_similarity: float = 0.75) -> dict[str, str]:
+        cache_key = (float(min_similarity), self._decision_state_version)
+        cached_lookup = self._auto_align_lookup_cache.get(cache_key)
+        if cached_lookup is not None:
+            return cached_lookup
+
         auto_align_lookup: dict[str, str] = {}
         for page in self.pages.values():
             if page.page_id == REVIEW_PAGE_ID:
@@ -2146,7 +2467,8 @@ class AlignmentApp:
             eligible_units = [
                 unit
                 for unit in all_units
-                if not unit.is_noise
+                if not unit.is_discarded
+                and not unit.is_noise
                 and not unit.align_group.strip()
                 and not unit.exclude_from_auto_align
             ]
@@ -2161,6 +2483,7 @@ class AlignmentApp:
                 )
                 for unit in component_units:
                     auto_align_lookup[unit_record_key(unit)] = group_name
+        self._auto_align_lookup_cache[cache_key] = auto_align_lookup
         return auto_align_lookup
 
     def _final_group_key_for_unit(self, unit: UnitSummary, auto_align_lookup: dict[str, str] | None = None) -> str:
@@ -2180,6 +2503,16 @@ class AlignmentApp:
             if auto_group_name:
                 return auto_group_name
         return merge_key
+
+    def _discard_group_key_for_unit(self, unit: UnitSummary) -> str:
+        if unit.align_group:
+            return f"discarded__sh{unit.shank_id}_sg{unit.sg_channel}__align__{sanitize_token(unit.align_group)}"
+        if unit.merge_group:
+            return (
+                f"discarded__s{unit.session_index:03d}_sh{unit.shank_id}_ch{unit.local_channel_on_shank}"
+                f"__merge__{sanitize_token(unit.merge_group)}"
+            )
+        return f"discarded__s{unit.session_index:03d}_u{unit.unit_id}"
 
     def _write_unique_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
         fieldnames = [
@@ -2226,6 +2559,77 @@ class AlignmentApp:
                     }
                 )
 
+    def _build_discarded_unit_summary_row(self, *, group_key: str, units: list[UnitSummary]) -> dict:
+        sorted_units = sorted(units, key=lambda unit: (unit.session_index, unit.unit_id))
+        representative = sorted_units[0]
+        session_names = []
+        seen_session_names: set[str] = set()
+        for unit in sorted_units:
+            if unit.session_name not in seen_session_names:
+                session_names.append(unit.session_name)
+                seen_session_names.add(unit.session_name)
+
+        return {
+            "discard_group_key": group_key,
+            "status": "discarded",
+            "discard_reason": build_discard_reason(representative),
+            "shank_id": int(representative.shank_id),
+            "channel": int(representative.local_channel_on_shank),
+            "sg_channel": int(representative.sg_channel),
+            "num_sessions": len(session_names),
+            "sessions_present": session_names,
+            "num_member_units": len(sorted_units),
+            "member_units": [
+                {
+                    "session_name": unit.session_name,
+                    "session_index": int(unit.session_index),
+                    "unit_id": int(unit.unit_id),
+                    "amplitude_median": unit.amplitude_median,
+                    "snr": unit.snr,
+                    "isi_violations_ratio": unit.isi_violations_ratio,
+                    "merge_group": unit.merge_group,
+                    "align_group": unit.align_group,
+                    "waveform_image_path": unit.waveform_image_path,
+                }
+                for unit in sorted_units
+            ],
+        }
+
+    def _write_discarded_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
+        fieldnames = [
+            "status",
+            "discard_group_key",
+            "discard_reason",
+            "shank_id",
+            "channel",
+            "sg_channel",
+            "num_sessions",
+            "sessions_present",
+            "num_member_units",
+            "member_units",
+        ]
+        with csv_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "status": row["status"],
+                        "discard_group_key": row["discard_group_key"],
+                        "discard_reason": row["discard_reason"],
+                        "shank_id": row["shank_id"],
+                        "channel": row["channel"],
+                        "sg_channel": row["sg_channel"],
+                        "num_sessions": row["num_sessions"],
+                        "sessions_present": "; ".join(row["sessions_present"]),
+                        "num_member_units": row["num_member_units"],
+                        "member_units": "; ".join(
+                            f"{item['session_name']}:u{item['unit_id']}"
+                            for item in row["member_units"]
+                        ),
+                    }
+                )
+
     def _build_group_summary_text(self, group_index: int, group_key: str, units: list[UnitSummary]) -> str:
         session_names = []
         seen_session_names: set[str] = set()
@@ -2253,6 +2657,7 @@ class AlignmentApp:
                     f"  isi_violations_ratio={format_metric(unit.isi_violations_ratio)}",
                     f"  snr={format_metric(unit.snr)}",
                     f"  num_spikes={format_metric(unit.num_spikes)}",
+                    f"  is_discarded={unit.is_discarded}",
                     f"  merge_group={unit.merge_group or '<none>'}",
                     f"  align_group={unit.align_group or '<none>'}",
                     f"  analyzer_folder={unit.analyzer_folder}",
