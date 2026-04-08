@@ -1279,7 +1279,6 @@ class AlignmentApp:
         self._select_page_index(current_index + 1)
 
     def _render_selected_page(self) -> None:
-        self._apply_control_state_to_units()
         self._start_new_render_cycle()
         selected_index = self._selected_page_index()
         if selected_index is not None:
@@ -1697,13 +1696,12 @@ class AlignmentApp:
         page = self._selected_page()
         if page is None:
             return None, []
-        units_lookup = self._units_by_key()
         selected_units: list[UnitSummary] = []
         for session in page.sessions:
             for unit in session.units:
                 vars_for_unit = self._ensure_unit_vars(unit)
                 if bool(vars_for_unit["selected"].get()):
-                    selected_units.append(units_lookup[unit_record_key(unit)])
+                    selected_units.append(unit)
         return page, selected_units
 
     def _update_selection_summary(self, page: PageSummary | None = None) -> None:
@@ -1829,7 +1827,6 @@ class AlignmentApp:
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
         self._hide_similarity_results()
-        self._render_selected_page()
 
     def _clear_selection_for_units(self, units: list[UnitSummary]) -> None:
         for unit in units:
