@@ -25,6 +25,7 @@ import re
 import tkinter as tk
 import traceback
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,9 +50,14 @@ DESIRED_METRICS = [
     "snr",
     "num_spikes",
 ]
-WAVEFORM_SIMILARITY_WEIGHT = 0.8
-AMPLITUDE_SIMILARITY_WEIGHT = 0.2
-DISCARD_ABS_AMPLITUDE_MAX = 15.0
+WAVEFORM_SIMILARITY_WEIGHT = 0.70
+AMPLITUDE_SIMILARITY_WEIGHT = 0.15
+TROUGH_TO_PEAK_SIMILARITY_WEIGHT = 0.15
+AUTOCORRELOGRAM_SIMILARITY_WEIGHT = 0.15
+AUTOCORRELOGRAM_MIN_SIMILARITY = 0.75
+TROUGH_TO_PEAK_TOLERANCE_MS = 0.15
+AUTO_MERGE_MIN_SIMILARITY = 0.90
+DISCARD_ABS_AMPLITUDE_MAX = 50.0
 DISCARD_SNR_MAX = 3.0
 DISCARD_ISI_VIOLATION_MIN = 2.0
 
@@ -80,6 +86,8 @@ class UnitSummary:
     snr: float | None
     num_spikes: int | None
     waveform_similarity_vector: list[float]
+    autocorrelogram_similarity_vector: list[float]
+    trough_to_peak_duration_ms: float | None
     waveform_image_path: str
     merge_group: str = ""
     align_group: str = ""
@@ -399,6 +407,74 @@ def get_waveform_vector(analyzer, unit_id) -> np.ndarray:
     return single_channel_mean / norm
 
 
+def get_trough_to_peak_duration_ms(analyzer, unit_id) -> float | None:
+    waveforms_ext = analyzer.get_extension("waveforms")
+    waveforms = waveforms_ext.get_waveforms_one_unit(unit_id)
+    if waveforms is None or getattr(waveforms, "size", 0) == 0:
+        return None
+
+    mean_waveform = waveforms.mean(axis=0)
+    channel_index = int(np.argmax(np.max(np.abs(mean_waveform), axis=0)))
+    single_channel_mean = mean_waveform[:, channel_index].astype(float)
+    if single_channel_mean.size < 2:
+        return None
+
+    trough_index = int(np.argmin(single_channel_mean))
+    if trough_index >= single_channel_mean.size - 1:
+        return None
+
+    post_trough = single_channel_mean[trough_index + 1 :]
+    if post_trough.size == 0:
+        return None
+
+    peak_index = trough_index + 1 + int(np.argmax(post_trough))
+
+    try:
+        sampling_frequency = float(analyzer.sampling_frequency)
+    except Exception:
+        try:
+            sampling_frequency = float(analyzer.get_sampling_frequency())
+        except Exception:
+            return None
+
+    if sampling_frequency <= 0:
+        return None
+
+    duration_ms = ((peak_index - trough_index) / sampling_frequency) * 1000.0
+    return float(duration_ms)
+
+
+def get_autocorrelogram_vector(analyzer, unit_id) -> np.ndarray:
+    if not analyzer.has_extension("correlograms"):
+        return np.zeros(1, dtype=float)
+
+    try:
+        correlograms, _bins = analyzer.get_extension("correlograms").get_data()
+    except Exception:
+        return np.zeros(1, dtype=float)
+
+    unit_ids = list(analyzer.sorting.get_unit_ids())
+    if unit_id not in unit_ids:
+        return np.zeros(1, dtype=float)
+
+    unit_index = unit_ids.index(unit_id)
+    if unit_index >= correlograms.shape[0]:
+        return np.zeros(1, dtype=float)
+
+    autocorr = np.asarray(correlograms[unit_index, unit_index], dtype=float).copy()
+    if autocorr.size == 0:
+        return np.zeros(1, dtype=float)
+
+    center_index = autocorr.size // 2
+    if 0 <= center_index < autocorr.size:
+        autocorr[center_index] = 0.0
+
+    norm = np.linalg.norm(autocorr)
+    if norm == 0:
+        return autocorr
+    return autocorr / norm
+
+
 def save_waveform_card_image(
     analyzer,
     unit_id: int,
@@ -498,6 +574,8 @@ def load_all_sessions(
             )
             metrics = metrics_lookup.get(unit_id_int, {})
             waveform_vector = get_waveform_vector(analyzer, unit_id)
+            autocorrelogram_vector = get_autocorrelogram_vector(analyzer, unit_id)
+            trough_to_peak_duration_ms = get_trough_to_peak_duration_ms(analyzer, unit_id)
             preferred_image_path = find_unit_summary_image(output_folder, unit_id_int)
             image_path = (
                 cache_folder
@@ -530,6 +608,8 @@ def load_all_sessions(
                 snr=safe_float(metrics.get("snr")),
                 num_spikes=safe_int(metrics.get("num_spikes")),
                 waveform_similarity_vector=waveform_vector.tolist(),
+                autocorrelogram_similarity_vector=autocorrelogram_vector.tolist(),
+                trough_to_peak_duration_ms=trough_to_peak_duration_ms,
                 waveform_image_path=str(preferred_image_path or image_path),
             )
             session_summary.units.append(unit_summary)
@@ -610,14 +690,60 @@ def compute_waveform_similarity(a: UnitSummary, b: UnitSummary) -> float:
     return max(0.0, min(1.0, waveform_score))
 
 
+def compute_trough_to_peak_similarity(a: UnitSummary, b: UnitSummary) -> float:
+    duration_a = safe_float(a.trough_to_peak_duration_ms)
+    duration_b = safe_float(b.trough_to_peak_duration_ms)
+    if duration_a is None or duration_b is None:
+        return 0.0
+
+    difference_ms = abs(duration_a - duration_b)
+    if TROUGH_TO_PEAK_TOLERANCE_MS <= 0:
+        return 1.0 if difference_ms == 0 else 0.0
+
+    score = 1.0 - (difference_ms / TROUGH_TO_PEAK_TOLERANCE_MS)
+    return max(0.0, min(1.0, score))
+
+
 def compute_similarity(a: UnitSummary, b: UnitSummary) -> float:
     waveform_score = compute_waveform_similarity(a, b)
     amplitude_score = compute_amplitude_similarity(a, b)
+    autocorrelogram_score = compute_autocorrelogram_similarity(a, b)
     score = (
         WAVEFORM_SIMILARITY_WEIGHT * waveform_score
         + AMPLITUDE_SIMILARITY_WEIGHT * amplitude_score
+        # Trough-to-peak is temporarily disabled from similarity scoring.
+        # + TROUGH_TO_PEAK_SIMILARITY_WEIGHT * trough_to_peak_score
+        + AUTOCORRELOGRAM_SIMILARITY_WEIGHT * autocorrelogram_score
     )
     return max(0.0, min(1.0, score))
+
+
+def compute_autocorrelogram_similarity(a: UnitSummary, b: UnitSummary) -> float:
+    va = np.asarray(a.autocorrelogram_similarity_vector, dtype=float)
+    vb = np.asarray(b.autocorrelogram_similarity_vector, dtype=float)
+    if va.size == 0 or vb.size == 0:
+        return 0.0
+    length = min(va.size, vb.size)
+    va = va[:length]
+    vb = vb[:length]
+    na = np.linalg.norm(va)
+    nb = np.linalg.norm(vb)
+    if na == 0 or nb == 0:
+        return 0.0
+    score = float(np.dot(va, vb) / (na * nb))
+    return max(0.0, min(1.0, score))
+
+
+def passes_trough_to_peak_duration_threshold(
+    a: UnitSummary,
+    b: UnitSummary,
+    max_difference_ms: float = TROUGH_TO_PEAK_TOLERANCE_MS,
+) -> bool:
+    duration_a = safe_float(a.trough_to_peak_duration_ms)
+    duration_b = safe_float(b.trough_to_peak_duration_ms)
+    if duration_a is None or duration_b is None:
+        return False
+    return abs(duration_a - duration_b) <= max_difference_ms
 
 
 def is_unit_auto_discarded(unit: UnitSummary) -> bool:
@@ -686,12 +812,22 @@ def passes_auto_align_thresholds(
     b: UnitSummary,
     min_waveform_similarity: float = 0.75,
     min_amplitude_similarity: float = 0.75,
+    min_autocorrelogram_similarity: float = AUTOCORRELOGRAM_MIN_SIMILARITY,
+    max_trough_to_peak_difference_ms: float = TROUGH_TO_PEAK_TOLERANCE_MS,
 ) -> bool:
     waveform_score = compute_waveform_similarity(a, b)
     amplitude_score = compute_amplitude_similarity(a, b)
+    autocorrelogram_score = compute_autocorrelogram_similarity(a, b)
     return (
         waveform_score >= min_waveform_similarity
         and amplitude_score >= min_amplitude_similarity
+        and autocorrelogram_score >= min_autocorrelogram_similarity
+        # Trough-to-peak is temporarily disabled from auto-align gating.
+        # and passes_trough_to_peak_duration_threshold(
+        #     a,
+        #     b,
+        #     max_difference_ms=max_trough_to_peak_difference_ms,
+        # )
     )
 
 
@@ -700,114 +836,81 @@ def build_strict_auto_align_rows(
     min_similarity: float = 0.75,
 ) -> tuple[list[list[UnitSummary]], set[str]]:
     eligible_units = sorted(units, key=lambda item: (item.session_index, item.unit_id))
-    candidate_pairs: list[tuple[float, float, float, str, str]] = []
-    for i, left in enumerate(eligible_units):
-        for right in eligible_units[i + 1:]:
-            if left.session_index == right.session_index:
-                continue
-            if passes_auto_align_thresholds(
-                left,
-                right,
-                min_waveform_similarity=min_similarity,
-                min_amplitude_similarity=min_similarity,
-            ):
-                candidate_pairs.append(
-                    (
-                        compute_similarity(left, right),
-                        compute_waveform_similarity(left, right),
-                        compute_amplitude_similarity(left, right),
-                        unit_record_key(left),
-                        unit_record_key(right),
-                    )
-                )
-
     units_lookup = {unit_record_key(unit): unit for unit in eligible_units}
-    strict_rows: list[list[UnitSummary]] = []
     grouped_keys: set[str] = set()
-    unit_to_row_index: dict[str, int] = {}
+    session_to_units: dict[int, list[UnitSummary]] = {}
+    for unit in eligible_units:
+        session_to_units.setdefault(int(unit.session_index), []).append(unit)
+
+    sorted_session_indices = sorted(session_to_units)
+    candidate_pairs: list[tuple[float, float, float, float, str, str]] = []
+    for left_index, left_session_index in enumerate(sorted_session_indices):
+        for right_session_index in sorted_session_indices[left_index + 1 :]:
+            for left in session_to_units[left_session_index]:
+                for right in session_to_units[right_session_index]:
+                    if not passes_auto_align_thresholds(
+                        left,
+                        right,
+                        min_waveform_similarity=min_similarity,
+                        min_amplitude_similarity=min_similarity,
+                        min_autocorrelogram_similarity=AUTOCORRELOGRAM_MIN_SIMILARITY,
+                    ):
+                        continue
+                    candidate_pairs.append(
+                        (
+                            compute_similarity(left, right),
+                            compute_waveform_similarity(left, right),
+                            compute_amplitude_similarity(left, right),
+                            compute_autocorrelogram_similarity(left, right),
+                            unit_record_key(left),
+                            unit_record_key(right),
+                        )
+                    )
 
     candidate_pairs.sort(
-        key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4])
+        key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[5])
     )
 
-    def can_add_to_row(unit: UnitSummary, row_units: list[UnitSummary]) -> bool:
-        if any(existing.session_index == unit.session_index for existing in row_units):
-            return False
-        return all(
-            passes_auto_align_thresholds(
-                unit,
-                existing,
-                min_waveform_similarity=min_similarity,
-                min_amplitude_similarity=min_similarity,
-            )
-            for existing in row_units
-        )
+    components: dict[str, set[str]] = {
+        unit_record_key(unit): {unit_record_key(unit)}
+        for unit in eligible_units
+    }
+    component_sessions: dict[str, set[int]] = {
+        unit_record_key(unit): {int(unit.session_index)}
+        for unit in eligible_units
+    }
+    component_for_key: dict[str, str] = {
+        unit_record_key(unit): unit_record_key(unit)
+        for unit in eligible_units
+    }
 
-    for _score, _waveform_score, _amplitude_score, left_key, right_key in candidate_pairs:
-        left = units_lookup.get(left_key)
-        right = units_lookup.get(right_key)
-        if left is None or right is None:
+    for _score, _waveform_score, _amplitude_score, _autocorr_score, left_key, right_key in candidate_pairs:
+        left_component_key = component_for_key[left_key]
+        right_component_key = component_for_key[right_key]
+        if left_component_key == right_component_key:
             continue
 
-        left_row_index = unit_to_row_index.get(left_key)
-        right_row_index = unit_to_row_index.get(right_key)
-
-        if left_row_index is None and right_row_index is None:
-            row_index = len(strict_rows)
-            strict_rows.append([left, right])
-            unit_to_row_index[left_key] = row_index
-            unit_to_row_index[right_key] = row_index
+        left_sessions = component_sessions[left_component_key]
+        right_sessions = component_sessions[right_component_key]
+        if left_sessions & right_sessions:
             continue
 
-        if left_row_index is not None and right_row_index is None:
-            row_units = strict_rows[left_row_index]
-            if can_add_to_row(right, row_units):
-                row_units.append(right)
-                unit_to_row_index[right_key] = left_row_index
-            continue
+        merged_keys = components[left_component_key] | components[right_component_key]
+        merged_sessions = left_sessions | right_sessions
 
-        if left_row_index is None and right_row_index is not None:
-            row_units = strict_rows[right_row_index]
-            if can_add_to_row(left, row_units):
-                row_units.append(left)
-                unit_to_row_index[left_key] = right_row_index
-            continue
+        components[left_component_key] = merged_keys
+        component_sessions[left_component_key] = merged_sessions
+        for member_key in merged_keys:
+            component_for_key[member_key] = left_component_key
 
-        if left_row_index == right_row_index:
-            continue
-
-        left_row_units = strict_rows[left_row_index]
-        right_row_units = strict_rows[right_row_index]
-        same_session_overlap = {
-            unit.session_index for unit in left_row_units
-        } & {
-            unit.session_index for unit in right_row_units
-        }
-        if same_session_overlap:
-            continue
-        if not all(
-            passes_auto_align_thresholds(
-                left_unit,
-                right_unit,
-                min_waveform_similarity=min_similarity,
-                min_amplitude_similarity=min_similarity,
-            )
-            for left_unit in left_row_units
-            for right_unit in right_row_units
-        ):
-            continue
-
-        merged_row = sorted(
-            left_row_units + right_row_units,
-            key=lambda item: (item.session_index, item.unit_id),
-        )
-        strict_rows[left_row_index] = merged_row
-        strict_rows[right_row_index] = []
-        for unit in merged_row:
-            unit_to_row_index[unit_record_key(unit)] = left_row_index
+        del components[right_component_key]
+        del component_sessions[right_component_key]
 
     final_rows: list[list[UnitSummary]] = []
-    for row_units in strict_rows:
+    for component_keys in components.values():
+        if len(component_keys) < 2:
+            continue
+        row_units = [units_lookup[key] for key in component_keys if key in units_lookup]
         if len(row_units) < 2:
             continue
         sorted_row = sorted(row_units, key=lambda item: (item.session_index, item.unit_id))
@@ -1096,6 +1199,11 @@ class AlignmentApp:
         self._render_generation = 0
         self._image_load_job: str | None = None
         self._pending_image_loads: list[tuple[int, ttk.Frame, str]] = []
+        self._current_page_alias_map: dict[str, UnitSummary] = {}
+        self._current_page_alias_by_unit_key: dict[str, str] = {}
+        self._current_row_alias_map: dict[str, list[UnitSummary]] = {}
+        self._undo_stack: list[dict[str, dict[str, Any]]] = []
+        self._redo_stack: list[dict[str, dict[str, Any]]] = []
 
         self.manifest_path = output_root / DEFAULT_EXPORT_FOLDER_NAME / "alignment_manifest.json"
         self.summary_root = output_root / DEFAULT_EXPORT_FOLDER_NAME
@@ -1143,10 +1251,11 @@ class AlignmentApp:
 
         info_text = (
             "Workflow\n"
-            "- Merge Selected: combine units from the same session\n"
-            "- Align Selected: same neuron across sessions\n"
+            "- Use commands with page-local IDs like u1, u2\n"
+            "- align: same neuron across sessions\n"
+            "- merge: combine units from the same session\n"
             "- Discarded Units: auto-flagged by amplitude/SNR/ISI thresholds\n"
-            "- Mark Selected as Noise: exclude from final summary export"
+            "- noise: exclude units from final summary export"
         )
         ttk.Label(sidebar, text=info_text, justify="left", wraplength=190).pack(anchor="w", pady=(12, 0))
 
@@ -1165,25 +1274,44 @@ class AlignmentApp:
         )
         status_label.pack(anchor="w", fill="x", pady=(6, 8))
 
-        self.selection_panel = ttk.LabelFrame(main, text="Selection Actions", padding=8)
+        self.selection_panel = ttk.LabelFrame(main, text="Command Actions", padding=8)
         self.selection_panel.pack(fill="x", expand=False, pady=(0, 8))
-        selection_buttons = ttk.Frame(self.selection_panel)
-        selection_buttons.pack(fill="x")
-        ttk.Button(selection_buttons, text="Merge Selected", command=self.merge_selected_units).pack(side="left")
-        ttk.Button(selection_buttons, text="Unmerge Selected", command=self.unmerge_selected_units).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Align Selected", command=self.align_selected_units).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Unalign Selected", command=self.unalign_selected_units).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Mark Selected as Noise", command=self.mark_selected_as_noise).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Clear Noise on Selected", command=self.clear_noise_on_selected).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Debug Selected QC", command=self.debug_selected_qc).pack(side="left", padx=(8, 0))
-        ttk.Button(selection_buttons, text="Clear Selection", command=self.clear_selected_units).pack(side="left", padx=(8, 0))
-        self.selection_summary_var = tk.StringVar(value="Select one or more units on the current channel page, then choose an action.")
+        command_row = ttk.Frame(self.selection_panel)
+        command_row.pack(fill="x")
+        command_buttons = ttk.Frame(self.selection_panel)
+        command_buttons.pack(fill="x", pady=(6, 0))
+        self.command_text = tk.Text(self.selection_panel, height=4, wrap="word")
+        self.command_text.pack(fill="x", expand=False, pady=(6, 0))
+        self.command_text.bind("<Control-Return>", lambda event: self.apply_command_batch() or "break")
+        ttk.Button(command_row, text="Apply Commands", command=self.apply_command_batch).pack(side="left")
+        ttk.Button(command_row, text="Undo", command=self.undo_last_change).pack(side="left", padx=(8, 0))
+        ttk.Button(command_row, text="Redo", command=self.redo_last_change).pack(side="left", padx=(8, 0))
+        ttk.Button(command_row, text="Clear Commands", command=self.clear_command_text).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Align", command=lambda: self.insert_command_template("align")).pack(side="left")
+        ttk.Button(command_buttons, text="Unalign", command=lambda: self.insert_command_template("unalign")).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Merge", command=lambda: self.insert_command_template("merge")).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Unmerge", command=lambda: self.insert_command_template("unmerge")).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Noise", command=lambda: self.insert_command_template("noise")).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Clear Noise", command=lambda: self.insert_command_template("clear_noise")).pack(side="left", padx=(8, 0))
+        ttk.Button(command_buttons, text="Similarity", command=lambda: self.insert_command_template("similarity")).pack(side="left", padx=(8, 0))
+        self.command_summary_var = tk.StringVar(
+            value=(
+                "Use page-local IDs like u1 or row IDs like r1. Example commands:\n"
+                "align u1 u3\n"
+                "align r2 r5\n"
+                "unalign r3\n"
+                "merge r4\n"
+                "noise u7\n"
+                "clear_noise r6\n"
+                "similarity u1 u2"
+            )
+        )
         ttk.Label(
             self.selection_panel,
-            textvariable=self.selection_summary_var,
+            textvariable=self.command_summary_var,
             justify="left",
             wraplength=1150,
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(6, 6))
 
         self.results_panel = ttk.LabelFrame(main, text="Selected Unit Similarity", padding=8)
 
@@ -1264,6 +1392,304 @@ class AlignmentApp:
         self.page_listbox.see(index)
         self._render_selected_page()
 
+    def _capture_decision_snapshot(self) -> dict[str, dict[str, Any]]:
+        snapshot: dict[str, dict[str, Any]] = {}
+        for unit in self._iter_all_units():
+            snapshot[unit_record_key(unit)] = {
+                "merge_group": unit.merge_group,
+                "align_group": unit.align_group,
+                "exclude_from_auto_align": unit.exclude_from_auto_align,
+                "is_noise": unit.is_noise,
+                "is_discarded": unit.is_discarded,
+            }
+        return snapshot
+
+    def _restore_decision_snapshot(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        for unit in self._iter_all_units():
+            state = snapshot.get(unit_record_key(unit))
+            if state is None:
+                continue
+            unit.merge_group = str(state.get("merge_group", "") or "")
+            unit.align_group = str(state.get("align_group", "") or "")
+            unit.exclude_from_auto_align = bool(state.get("exclude_from_auto_align", False))
+            unit.is_noise = bool(state.get("is_noise", False))
+            unit.is_discarded = bool(state.get("is_discarded", False))
+            vars_for_unit = self._ensure_unit_vars(unit)
+            vars_for_unit["merge_group"].set(unit.merge_group)
+            vars_for_unit["align_group"].set(unit.align_group)
+            vars_for_unit["is_noise"].set(unit.is_noise)
+        self._sync_merge_groups_from_align_groups()
+        self._mark_decisions_changed()
+
+    def _push_undo_snapshot(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > 100:
+            self._undo_stack = self._undo_stack[-100:]
+        self._redo_stack.clear()
+
+    def undo_last_change(self) -> None:
+        if not self._undo_stack:
+            messagebox.showinfo("Nothing to undo", "No earlier change is available to undo.")
+            return
+        current = self._capture_decision_snapshot()
+        previous = self._undo_stack.pop()
+        self._redo_stack.append(current)
+        self._restore_decision_snapshot(previous)
+        self._hide_similarity_results()
+        self._render_selected_page()
+
+    def redo_last_change(self) -> None:
+        if not self._redo_stack:
+            messagebox.showinfo("Nothing to redo", "No change is available to redo.")
+            return
+        current = self._capture_decision_snapshot()
+        next_state = self._redo_stack.pop()
+        self._undo_stack.append(current)
+        self._restore_decision_snapshot(next_state)
+        self._hide_similarity_results()
+        self._render_selected_page()
+
+    def clear_command_text(self) -> None:
+        self.command_text.delete("1.0", "end")
+
+    def insert_command_template(self, command_name: str) -> None:
+        self.command_text.configure(state="normal")
+        existing_text = self.command_text.get("1.0", "end-1c")
+        insert_prefix = ""
+        if existing_text and not existing_text.endswith("\n"):
+            insert_prefix = "\n"
+        self.command_text.insert("end", f"{insert_prefix}{command_name} ")
+        self.command_text.focus_set()
+        self.command_text.mark_set("insert", "end-1c")
+
+    def _set_command_panel_state(self, *, enabled: bool, message: str = "") -> None:
+        text_state = "normal" if enabled else "disabled"
+        self.command_text.configure(state=text_state)
+        if enabled:
+            self.command_summary_var.set(message or self.command_summary_var.get())
+        else:
+            self.command_text.configure(state="normal")
+            self.command_text.delete("1.0", "end")
+            self.command_text.configure(state="disabled")
+            self.command_summary_var.set(message)
+
+    def _set_current_page_aliases(
+        self,
+        page: PageSummary | None,
+        display_rows: list[dict[int, list[UnitSummary]]] | None = None,
+    ) -> None:
+        self._current_page_alias_map = {}
+        self._current_page_alias_by_unit_key = {}
+        self._current_row_alias_map = {}
+        if page is None or display_rows is None:
+            self._set_command_panel_state(
+                enabled=False,
+                message="Commands are available only on SG channel pages.",
+            )
+            return
+
+        alias_index = 1
+        for row_index, row_units in enumerate(display_rows, start=1):
+            row_alias = f"r{row_index}"
+            row_members: list[UnitSummary] = []
+            visible_sessions = [
+                session for session in page.sessions if row_units.get(session.session_index, [])
+            ]
+            for session in visible_sessions:
+                for unit in row_units.get(session.session_index, []):
+                    alias = f"u{alias_index}"
+                    self._current_page_alias_map[alias] = unit
+                    self._current_page_alias_by_unit_key[unit_record_key(unit)] = alias
+                    row_members.append(unit)
+                    alias_index += 1
+            self._current_row_alias_map[row_alias] = row_members
+
+        self.command_text.configure(state="normal")
+        self.command_summary_var.set(
+            "Use unit IDs like u1 and row IDs like r1. Commands:\n"
+            "align u1 u3\n"
+            "align r2 r5\n"
+            "unalign r3\n"
+            "merge r4\n"
+            "unmerge r4\n"
+            "noise u7\n"
+            "clear_noise r6\n"
+            "similarity u1 u2\n"
+            "Use one line per command. Apply Commands runs them top to bottom once, then refreshes the page."
+        )
+
+    def _resolve_command_units(self, alias_tokens: list[str]) -> list[UnitSummary]:
+        if not alias_tokens:
+            raise ValueError("Add at least one page-local unit ID such as u1.")
+        resolved: list[UnitSummary] = []
+        seen: set[str] = set()
+        for alias in alias_tokens:
+            key = alias.strip().lower()
+            if key in self._current_row_alias_map:
+                for unit in self._current_row_alias_map[key]:
+                    unit_key = unit_record_key(unit)
+                    if unit_key in seen:
+                        continue
+                    seen.add(unit_key)
+                    resolved.append(unit)
+                continue
+            unit = self._current_page_alias_map.get(key)
+            if unit is None:
+                raise ValueError(f"Unknown alias: {alias}")
+            unit_key = unit_record_key(unit)
+            if unit_key in seen:
+                continue
+            seen.add(unit_key)
+            resolved.append(unit)
+        return resolved
+
+    def _resolve_single_command_unit(self, alias_token: str) -> UnitSummary:
+        units = self._resolve_command_units([alias_token])
+        if len(units) != 1:
+            raise ValueError(
+                f"{alias_token} resolved to {len(units)} units. Use a single unit alias like u1 for similarity."
+            )
+        return units[0]
+
+    def _run_page_command(self, page: PageSummary, command_name: str, alias_tokens: list[str]) -> tuple[str, bool]:
+        normalized = command_name.strip().lower()
+
+        if normalized in {"similarity", "similarities", "compare"}:
+            if len(alias_tokens) != 2:
+                raise ValueError("similarity needs exactly two unit aliases, for example: similarity u1 u2")
+            left = self._resolve_single_command_unit(alias_tokens[0])
+            right = self._resolve_single_command_unit(alias_tokens[1])
+            waveform_score = compute_waveform_similarity(left, right)
+            amplitude_score = compute_amplitude_similarity(left, right)
+            autocorrelogram_score = compute_autocorrelogram_similarity(left, right)
+            total_score = compute_similarity(left, right)
+            return (
+                f"similarity {alias_tokens[0]} vs {alias_tokens[1]} | "
+                f"waveform={waveform_score:.3f}, "
+                f"amplitude={amplitude_score:.3f}, "
+                f"autocorrelogram={autocorrelogram_score:.3f}, "
+                f"total={total_score:.3f}",
+                False,
+            )
+
+        units = self._resolve_command_units(alias_tokens)
+
+        if normalized == "align":
+            session_indices = {unit.session_index for unit in units}
+            if len(units) < 2:
+                raise ValueError("align needs at least two units.")
+            if len(session_indices) < 2:
+                raise ValueError("align needs units from at least two sessions.")
+            result = self._assign_selected_units_to_group(
+                attr_name="align_group",
+                base_name=f"align_sh{page.shank_id}_sg{page.sg_channel}",
+                scope_tag=f"sh{page.shank_id}_sg{page.sg_channel}",
+                selected_units=units,
+                validation_message="Select at least two units to create an alignment group.",
+                expand_existing_members=False,
+            )
+            if result is None:
+                raise ValueError("align could not be applied.")
+            group_name, unit_count = result
+            return f"align {group_name} on {unit_count} unit(s)", True
+
+        if normalized == "unalign":
+            cleared_count = 0
+            for unit in units:
+                vars_for_unit = self._ensure_unit_vars(unit)
+                if vars_for_unit["align_group"].get().strip():
+                    cleared_count += 1
+                vars_for_unit["align_group"].set("")
+                unit.align_group = ""
+                unit.exclude_from_auto_align = True
+            return f"cleared alignment on {cleared_count} unit(s)", True
+
+        if normalized == "merge":
+            session_indices = {unit.session_index for unit in units}
+            if len(units) < 2:
+                raise ValueError("merge needs at least two units.")
+            if len(session_indices) != 1:
+                raise ValueError("merge needs units from one session only.")
+            result = self._assign_selected_units_to_group(
+                attr_name="merge_group",
+                base_name=f"merge_s{units[0].session_index:03d}_sh{page.shank_id}_sg{page.sg_channel}",
+                scope_tag=f"s{units[0].session_index}_sh{page.shank_id}_sg{page.sg_channel}",
+                selected_units=units,
+                validation_message="Select at least two units from the same session to create a merge group.",
+            )
+            if result is None:
+                raise ValueError("merge could not be applied.")
+            group_name, unit_count = result
+            return f"merge {group_name} on {unit_count} unit(s)", True
+
+        if normalized == "unmerge":
+            cleared_count = 0
+            for unit in units:
+                vars_for_unit = self._ensure_unit_vars(unit)
+                if vars_for_unit["merge_group"].get().strip():
+                    cleared_count += 1
+                vars_for_unit["merge_group"].set("")
+                unit.merge_group = ""
+            return f"cleared merge on {cleared_count} unit(s)", True
+
+        if normalized == "noise":
+            for unit in units:
+                vars_for_unit = self._ensure_unit_vars(unit)
+                vars_for_unit["is_noise"].set(True)
+                unit.is_noise = True
+            return f"marked {len(units)} unit(s) as noise", True
+
+        if normalized in {"clear_noise", "cleannoise", "denoise"}:
+            for unit in units:
+                vars_for_unit = self._ensure_unit_vars(unit)
+                vars_for_unit["is_noise"].set(False)
+                unit.is_noise = False
+            return f"cleared noise on {len(units)} unit(s)", True
+
+        raise ValueError(f"Unknown command: {command_name}")
+
+    def apply_command_batch(self) -> None:
+        page = self._selected_page()
+        if page is None:
+            messagebox.showinfo("No page selected", "Open an SG channel page first.")
+            return
+
+        raw_text = self.command_text.get("1.0", "end").strip()
+        if not raw_text:
+            messagebox.showinfo("No commands", "Enter one or more commands first.")
+            return
+
+        before_snapshot = self._capture_decision_snapshot()
+        applied_messages: list[str] = []
+        changed_state = False
+        try:
+            for line_number, raw_line in enumerate(raw_text.splitlines(), start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                tokens = line.split()
+                if len(tokens) < 2:
+                    raise ValueError(f"Line {line_number}: expected a command followed by one or more unit IDs.")
+                result_text, command_changed_state = self._run_page_command(page, tokens[0], tokens[1:])
+                applied_messages.append(
+                    f"Line {line_number}: {result_text}"
+                )
+                changed_state = changed_state or command_changed_state
+            if not applied_messages:
+                messagebox.showinfo("No commands", "Only blank lines or comments were provided.")
+                return
+            if changed_state:
+                self._push_undo_snapshot(before_snapshot)
+                self._mark_decisions_changed()
+            self._hide_similarity_results()
+            self._render_selected_page()
+            messagebox.showinfo("Commands applied", "\n".join(applied_messages))
+        except Exception as exc:
+            self._restore_decision_snapshot(before_snapshot)
+            self._hide_similarity_results()
+            self._render_selected_page()
+            messagebox.showerror("Command error", str(exc))
+
     def go_to_previous_page(self) -> None:
         current_index = self._selected_page_index()
         if current_index is None:
@@ -1284,9 +1710,11 @@ class AlignmentApp:
         if selected_index is not None:
             selected_page_id = self.page_ids[selected_index]
             if selected_page_id == REVIEW_PAGE_ID:
+                self._set_current_page_aliases(None)
                 self._render_review_page()
                 return
             if selected_page_id == DISCARDED_PAGE_ID:
+                self._set_current_page_aliases(None)
                 self._render_discarded_page()
                 return
 
@@ -1294,6 +1722,7 @@ class AlignmentApp:
         for child in self.page_content.winfo_children():
             child.destroy()
         if page is None:
+            self._set_current_page_aliases(None)
             self.page_title_var.set("No page selected")
             self.status_var.set("")
             self._hide_similarity_results()
@@ -1317,10 +1746,10 @@ class AlignmentApp:
             f" | Discarded on this channel: {page_summary['total_discarded_units']}\n"
             + " | ".join(summary_parts)
         )
-        self._update_selection_summary(page)
         self._hide_similarity_results()
 
         display_rows = self._get_page_display_rows(page)
+        self._set_current_page_aliases(page, display_rows)
 
         grid_wrapper = ttk.Frame(self.page_content)
         grid_wrapper.pack(fill="both", expand=True)
@@ -1365,11 +1794,6 @@ class AlignmentApp:
         for row_index, row_units in enumerate(display_rows, start=1):
             row_frame = ttk.Frame(grid_wrapper)
             row_frame.pack(fill="x")
-            row_all_units = [
-                unit
-                for session in page.sessions
-                for unit in row_units.get(session.session_index, [])
-            ]
             present_sessions = [
                 session.session_name
                 for session in page.sessions
@@ -1380,24 +1804,10 @@ class AlignmentApp:
             row_label_frame.pack_propagate(False)
             ttk.Label(
                 row_label_frame,
-                text=f"Row {row_index}",
+                text=f"Row {row_index} | r{row_index}",
                 anchor="w",
                 justify="left",
             ).pack(fill="x")
-            row_button_frame = ttk.Frame(row_label_frame)
-            row_button_frame.pack(fill="x", pady=(6, 6))
-            ttk.Button(
-                row_button_frame,
-                text="Select Row",
-                command=lambda units=row_all_units, current_page=page: self._select_units_for_row(units, current_page),
-                width=12,
-            ).pack(side="left")
-            ttk.Button(
-                row_button_frame,
-                text="Clear Row",
-                command=lambda units=row_all_units, current_page=page: self._clear_row_selection(units, current_page),
-                width=10,
-            ).pack(side="left", padx=(4, 0))
             ttk.Label(
                 row_label_frame,
                 text="Shown:\n" + ("\n".join(present_sessions) if present_sessions else "none"),
@@ -1423,7 +1833,8 @@ class AlignmentApp:
                 session_card.grid(row=0, column=col_index, sticky="nsew", padx=6, pady=4)
                 units = row_units.get(session.session_index, [])
                 for unit in units:
-                    self._render_unit_card(session_card, unit, defer_image=True)
+                    page_alias = self._current_page_alias_by_unit_key.get(unit_record_key(unit), "")
+                    self._render_unit_card(session_card, unit, defer_image=True, page_alias=page_alias)
 
         self.canvas.yview_moveto(0.0)
 
@@ -1444,7 +1855,6 @@ class AlignmentApp:
         self.status_var.set(
             "Review current decisions before export."
         )
-        self.selection_summary_var.set("Selection actions are available on channel pages.")
 
         review_frame = ttk.Frame(self.page_content, padding=8)
         review_frame.pack(fill="both", expand=True)
@@ -1496,7 +1906,6 @@ class AlignmentApp:
         self.status_var.set(
             f"Auto-discarded units across all channel pages: {totals['discarded_units']}"
         )
-        self.selection_summary_var.set("Selection actions are available on channel pages.")
 
         discarded_frame = ttk.Frame(self.page_content, padding=8)
         discarded_frame.pack(fill="both", expand=True)
@@ -1670,7 +2079,7 @@ class AlignmentApp:
                 session_card = ttk.LabelFrame(cells, text=session_name, padding=6)
                 session_card.grid(row=0, column=col_index, sticky="nsew", padx=6, pady=4)
                 for unit in units_by_session[(_session_index, session_name)]:
-                    self._render_unit_card(session_card, unit, defer_image=False)
+                    self._render_unit_card(session_card, unit, defer_image=False, page_alias="")
 
     def _get_image(self, image_path: str):
         if image_path not in self.image_cache:
@@ -1691,36 +2100,6 @@ class AlignmentApp:
 
     def _units_by_key(self) -> dict[str, UnitSummary]:
         return {unit_record_key(unit): unit for unit in self._iter_all_units()}
-
-    def _selected_units_for_current_page(self) -> tuple[PageSummary | None, list[UnitSummary]]:
-        page = self._selected_page()
-        if page is None:
-            return None, []
-        selected_units: list[UnitSummary] = []
-        for session in page.sessions:
-            for unit in session.units:
-                vars_for_unit = self._ensure_unit_vars(unit)
-                if bool(vars_for_unit["selected"].get()):
-                    selected_units.append(unit)
-        return page, selected_units
-
-    def _update_selection_summary(self, page: PageSummary | None = None) -> None:
-        current_page = page or self._selected_page()
-        if current_page is None:
-            self.selection_summary_var.set("Selection actions are available on channel pages.")
-            return
-        _, selected_units = self._selected_units_for_current_page()
-        if not selected_units:
-            self.selection_summary_var.set(
-                "Select one or more units on the current channel page, then choose an action."
-            )
-            return
-        labels = ", ".join(f"{unit.session_name} u{unit.unit_id}" for unit in selected_units[:6])
-        if len(selected_units) > 6:
-            labels += ", ..."
-        self.selection_summary_var.set(
-            f"Selected {len(selected_units)} unit(s): {labels}"
-        )
 
     def _show_similarity_results(self, text: str) -> None:
         for child in self.results_panel.winfo_children():
@@ -1761,129 +2140,6 @@ class AlignmentApp:
         self._page_display_rows_cache[cache_key] = display_rows
         return display_rows
 
-    def show_selected_similarity(self) -> None:
-        page, selected_units = self._selected_units_for_current_page()
-        if page is None:
-            messagebox.showinfo("No page selected", "Open a channel page first.")
-            return
-        if len(selected_units) < 2:
-            messagebox.showinfo("Not enough units", "Select at least two units first.")
-            return
-
-        lines = [
-            "Pairwise waveform similarity for selected units:",
-        ]
-        for i, left in enumerate(selected_units):
-            for right in selected_units[i + 1:]:
-                score = compute_similarity(left, right)
-                lines.append(
-                    f"- {left.session_name} u{left.unit_id} <-> {right.session_name} u{right.unit_id}: {score:.3f}"
-                )
-        self._show_similarity_results("\n".join(lines))
-
-    def debug_selected_qc(self) -> None:
-        page, selected_units = self._selected_units_for_current_page()
-        if page is None:
-            messagebox.showinfo("No page selected", "Open a channel page first.")
-            return
-        if not selected_units:
-            messagebox.showinfo("No units selected", "Select at least one unit first.")
-            return
-
-        selected_units = sorted(selected_units, key=lambda unit: (unit.session_index, unit.unit_id))
-        lines = [
-            "Selected unit QC debug",
-            "",
-            (
-                "Discard rule requires ANY of these:\n"
-                f"- |amplitude_median| < {DISCARD_ABS_AMPLITUDE_MAX:g}\n"
-                f"- snr < {DISCARD_SNR_MAX:g}\n"
-                f"- isi_violations_ratio > {DISCARD_ISI_VIOLATION_MIN:g}"
-            ),
-            "",
-        ]
-        for unit in selected_units:
-            checks = evaluate_discard_criteria(unit)
-            raw_isi = safe_float(unit.isi_violations_ratio)
-            lines.extend(
-                [
-                    f"{unit.session_name} | unit {unit.unit_id}",
-                    f"raw amplitude_median = {format_metric(unit.amplitude_median)}",
-                    f"raw snr = {format_metric(unit.snr)}",
-                    f"raw isi_violations_ratio = {format_metric(raw_isi)}",
-                    f"|amp| check: {'PASS' if checks['amplitude_pass'] else 'FAIL'}",
-                    f"snr check: {'PASS' if checks['snr_pass'] else 'FAIL'}",
-                    f"isi check: {'PASS' if checks['isi_pass'] else 'FAIL'}",
-                    f"final is_discarded = {'YES' if checks['all_pass'] else 'NO'}",
-                    "",
-                ]
-            )
-        messagebox.showinfo("Selected QC Debug", "\n".join(lines).strip())
-
-    def clear_selected_units(self) -> None:
-        page, selected_units = self._selected_units_for_current_page()
-        if page is None:
-            return
-        self._clear_selection_for_units(selected_units)
-        self._update_selection_summary(page)
-        self._hide_similarity_results()
-
-    def _clear_selection_for_units(self, units: list[UnitSummary]) -> None:
-        for unit in units:
-            self._ensure_unit_vars(unit)["selected"].set(False)
-
-    def _set_selection_for_units(self, units: list[UnitSummary], selected: bool) -> None:
-        for unit in units:
-            self._ensure_unit_vars(unit)["selected"].set(selected)
-
-    def _select_units_for_row(self, units: list[UnitSummary], page: PageSummary) -> None:
-        self._set_selection_for_units(units, True)
-        self._update_selection_summary(page)
-        self._hide_similarity_results()
-
-    def _clear_row_selection(self, units: list[UnitSummary], page: PageSummary) -> None:
-        self._set_selection_for_units(units, False)
-        self._update_selection_summary(page)
-        self._hide_similarity_results()
-
-    def mark_selected_as_noise(self) -> None:
-        page, selected_units = self._selected_units_for_current_page()
-        if page is None:
-            messagebox.showinfo("No page selected", "Open a channel page first.")
-            return
-        if not selected_units:
-            messagebox.showinfo("No units selected", "Select at least one unit first.")
-            return
-        for unit in selected_units:
-            vars_for_unit = self._ensure_unit_vars(unit)
-            vars_for_unit["is_noise"].set(True)
-            unit.is_noise = True
-        self._mark_decisions_changed()
-        self._clear_selection_for_units(selected_units)
-        self._update_selection_summary(page)
-        self._hide_similarity_results()
-        self._render_selected_page()
-        messagebox.showinfo("Noise updated", f"Marked {len(selected_units)} unit(s) as noise.")
-
-    def clear_noise_on_selected(self) -> None:
-        page, selected_units = self._selected_units_for_current_page()
-        if page is None:
-            messagebox.showinfo("No page selected", "Open a channel page first.")
-            return
-        if not selected_units:
-            messagebox.showinfo("No units selected", "Select at least one unit first.")
-            return
-        for unit in selected_units:
-            vars_for_unit = self._ensure_unit_vars(unit)
-            vars_for_unit["is_noise"].set(False)
-            unit.is_noise = False
-        self._mark_decisions_changed()
-        self._clear_selection_for_units(selected_units)
-        self._update_selection_summary(page)
-        self._hide_similarity_results()
-        self._render_selected_page()
-        messagebox.showinfo("Noise updated", f"Cleared noise flag on {len(selected_units)} unit(s).")
-
     def _build_existing_group_members(
         self,
         attr_name: str,
@@ -1906,6 +2162,7 @@ class AlignmentApp:
         scope_tag: str,
         selected_units: list[UnitSummary],
         validation_message: str,
+        expand_existing_members: bool = True,
     ) -> tuple[str, int] | None:
         units_lookup = self._units_by_key()
         existing_members = self._build_existing_group_members(
@@ -1935,8 +2192,9 @@ class AlignmentApp:
             }
         )
         expanded_keys = set(selected_keys)
-        for name in existing_names_in_selection:
-            expanded_keys.update(existing_members.get(f"{scope_prefix}{name}", set()))
+        if expand_existing_members:
+            for name in existing_names_in_selection:
+                expanded_keys.update(existing_members.get(f"{scope_prefix}{name}", set()))
 
         if len(expanded_keys) < 2:
             messagebox.showinfo("Not enough units", validation_message)
@@ -1978,6 +2236,7 @@ class AlignmentApp:
                 "Merge is only for units from the same session. Select units from one session column.",
             )
             return
+        before_snapshot = self._capture_decision_snapshot()
 
         result = self._assign_selected_units_to_group(
             attr_name="merge_group",
@@ -1989,6 +2248,7 @@ class AlignmentApp:
         if result is None:
             return
         group_name, unit_count = result
+        self._push_undo_snapshot(before_snapshot)
         self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
@@ -2011,6 +2271,7 @@ class AlignmentApp:
                 "Align is for matching the same neuron across sessions. Select units from at least two session columns.",
             )
             return
+        before_snapshot = self._capture_decision_snapshot()
 
         result = self._assign_selected_units_to_group(
             attr_name="align_group",
@@ -2018,10 +2279,12 @@ class AlignmentApp:
             scope_tag=f"sh{page.shank_id}_sg{page.sg_channel}",
             selected_units=selected_units,
             validation_message="Select at least two units to create an alignment group.",
+            expand_existing_members=False,
         )
         if result is None:
             return
         group_name, unit_count = result
+        self._push_undo_snapshot(before_snapshot)
         self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
@@ -2037,6 +2300,7 @@ class AlignmentApp:
         if not selected_units:
             messagebox.showinfo("No units selected", "Select at least one unit first.")
             return
+        before_snapshot = self._capture_decision_snapshot()
         cleared_count = 0
         for unit in selected_units:
             vars_for_unit = self._ensure_unit_vars(unit)
@@ -2044,6 +2308,7 @@ class AlignmentApp:
                 cleared_count += 1
             vars_for_unit["merge_group"].set("")
             unit.merge_group = ""
+        self._push_undo_snapshot(before_snapshot)
         self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
@@ -2059,6 +2324,7 @@ class AlignmentApp:
         if not selected_units:
             messagebox.showinfo("No units selected", "Select at least one unit first.")
             return
+        before_snapshot = self._capture_decision_snapshot()
         cleared_count = 0
         for unit in selected_units:
             vars_for_unit = self._ensure_unit_vars(unit)
@@ -2067,6 +2333,7 @@ class AlignmentApp:
             vars_for_unit["align_group"].set("")
             unit.align_group = ""
             unit.exclude_from_auto_align = True
+        self._push_undo_snapshot(before_snapshot)
         self._mark_decisions_changed()
         self._clear_selection_for_units(selected_units)
         self._update_selection_summary(page)
@@ -2081,23 +2348,23 @@ class AlignmentApp:
                 "merge_group": tk.StringVar(value=unit.merge_group),
                 "align_group": tk.StringVar(value=unit.align_group),
                 "is_noise": tk.BooleanVar(value=unit.is_noise),
-                "selected": tk.BooleanVar(value=False),
             }
         return self.unit_control_vars[key]
 
-    def _render_unit_card(self, parent: ttk.Frame, unit: UnitSummary, *, defer_image: bool) -> None:
+    def _render_unit_card(
+        self,
+        parent: ttk.Frame,
+        unit: UnitSummary,
+        *,
+        defer_image: bool,
+        page_alias: str = "",
+    ) -> None:
         vars_for_unit = self._ensure_unit_vars(unit)
         card = ttk.Frame(parent, relief="solid", padding=6)
         card.pack(fill="x", expand=True, pady=6)
 
         select_row = ttk.Frame(card)
         select_row.pack(fill="x")
-        ttk.Checkbutton(
-            select_row,
-            text="Select",
-            variable=vars_for_unit["selected"],
-            command=self._update_selection_summary,
-        ).pack(side="left")
         if unit.merge_group or unit.align_group or unit.is_discarded or unit.is_noise:
             tags = []
             if unit.merge_group:
@@ -2113,7 +2380,8 @@ class AlignmentApp:
         header = ttk.Label(
             card,
             text=(
-                f"Unit {unit.unit_id} | sg {unit.sg_channel}\n"
+                (f"{page_alias} | " if page_alias else "")
+                + f"Unit {unit.unit_id} | sg {unit.sg_channel}\n"
                 f"FR {format_metric(unit.firing_rate)} Hz | "
                 f"SNR {format_metric(unit.snr)}"
             ),
@@ -2148,9 +2416,15 @@ class AlignmentApp:
     def _is_auto_merge_from_align(self, merge_group: str) -> bool:
         return bool(merge_group) and merge_group.startswith("__alignmerge__")
 
+    def _is_auto_merge_suggestion(self, merge_group: str) -> bool:
+        return bool(merge_group) and merge_group.startswith("__automerge__")
+
+    def _is_auto_generated_merge(self, merge_group: str) -> bool:
+        return self._is_auto_merge_from_align(merge_group) or self._is_auto_merge_suggestion(merge_group)
+
     def _sync_merge_groups_from_align_groups(self) -> None:
         for unit in self._iter_all_units():
-            if self._is_auto_merge_from_align(unit.merge_group):
+            if self._is_auto_generated_merge(unit.merge_group):
                 unit.merge_group = ""
 
         grouped_units: dict[tuple[int, str], list[UnitSummary]] = {}
@@ -2170,8 +2444,70 @@ class AlignmentApp:
                 continue
             auto_merge_name = f"__alignmerge__{sanitize_token(align_name)}"
             for unit in units:
-                if not unit.merge_group or self._is_auto_merge_from_align(unit.merge_group):
+                if not unit.merge_group or self._is_auto_generated_merge(unit.merge_group):
                     unit.merge_group = auto_merge_name
+
+        merge_candidate_groups: dict[tuple[int, int], list[UnitSummary]] = {}
+        for unit in self._iter_all_units():
+            if unit.is_discarded or unit.is_noise:
+                continue
+            merge_candidate_groups.setdefault(
+                (int(unit.session_index), int(unit.sg_channel)),
+                [],
+            ).append(unit)
+
+        for (session_index, sg_channel), units in merge_candidate_groups.items():
+            if len(units) < 2:
+                continue
+
+            adjacency: dict[str, set[str]] = {}
+            for i, left in enumerate(sorted(units, key=lambda item: item.unit_id)):
+                if left.merge_group and not self._is_auto_generated_merge(left.merge_group):
+                    continue
+                for right in units[i + 1 :]:
+                    if right.merge_group and not self._is_auto_generated_merge(right.merge_group):
+                        continue
+                    waveform_score = compute_waveform_similarity(left, right)
+                    amplitude_score = compute_amplitude_similarity(left, right)
+                    autocorrelogram_score = compute_autocorrelogram_similarity(left, right)
+                    if (
+                        waveform_score >= AUTO_MERGE_MIN_SIMILARITY
+                        and amplitude_score >= AUTO_MERGE_MIN_SIMILARITY
+                        and autocorrelogram_score >= AUTO_MERGE_MIN_SIMILARITY
+                    ):
+                        left_key = unit_record_key(left)
+                        right_key = unit_record_key(right)
+                        adjacency.setdefault(left_key, set()).add(right_key)
+                        adjacency.setdefault(right_key, set()).add(left_key)
+
+            visited: set[str] = set()
+            for start_key in sorted(adjacency):
+                if start_key in visited:
+                    continue
+                stack = [start_key]
+                component_keys: set[str] = set()
+                while stack:
+                    current_key = stack.pop()
+                    if current_key in visited:
+                        continue
+                    visited.add(current_key)
+                    component_keys.add(current_key)
+                    stack.extend(adjacency.get(current_key, set()) - visited)
+
+                if len(component_keys) < 2:
+                    continue
+
+                component_units = sorted(
+                    [unit for unit in units if unit_record_key(unit) in component_keys],
+                    key=lambda item: item.unit_id,
+                )
+                auto_merge_name = (
+                    f"__automerge__s{session_index:03d}_sg{sg_channel:03d}"
+                    f"_u{component_units[0].unit_id:04d}"
+                )
+                for unit in component_units:
+                    if not unit.merge_group or self._is_auto_generated_merge(unit.merge_group):
+                        unit.merge_group = auto_merge_name
 
         for unit in self._iter_all_units():
             vars_for_unit = self._ensure_unit_vars(unit)
@@ -2236,6 +2572,8 @@ class AlignmentApp:
             vars_for_unit["align_group"].set(unit.align_group)
             vars_for_unit["is_noise"].set(unit.is_noise)
         self._sync_merge_groups_from_align_groups()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         self._mark_decisions_changed()
 
     def export_summary(self) -> None:
