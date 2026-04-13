@@ -1268,6 +1268,41 @@ class AlignmentState:
             ],
         }
 
+    def build_noise_unit_summary_row(self, *, group_key: str, units: list[UnitSummary]) -> dict:
+        sorted_units = sorted(units, key=lambda unit: (unit.session_index, unit.unit_id))
+        representative = sorted_units[0]
+        session_names = []
+        seen_session_names: set[str] = set()
+        for unit in sorted_units:
+            if unit.session_name not in seen_session_names:
+                session_names.append(unit.session_name)
+                seen_session_names.add(unit.session_name)
+
+        return {
+            "noise_group_key": group_key,
+            "status": "noise",
+            "shank_id": int(representative.shank_id),
+            "channel": int(representative.local_channel_on_shank),
+            "sg_channel": int(representative.sg_channel),
+            "num_sessions": len(session_names),
+            "sessions_present": session_names,
+            "num_member_units": len(sorted_units),
+            "member_units": [
+                {
+                    "session_name": unit.session_name,
+                    "session_index": int(unit.session_index),
+                    "unit_id": int(unit.unit_id),
+                    "amplitude_median": unit.amplitude_median,
+                    "snr": unit.snr,
+                    "isi_violations_ratio": unit.isi_violations_ratio,
+                    "merge_group": unit.merge_group,
+                    "align_group": unit.align_group,
+                    "waveform_image_path": unit.waveform_image_path,
+                }
+                for unit in sorted_units
+            ],
+        }
+
     def write_unique_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
         fieldnames = [
             "final_unit_id", "final_unit_label", "shank_id", "channel", "sg_channel",
@@ -1323,6 +1358,29 @@ class AlignmentState:
                     }
                 )
 
+    def write_noise_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
+        fieldnames = [
+            "status", "noise_group_key", "shank_id", "channel",
+            "sg_channel", "num_sessions", "sessions_present", "num_member_units", "member_units",
+        ]
+        with csv_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "status": row["status"],
+                        "noise_group_key": row["noise_group_key"],
+                        "shank_id": row["shank_id"],
+                        "channel": row["channel"],
+                        "sg_channel": row["sg_channel"],
+                        "num_sessions": row["num_sessions"],
+                        "sessions_present": "; ".join(row["sessions_present"]),
+                        "num_member_units": row["num_member_units"],
+                        "member_units": "; ".join(f"{item['session_name']}:u{item['unit_id']}" for item in row["member_units"]),
+                    }
+                )
+
     def build_group_summary_text(self, group_index: int, group_key: str, units: list[UnitSummary]) -> str:
         session_names = []
         seen_session_names: set[str] = set()
@@ -1368,18 +1426,21 @@ class AlignmentState:
         auto_align_lookup = self.build_auto_align_lookup_multi_shank()
         final_groups: dict[str, list[UnitSummary]] = {}
         discarded_groups: dict[str, list[UnitSummary]] = {}
+        noise_groups: dict[str, list[UnitSummary]] = {}
 
         for unit in self._iter_all_units():
             if unit.is_discarded:
                 discarded_groups.setdefault(self.discard_group_key_for_unit(unit), []).append(unit)
                 continue
             if unit.is_noise:
+                noise_groups.setdefault(self.discard_group_key_for_unit(unit).replace("discarded__", "noise__"), []).append(unit)
                 continue
             final_groups.setdefault(self.final_group_key_for_unit(unit, auto_align_lookup=auto_align_lookup), []).append(unit)
 
         manifest_rows = []
         unique_unit_rows = []
         discarded_unit_rows = []
+        noise_unit_rows = []
 
         for group_index, (group_key, units) in enumerate(sorted(final_groups.items()), start=1):
             group_folder = export_folder / f"unit_{group_index:04d}"
@@ -1431,6 +1492,8 @@ class AlignmentState:
 
         for group_key, units in sorted(discarded_groups.items()):
             discarded_unit_rows.append(self.build_discarded_unit_summary_row(group_key=group_key, units=units))
+        for group_key, units in sorted(noise_groups.items()):
+            noise_unit_rows.append(self.build_noise_unit_summary_row(group_key=group_key, units=units))
 
         unique_units_json_path = self.summary_root / "unique_units_summary.json"
         unique_units_json_path.write_text(json.dumps(unique_unit_rows, indent=2), encoding="utf-8")
@@ -1441,6 +1504,10 @@ class AlignmentState:
         discarded_units_json_path.write_text(json.dumps(discarded_unit_rows, indent=2), encoding="utf-8")
         discarded_units_csv_path = self.summary_root / "discarded_units_summary.csv"
         self.write_discarded_units_summary_csv(discarded_units_csv_path, discarded_unit_rows)
+        noise_units_json_path = self.summary_root / "noise_units_summary.json"
+        noise_units_json_path.write_text(json.dumps(noise_unit_rows, indent=2), encoding="utf-8")
+        noise_units_csv_path = self.summary_root / "noise_units_summary.csv"
+        self.write_noise_units_summary_csv(noise_units_csv_path, noise_unit_rows)
 
         export_manifest_path = self.summary_root / "export_summary.json"
         export_manifest_path.write_text(
@@ -1451,6 +1518,8 @@ class AlignmentState:
                     "unique_units_summary_csv": str(unique_units_csv_path),
                     "discarded_units_summary_json": str(discarded_units_json_path),
                     "discarded_units_summary_csv": str(discarded_units_csv_path),
+                    "noise_units_summary_json": str(noise_units_json_path),
+                    "noise_units_summary_csv": str(noise_units_csv_path),
                     "cross_session_alignment_groups": manifest_rows,
                 },
                 indent=2,
@@ -1464,8 +1533,11 @@ class AlignmentState:
             "unique_units_csv_path": str(unique_units_csv_path),
             "discarded_units_json_path": str(discarded_units_json_path),
             "discarded_units_csv_path": str(discarded_units_csv_path),
+            "noise_units_json_path": str(noise_units_json_path),
+            "noise_units_csv_path": str(noise_units_csv_path),
             "num_unique_units": len(unique_unit_rows),
             "num_discarded_groups": len(discarded_unit_rows),
+            "num_noise_groups": len(noise_unit_rows),
             "num_alignment_groups": len(manifest_rows),
         }
 
@@ -1506,17 +1578,20 @@ class AlignmentState:
 
         final_groups: dict[str, list[UnitSummary]] = {}
         discarded_groups: dict[str, list[UnitSummary]] = {}
+        noise_groups: dict[str, list[UnitSummary]] = {}
         for unit in page_units:
             if unit.is_discarded:
                 discarded_groups.setdefault(self.discard_group_key_for_unit(unit), []).append(unit)
                 continue
             if unit.is_noise:
+                noise_groups.setdefault(self.discard_group_key_for_unit(unit).replace("discarded__", "noise__"), []).append(unit)
                 continue
             final_groups.setdefault(self.final_group_key_for_unit(unit, auto_align_lookup=page_auto_lookup), []).append(unit)
 
         manifest_rows = []
         unique_unit_rows = []
         discarded_unit_rows = []
+        noise_unit_rows = []
 
         for group_index, (group_key, units) in enumerate(sorted(final_groups.items()), start=1):
             group_folder = export_folder / f"unit_{group_index:04d}"
@@ -1568,6 +1643,8 @@ class AlignmentState:
 
         for group_key, units in sorted(discarded_groups.items()):
             discarded_unit_rows.append(self.build_discarded_unit_summary_row(group_key=group_key, units=units))
+        for group_key, units in sorted(noise_groups.items()):
+            noise_unit_rows.append(self.build_noise_unit_summary_row(group_key=group_key, units=units))
 
         unique_units_json_path = page_summary_root / f"unique_units_summary_sg_{page.sg_channel:03d}.json"
         unique_units_json_path.write_text(json.dumps(unique_unit_rows, indent=2), encoding="utf-8")
@@ -1578,6 +1655,10 @@ class AlignmentState:
         discarded_units_json_path.write_text(json.dumps(discarded_unit_rows, indent=2), encoding="utf-8")
         discarded_units_csv_path = page_summary_root / f"discarded_units_summary_sg_{page.sg_channel:03d}.csv"
         self.write_discarded_units_summary_csv(discarded_units_csv_path, discarded_unit_rows)
+        noise_units_json_path = page_summary_root / f"noise_units_summary_sg_{page.sg_channel:03d}.json"
+        noise_units_json_path.write_text(json.dumps(noise_unit_rows, indent=2), encoding="utf-8")
+        noise_units_csv_path = page_summary_root / f"noise_units_summary_sg_{page.sg_channel:03d}.csv"
+        self.write_noise_units_summary_csv(noise_units_csv_path, noise_unit_rows)
 
         export_manifest_path = page_summary_root / f"export_summary_sg_{page.sg_channel:03d}.json"
         export_manifest_path.write_text(
@@ -1593,6 +1674,8 @@ class AlignmentState:
                     "unique_units_summary_csv": str(unique_units_csv_path),
                     "discarded_units_summary_json": str(discarded_units_json_path),
                     "discarded_units_summary_csv": str(discarded_units_csv_path),
+                    "noise_units_summary_json": str(noise_units_json_path),
+                    "noise_units_summary_csv": str(noise_units_csv_path),
                     "cross_session_alignment_groups": manifest_rows,
                 },
                 indent=2,
@@ -1606,8 +1689,11 @@ class AlignmentState:
             "unique_units_csv_path": str(unique_units_csv_path),
             "discarded_units_json_path": str(discarded_units_json_path),
             "discarded_units_csv_path": str(discarded_units_csv_path),
+            "noise_units_json_path": str(noise_units_json_path),
+            "noise_units_csv_path": str(noise_units_csv_path),
             "num_unique_units": len(unique_unit_rows),
             "num_discarded_groups": len(discarded_unit_rows),
+            "num_noise_groups": len(noise_unit_rows),
             "num_alignment_groups": len(manifest_rows),
             "page_scope": f"shank {page.shank_id}, SG {page.sg_channel}",
         }
@@ -1998,8 +2084,8 @@ Use aliases like u1 and r1 from the current page.</div>
     function insertCommandTemplate(name) {{ const existing = commandText.value; const prefix = existing && !existing.endsWith("\\n") ? "\\n" : ""; commandText.value += `${{prefix}}${{name}} `; commandText.focus(); commandText.selectionStart = commandText.selectionEnd = commandText.value.length; }}
     async function loadState() {{ const payload = await fetchJson("/api/state"); DATA = payload.app; populateShanks(); populatePages(); render(); }}
     async function applyCommands() {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value, commands: commandText.value }}; const result = await fetchJson("/api/commands", {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app; populateShanks(); shankSelect.value = String(payload.shank_id); populatePages(); pageSelect.value = payload.page_id; render(); setLog(result.messages); }}
-    async function postSimple(url) {{ const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.messages) setLog(result.messages); if (result.export_result) {{ if (result.export_result.page_scope) setLog([`Scope: ${{result.export_result.page_scope}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); else if (result.export_result.num_pages_exported !== undefined) setLog([`Scope: all loaded pages`, `Pages exported: ${{result.export_result.num_pages_exported}}`]); else setLog([`Scope: full summary`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }} }}
-    async function postWithPage(url) {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value }}; const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.export_result) setLog([`${{result.export_result.page_scope ? `Scope: ${{result.export_result.page_scope}}` : "Scope: current page"}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }}
+    async function postSimple(url) {{ const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.messages) setLog(result.messages); if (result.export_result) {{ if (result.export_result.page_scope) setLog([`Scope: ${{result.export_result.page_scope}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); else if (result.export_result.num_pages_exported !== undefined) setLog([`Scope: all loaded pages`, `Pages exported: ${{result.export_result.num_pages_exported}}`]); else setLog([`Scope: full summary`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }} }}
+    async function postWithPage(url) {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value }}; const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.export_result) setLog([`${{result.export_result.page_scope ? `Scope: ${{result.export_result.page_scope}}` : "Scope: current page"}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }}
     shankSelect.addEventListener("change", () => {{ setPageNavMessage(""); populatePages(); clearCommandsForNavigation(); render(); }});
     pageSelect.addEventListener("change", () => {{ setPageNavMessage(""); clearCommandsForNavigation(); render(); }}); kindSelect.addEventListener("change", render); searchInput.addEventListener("input", render);
     commandText.addEventListener("keydown", (event) => {{ if (event.ctrlKey && event.key === "Enter") {{ event.preventDefault(); applyCommands().catch((err) => setLog(err.message)); }} }});
