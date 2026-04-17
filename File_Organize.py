@@ -10,7 +10,7 @@ from pathlib import Path
 DEFAULT_ROOT = Path(r"H:\\")  # Fallback root when you want one path for both source and target.
 DEFAULT_TARGET_ROOT = DEFAULT_ROOT  # Final write location for organized folders.
 DEFAULT_SHANK_COUNT = 32
-DEFAULT_REC_ORGANIZATION = True  # True: move .rec files into daily *_rec folders.
+DEFAULT_REC_ORGANIZATION = True  # True: move .rec files into daily split *_rec folders.
 DEFAULT_SORTING_ORGANIZATION = False  # True: organize sorting results into *_Sorting folders.
 DEFAULT_CLEANUP_EMPTY = False  # True: remove empty folders left behind after moves.
 DEFAULT_DELETE_PREPROCESS = False  # True: delete preprocessed_recording folders after organization.
@@ -51,6 +51,22 @@ def parse_day_code_from_rec_file(rec_file: Path) -> str | None:
     return normalize_day_code(match.group("date"))
 
 
+def parse_rec_session_hour(rec_file: Path) -> int | None:
+    match = REC_FILE_PATTERN.search(rec_file.name)
+    if not match:
+        return None
+    return int(match.group("time")[:2])
+
+
+def build_rec_bucket_name(day_code: str, rec_file: Path) -> str:
+    session_hour = parse_rec_session_hour(rec_file)
+    if session_hour is None:
+        raise ValueError(f"Unsupported .rec file name: {rec_file}")
+    if session_hour < 12:
+        return f"{day_code}_00_to_11_rec"
+    return f"{day_code}_12_to_23_rec"
+
+
 def parse_day_code_from_session_folder(folder: Path) -> str | None:
     match = SORTING_SESSION_PATTERN.fullmatch(folder.name)
     if not match:
@@ -68,7 +84,7 @@ def parse_day_code_from_sorting_root(folder: Path) -> str | None:
 
 
 def build_rec_target(root: Path, day_code: str, rec_file: Path) -> Path:
-    return root / f"{day_code}_rec" / rec_file.name
+    return root / build_rec_bucket_name(day_code, rec_file) / rec_file.name
 
 
 def build_sorting_target(root: Path, day_code: str, shank_id: int, run_folder: Path) -> Path:
@@ -165,7 +181,7 @@ def apply_interactive_settings(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.rec_organization is None:
         args.rec_organization = prompt_yes_no(
-            "Organize .rec files into *_rec folders?",
+            "Organize .rec files into 00_to_11 and 12_to_23 *_rec folders?",
             DEFAULT_REC_ORGANIZATION,
         )
 
@@ -266,7 +282,7 @@ def iter_rec_files(root: Path):
 
 def is_rec_already_organized(path: Path, target_root: Path, day_code: str) -> bool:
     try:
-        return path.parent == target_root / f"{day_code}_rec"
+        return path.parent == target_root / build_rec_bucket_name(day_code, path)
     except Exception:
         return False
 
@@ -529,7 +545,7 @@ def resolve_organization_roots(args: argparse.Namespace) -> tuple[list[Path], Pa
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Organize W: recordings into daily *_rec folders and sorting results into "
+            "Organize W: recordings into daily split *_rec folders and sorting results into "
             "daily *_Sorting/shX/day_hour_shX folders."
         )
     )
@@ -580,7 +596,7 @@ def parse_args() -> argparse.Namespace:
         "--rec-organization",
         action="store_true",
         default=None,
-        help="Organize .rec files into daily *_rec folders.",
+        help="Organize .rec files into daily 00_to_11 and 12_to_23 *_rec folders.",
     )
     parser.add_argument(
         "--sorting-organization",
