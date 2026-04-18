@@ -37,7 +37,7 @@ from rec2nwb import (
 RECORDING_METHOD = "spikegadget"
 PROBE_FILE = Path(r"E:\Curtis\spikeinterface\LSNET_probe.json")
 IMPEDANCE_FILE = Path(r"E:\Curtis\spikeinterface\imp_09222025_LSNET18.txt")
-OUTPUT_ROOT = Path(r"S:\\")
+OUTPUT_ROOT = Path(r"S:\\Overflow")
 
 HOUR_DURATION_SEC = 3600
 SAVE_PREPROCESSED_RECORDING = True

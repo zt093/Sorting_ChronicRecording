@@ -48,7 +48,7 @@ MATERIALIZE_SHANK_RECORDING_AS_NUMPY = True
 
 MS5_SORTER_PARAMS = {
     "scheme": "2",
-    "detect_sign": -1,
+    "detect_sign": 0,
     "detect_threshold": 5.5,
     "npca_per_channel": 3,
     "npca_per_subdivision": 10,
@@ -66,10 +66,12 @@ MS5_SORTER_PARAMS = {
 }
 
 MS5_OVERFLOW_FALLBACK_PARAMS = {
-    "detect_sign": -1,
     "whiten": True,
-    "classification_chunk_sec": 300,
     "skip_alignment": True,
+}
+
+MS5_OVERFLOW_CHUNKED_FALLBACK_PARAMS = {
+    "classification_chunk_sec": 300,
 }
 
 
@@ -976,7 +978,8 @@ def run_sorter_pipeline(
             fallback_params.update(MS5_OVERFLOW_FALLBACK_PARAMS)
             print(
                 "Primary MountainSort5 run overflowed during template alignment. "
-                "Retrying with direct MountainSort5 fallback and skip_alignment=True."
+                "Retrying with direct MountainSort5 fallback and skip_alignment=True "
+                "while preserving the original detect_sign."
             )
             try:
                 sorting, sorting_elapsed_sec = time_step(
@@ -988,29 +991,54 @@ def run_sorter_pipeline(
                 fallback_succeeded = True
                 sorter_params = fallback_params
                 step_timings["overflow_fallback_used"] = 1.0
+                step_timings["overflow_fallback_stage"] = 1.0
                 step_timings["run_sorter_fallback_elapsed_sec"] = float(sorting_elapsed_sec)
             except Exception as fallback_exc:
-                failure_summary = _build_sorting_failure_summary(
-                    output_folder=output_folder,
-                    sorter_run_folder=sorter_run_folder,
-                    input_sources=input_sources,
-                    shank_id=shank_id,
-                    window_label=window_label,
-                    sorter_params=fallback_params,
-                    recording=rec_for_sorting,
-                    exc=fallback_exc,
-                    traceback_text=traceback.format_exc(),
-                    sorter_name="mountainsort5_skip_alignment_fallback",
-                    fallback_attempted=True,
-                    fallback_succeeded=False,
+                fallback_traceback = traceback.format_exc()
+                chunked_fallback_params = dict(fallback_params)
+                chunked_fallback_params.update(MS5_OVERFLOW_CHUNKED_FALLBACK_PARAMS)
+                print(
+                    "skip_alignment=True fallback still failed. "
+                    "Retrying with the same detect_sign plus classification_chunk_sec=300."
                 )
-                failure_summary["primary_exception_type"] = type(exc).__name__
-                failure_summary["primary_exception_message"] = str(exc)
-                failure_summary["primary_traceback"] = primary_traceback
-                failure_summary_path = output_folder / "sorting_failure_summary.json"
-                save_json(failure_summary_path, failure_summary)
-                print(f"Saved sorter failure summary to: {failure_summary_path}")
-                raise fallback_exc from exc
+                try:
+                    sorting, sorting_elapsed_sec = time_step(
+                        f"shank_{shank_id}_{window_label}_run_sorter_fallback_chunked",
+                        _run_mountainsort5_skip_alignment_fallback,
+                        recording=rec_for_sorting,
+                        sorter_params=chunked_fallback_params,
+                    )
+                    fallback_succeeded = True
+                    sorter_params = chunked_fallback_params
+                    step_timings["overflow_fallback_used"] = 1.0
+                    step_timings["overflow_fallback_stage"] = 2.0
+                    step_timings["run_sorter_fallback_elapsed_sec"] = float(sorting_elapsed_sec)
+                except Exception as chunked_fallback_exc:
+                    failure_summary = _build_sorting_failure_summary(
+                        output_folder=output_folder,
+                        sorter_run_folder=sorter_run_folder,
+                        input_sources=input_sources,
+                        shank_id=shank_id,
+                        window_label=window_label,
+                        sorter_params=chunked_fallback_params,
+                        recording=rec_for_sorting,
+                        exc=chunked_fallback_exc,
+                        traceback_text=traceback.format_exc(),
+                        sorter_name="mountainsort5_skip_alignment_chunked_fallback",
+                        fallback_attempted=True,
+                        fallback_succeeded=False,
+                    )
+                    failure_summary["primary_exception_type"] = type(exc).__name__
+                    failure_summary["primary_exception_message"] = str(exc)
+                    failure_summary["primary_traceback"] = primary_traceback
+                    failure_summary["fallback_stage_1_sorter"] = "mountainsort5_skip_alignment_fallback"
+                    failure_summary["fallback_stage_1_exception_type"] = type(fallback_exc).__name__
+                    failure_summary["fallback_stage_1_exception_message"] = str(fallback_exc)
+                    failure_summary["fallback_stage_1_traceback"] = fallback_traceback
+                    failure_summary_path = output_folder / "sorting_failure_summary.json"
+                    save_json(failure_summary_path, failure_summary)
+                    print(f"Saved sorter failure summary to: {failure_summary_path}")
+                    raise chunked_fallback_exc from exc
         else:
             failure_summary = _build_sorting_failure_summary(
                 output_folder=output_folder,
