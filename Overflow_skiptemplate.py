@@ -46,6 +46,11 @@ MS_AFTER = 2.0
 MAX_SPIKES_PER_UNIT = 500
 MATERIALIZE_SHANK_RECORDING_AS_NUMPY = True
 
+BIG_NOISE_NEGATIVE_THRESHOLD = -2500.0
+BIG_NOISE_POSITIVE_THRESHOLD = 1000.0
+BIG_NOISE_MARGIN_SAMPLES = 25
+BIG_NOISE_BLANK_ALL_CHANNELS = True
+
 MS5_SORTER_PARAMS = {
     "scheme": "2",
     "detect_sign": 0,
@@ -69,11 +74,6 @@ MS5_OVERFLOW_FALLBACK_PARAMS = {
     "whiten": True,
     "skip_alignment": True,
 }
-
-MS5_OVERFLOW_CHUNKED_FALLBACK_PARAMS = {
-    "classification_chunk_sec": 300,
-}
-
 
 def save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +256,10 @@ def build_batch_output_folder_for_inputs(input_paths: list[Path], data_files: li
 
 def get_overflow_report_path(batch_output_folder: Path, session_description: str) -> Path:
     return batch_output_folder / f"overflow_error_report_{session_description}.json"
+
+
+def get_overflow_skiptemplate_summary_path(batch_output_folder: Path) -> Path:
+    return batch_output_folder / "overflow_skiptemplate_summary.json"
 
 
 def get_sorting_unit_property(sorting, unit_id, property_name: str):
@@ -569,6 +573,115 @@ def materialize_recording_as_numpy(recording):
     return numpy_recording
 
 
+def remove_big_noise_artifacts(
+    recording,
+    negative_threshold: float = BIG_NOISE_NEGATIVE_THRESHOLD,
+    positive_threshold: float = BIG_NOISE_POSITIVE_THRESHOLD,
+    margin_samples: int = BIG_NOISE_MARGIN_SAMPLES,
+    blank_all_channels: bool = BIG_NOISE_BLANK_ALL_CHANNELS,
+):
+    traces = np.asarray(recording.get_traces())
+    if traces.ndim != 2:
+        raise ValueError(f"Expected 2D traces array, got shape {traces.shape}")
+
+    artifact_mask = (traces < negative_threshold) | (traces > positive_threshold)
+    event_count = int(np.count_nonzero(artifact_mask))
+    if event_count == 0:
+        metadata = {
+            "negative_threshold": float(negative_threshold),
+            "positive_threshold": float(positive_threshold),
+            "margin_samples": int(margin_samples),
+            "blank_all_channels": bool(blank_all_channels),
+            "num_threshold_crossings": 0,
+            "num_masked_samples": 0,
+            "num_masked_segments": 0,
+        }
+        return materialize_recording_as_numpy(recording), metadata
+
+    if blank_all_channels:
+        sample_hits = np.any(artifact_mask, axis=1)
+        channel_hits = artifact_mask.any(axis=0)
+        masked_channel_indices = np.flatnonzero(channel_hits)
+    else:
+        sample_hits = np.any(artifact_mask, axis=1)
+        masked_channel_indices = None
+
+    expanded_mask = np.zeros(sample_hits.shape[0], dtype=bool)
+    hit_indices = np.flatnonzero(sample_hits)
+    for hit_index in hit_indices:
+        start = max(0, int(hit_index) - int(margin_samples))
+        end = min(sample_hits.shape[0], int(hit_index) + int(margin_samples) + 1)
+        expanded_mask[start:end] = True
+
+    cleaned_traces = traces.copy()
+    if blank_all_channels:
+        cleaned_traces[expanded_mask, :] = 0
+    else:
+        cleaned_traces[artifact_mask] = 0
+        for hit_index in hit_indices:
+            start = max(0, int(hit_index) - int(margin_samples))
+            end = min(sample_hits.shape[0], int(hit_index) + int(margin_samples) + 1)
+            affected_channels = np.flatnonzero(artifact_mask[hit_index])
+            if affected_channels.size > 0:
+                cleaned_traces[start:end, affected_channels] = 0
+
+    transitions = np.diff(np.r_[False, expanded_mask, False].astype(np.int8))
+    segment_starts = np.flatnonzero(transitions == 1)
+    segment_ends = np.flatnonzero(transitions == -1)
+    artifact_segments = [
+        {"start_frame": int(start), "end_frame": int(end)}
+        for start, end in zip(segment_starts, segment_ends)
+    ]
+
+    cleaned_recording = si.NumpyRecording(
+        traces_list=[cleaned_traces],
+        sampling_frequency=float(recording.get_sampling_frequency()),
+        channel_ids=[str(ch) for ch in recording.get_channel_ids()],
+    )
+
+    try:
+        gains = recording.get_channel_gains()
+        if gains is not None:
+            cleaned_recording.set_channel_gains(np.asarray(gains))
+    except Exception:
+        pass
+
+    try:
+        offsets = recording.get_channel_offsets()
+        if offsets is not None:
+            cleaned_recording.set_channel_offsets(np.asarray(offsets))
+    except Exception:
+        pass
+
+    for prop_key in recording.get_property_keys():
+        try:
+            cleaned_recording.set_property(prop_key, recording.get_property(prop_key))
+        except Exception:
+            pass
+
+    try:
+        if hasattr(recording, "has_probe") and recording.has_probe():
+            cleaned_recording = cleaned_recording.set_probe(recording.get_probe(), in_place=False)
+    except Exception:
+        pass
+
+    metadata = {
+        "negative_threshold": float(negative_threshold),
+        "positive_threshold": float(positive_threshold),
+        "margin_samples": int(margin_samples),
+        "blank_all_channels": bool(blank_all_channels),
+        "num_threshold_crossings": int(event_count),
+        "num_masked_samples": int(np.count_nonzero(expanded_mask)),
+        "num_masked_segments": int(len(artifact_segments)),
+        "masked_fraction": float(np.count_nonzero(expanded_mask) / traces.shape[0]),
+        "artifact_segments_preview": artifact_segments[:50],
+    }
+    if blank_all_channels:
+        metadata["masked_channel_indices"] = [int(idx) for idx in masked_channel_indices.tolist()]
+
+    return cleaned_recording, metadata
+
+
 def preprocess_recording(recording, window_metadata: dict):
     rec_cr = preproc.common_reference(recording, operator="median", reference="global")
     rec_filt = preproc.bandpass_filter(
@@ -577,15 +690,17 @@ def preprocess_recording(recording, window_metadata: dict):
         freq_max=6000,
         dtype="float32",
     )
+    rec_denoised, noise_metadata = remove_big_noise_artifacts(rec_filt)
     metadata = {
-        "steps": ["common_reference", "bandpass_filter"],
+        "steps": ["common_reference", "bandpass_filter", "remove_big_noise_artifacts"],
         "params": {
             "common_reference": {"operator": "median", "reference": "global"},
             "bandpass_filter": {"freq_min": 300, "freq_max": 6000, "dtype": "float32"},
+            "remove_big_noise_artifacts": noise_metadata,
             "window": window_metadata,
         },
     }
-    return rec_filt, metadata
+    return rec_denoised, metadata
 
 
 def _build_ms5_scheme2_parameters(sorter_params: dict):
@@ -994,51 +1109,27 @@ def run_sorter_pipeline(
                 step_timings["overflow_fallback_stage"] = 1.0
                 step_timings["run_sorter_fallback_elapsed_sec"] = float(sorting_elapsed_sec)
             except Exception as fallback_exc:
-                fallback_traceback = traceback.format_exc()
-                chunked_fallback_params = dict(fallback_params)
-                chunked_fallback_params.update(MS5_OVERFLOW_CHUNKED_FALLBACK_PARAMS)
-                print(
-                    "skip_alignment=True fallback still failed. "
-                    "Retrying with the same detect_sign plus classification_chunk_sec=300."
+                failure_summary = _build_sorting_failure_summary(
+                    output_folder=output_folder,
+                    sorter_run_folder=sorter_run_folder,
+                    input_sources=input_sources,
+                    shank_id=shank_id,
+                    window_label=window_label,
+                    sorter_params=fallback_params,
+                    recording=rec_for_sorting,
+                    exc=fallback_exc,
+                    traceback_text=traceback.format_exc(),
+                    sorter_name="mountainsort5_skip_alignment_fallback",
+                    fallback_attempted=True,
+                    fallback_succeeded=False,
                 )
-                try:
-                    sorting, sorting_elapsed_sec = time_step(
-                        f"shank_{shank_id}_{window_label}_run_sorter_fallback_chunked",
-                        _run_mountainsort5_skip_alignment_fallback,
-                        recording=rec_for_sorting,
-                        sorter_params=chunked_fallback_params,
-                    )
-                    fallback_succeeded = True
-                    sorter_params = chunked_fallback_params
-                    step_timings["overflow_fallback_used"] = 1.0
-                    step_timings["overflow_fallback_stage"] = 2.0
-                    step_timings["run_sorter_fallback_elapsed_sec"] = float(sorting_elapsed_sec)
-                except Exception as chunked_fallback_exc:
-                    failure_summary = _build_sorting_failure_summary(
-                        output_folder=output_folder,
-                        sorter_run_folder=sorter_run_folder,
-                        input_sources=input_sources,
-                        shank_id=shank_id,
-                        window_label=window_label,
-                        sorter_params=chunked_fallback_params,
-                        recording=rec_for_sorting,
-                        exc=chunked_fallback_exc,
-                        traceback_text=traceback.format_exc(),
-                        sorter_name="mountainsort5_skip_alignment_chunked_fallback",
-                        fallback_attempted=True,
-                        fallback_succeeded=False,
-                    )
-                    failure_summary["primary_exception_type"] = type(exc).__name__
-                    failure_summary["primary_exception_message"] = str(exc)
-                    failure_summary["primary_traceback"] = primary_traceback
-                    failure_summary["fallback_stage_1_sorter"] = "mountainsort5_skip_alignment_fallback"
-                    failure_summary["fallback_stage_1_exception_type"] = type(fallback_exc).__name__
-                    failure_summary["fallback_stage_1_exception_message"] = str(fallback_exc)
-                    failure_summary["fallback_stage_1_traceback"] = fallback_traceback
-                    failure_summary_path = output_folder / "sorting_failure_summary.json"
-                    save_json(failure_summary_path, failure_summary)
-                    print(f"Saved sorter failure summary to: {failure_summary_path}")
-                    raise chunked_fallback_exc from exc
+                failure_summary["primary_exception_type"] = type(exc).__name__
+                failure_summary["primary_exception_message"] = str(exc)
+                failure_summary["primary_traceback"] = primary_traceback
+                failure_summary_path = output_folder / "sorting_failure_summary.json"
+                save_json(failure_summary_path, failure_summary)
+                print(f"Saved sorter failure summary to: {failure_summary_path}")
+                raise fallback_exc from exc
         else:
             failure_summary = _build_sorting_failure_summary(
                 output_folder=output_folder,
@@ -1477,6 +1568,8 @@ def run_retry_task(
         "shank_id": shank_id,
         "num_input_files": 1,
         "runs": [],
+        "num_runs_succeeded": 0,
+        "status": "pending",
         "resort_scope": "overflow_report_retry",
         "source_overflow_report": str(task["report_path"]),
     }
@@ -1502,9 +1595,11 @@ def run_retry_task(
     )
     shank_batch["runs"].append(result)
     shank_batch["runs"].sort(key=lambda run: run["recording_label"])
+    shank_batch["num_runs_succeeded"] = int(len(shank_batch["runs"]))
 
     shank_wall_clock_elapsed_sec = perf_counter() - batch_start_time
     shank_batch["wall_clock_elapsed_sec"] = float(shank_wall_clock_elapsed_sec)
+    shank_batch["status"] = "success"
 
     shank_summary_path = (
         build_shank_output_root(batch_output_folder, session_description, shank_id)
@@ -1520,6 +1615,8 @@ def run_retry_task(
             "input_file": str(task["input_file"]),
             "recording_label": str(task["recording_label"]),
         },
+        "retry_status": "success",
+        "retry_succeeded": True,
         "result": result,
         "shank_config_elapsed_sec": float(shank_config_elapsed_sec),
         "preview_elapsed_sec": float(preview_elapsed_sec),
@@ -1678,21 +1775,33 @@ def main() -> None:
 
         overall_elapsed_sec = perf_counter() - overall_start
         mode_elapsed_sec = perf_counter() - mode_start
+        num_retry_succeeded = sum(1 for item in retry_results if item.get("retry_succeeded"))
+        num_retry_failed = len(retry_results) - num_retry_succeeded
         rerun_summary = {
-            "mode": "overflow_report_folder_retry",
+            "mode": "overflow_skiptemplate_folder_retry",
             "report_folder": str(overflow_folder),
             "recording_method": RECORDING_METHOD,
             "num_reports": int(len(report_paths)),
             "num_retry_tasks": int(len(retry_tasks)),
+            "num_retry_succeeded": int(num_retry_succeeded),
+            "num_retry_failed": int(num_retry_failed),
+            "all_retries_succeeded": bool(num_retry_failed == 0 and len(retry_results) == len(retry_tasks)),
+            "status": (
+                "all_retries_succeeded"
+                if num_retry_failed == 0 and len(retry_results) == len(retry_tasks)
+                else "retry_incomplete"
+            ),
             "first_file_only_duration_sec": float(first_file_only_duration) if first_file_only_duration is not None else None,
             "collect_user_inputs_elapsed_sec": float(input_elapsed_sec),
             "retry_mode_wall_clock_elapsed_sec": float(mode_elapsed_sec),
             "overall_wall_clock_elapsed_sec": float(overall_elapsed_sec),
+            "source_overflow_reports": [str(path) for path in report_paths],
+            "session_labels": sorted({str(task["session_description"]) for task in retry_tasks}),
             "tasks": retry_results,
         }
-        rerun_summary_path = overflow_folder / "overflow_rerun_summary.json"
+        rerun_summary_path = get_overflow_skiptemplate_summary_path(overflow_folder)
         save_json(rerun_summary_path, rerun_summary)
-        print(f"\nSaved overflow rerun summary to: {rerun_summary_path}")
+        print(f"\nSaved overflow skiptemplate summary to: {rerun_summary_path}")
         print(f"Finished overflow-report retry processing in {_format_elapsed_time(mode_elapsed_sec)}.")
         return
 

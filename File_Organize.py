@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path(r"H:\\")  # Fallback root when you want one path for both source and target.
+DEFAULT_ROOT = Path(r"S:\\")  # Fallback root when you want one path for both source and target.
 DEFAULT_TARGET_ROOT = DEFAULT_ROOT  # Final write location for organized folders.
 DEFAULT_SHANK_COUNT = 32
-DEFAULT_REC_ORGANIZATION = True  # True: move .rec files into daily split *_rec folders.
+DEFAULT_REC_ORGANIZATION = False  # True: move .rec files into daily split *_rec folders.
 DEFAULT_SORTING_ORGANIZATION = False  # True: organize sorting results into *_Sorting folders.
 DEFAULT_CLEANUP_EMPTY = False  # True: remove empty folders left behind after moves.
 DEFAULT_DELETE_PREPROCESS = False  # True: delete preprocessed_recording folders after organization.
 DEFAULT_DELETE_FAILED_SORTING_RESULTS = False  # True: ask for a failed session label to delete.
+DEFAULT_CHECK_SORTING_COMPLETION = True  # True: verify one or more organized *_Sorting folders are complete.
 DEFAULT_SOURCE_ROOTS = [
     Path(r"W:\260224_Sorting"),
     Path(r"W:\260224_rec\0224_12_23\260224_Sorting"),
@@ -132,6 +134,329 @@ def build_session_summary_target(root: Path, day_code: str, session_span: str, f
     return root / f"{day_code}_Sorting" / f"{stem}_{session_span}{suffix}"
 
 
+def load_json_file(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8-sig") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}, found {type(payload).__name__}")
+    return payload
+
+
+def iter_organized_sorting_roots(root: Path):
+    if parse_day_code_from_sorting_root(root) is not None:
+        yield root
+        return
+
+    for child in sorted(root.glob("*_Sorting")):
+        if child.is_dir():
+            yield child
+
+
+def has_complete_sorted_output(output_folder: Path | None) -> tuple[bool, list[str]]:
+    issues: list[str] = []
+    if output_folder is None:
+        return False, ["missing output folder path"]
+
+    if not output_folder.exists():
+        return False, [f"missing output folder: {output_folder}"]
+    if not output_folder.is_dir():
+        return False, [f"output folder is not a directory: {output_folder}"]
+
+    required_files = (
+        output_folder / "sorting_summary.json",
+        output_folder / "sorted_units.npz",
+        output_folder / "analysis_summary.json",
+    )
+    for required_file in required_files:
+        if not required_file.is_file():
+            issues.append(f"missing file: {required_file}")
+
+    sorted_sorting_folder = output_folder / "sorted_sorting"
+    if not sorted_sorting_folder.is_dir():
+        issues.append(f"missing folder: {sorted_sorting_folder}")
+
+    return len(issues) == 0, issues
+
+
+def build_overflow_retry_index(sorting_root: Path) -> dict[tuple[str, str, str], dict]:
+    retry_index: dict[tuple[str, str, str], dict] = {}
+    for summary_path in sorted(sorting_root.glob("overflow_skiptemplate_summary*.json")):
+        summary = load_json_file(summary_path)
+        for task_entry in summary.get("tasks", []):
+            if not isinstance(task_entry, dict):
+                continue
+
+            task = task_entry.get("task") or {}
+            if not isinstance(task, dict):
+                continue
+
+            session_description = str(task.get("session_description") or "").strip()
+            shank_id = str(task.get("shank_id") or "").strip()
+            recording_label = str(task.get("recording_label") or "").strip()
+            if not session_description or not shank_id or not recording_label:
+                continue
+
+            result = task_entry.get("result")
+            output_folder = None
+            if isinstance(result, dict) and result.get("output_folder"):
+                output_folder = Path(str(result["output_folder"]))
+            artifacts_ok, artifact_issues = has_complete_sorted_output(output_folder)
+
+            retry_succeeded_value = task_entry.get("retry_succeeded")
+            retry_succeeded = bool(retry_succeeded_value) if isinstance(retry_succeeded_value, bool) else artifacts_ok
+            retry_status = str(task_entry.get("retry_status") or ("success" if retry_succeeded else "failed"))
+
+            retry_index[(session_description, shank_id, recording_label)] = {
+                "retry_status": retry_status,
+                "retry_succeeded": retry_succeeded,
+                "summary_path": str(summary_path),
+                "output_folder": str(output_folder) if output_folder is not None else None,
+                "artifact_issues": artifact_issues,
+            }
+
+    return retry_index
+
+
+def sort_session_run_key(item: dict) -> tuple[int, str, str]:
+    shank_value = str(item.get("shank_id") or "")
+    try:
+        shank_sort = int(shank_value)
+    except ValueError:
+        shank_sort = 10**9
+    return shank_sort, shank_value, str(item.get("recording_label") or "")
+
+
+def check_sorting_completion(root: Path) -> dict:
+    """
+    Check whether each shank/run session in organized *_Sorting folders has final sorting output.
+
+    Normal successful runs are validated from the outputs created by
+    Combined_NWB+Sorting+Analyze.py. Runs that previously overflowed are considered complete only
+    if they appear as successful in the retry outputs from Overflow_skiptemplate.py.
+    """
+    root = root.resolve()
+    sorting_roots = list(iter_organized_sorting_roots(root))
+    retry_indices = {
+        sorting_root: build_overflow_retry_index(sorting_root)
+        for sorting_root in sorting_roots
+    }
+
+    report = {
+        "root": str(root),
+        "num_sorting_roots": int(len(sorting_roots)),
+        "all_sessions_complete": True,
+        "sessions": [],
+        "issues": [],
+    }
+    if not sorting_roots:
+        report["all_sessions_complete"] = False
+        report["issues"].append(f"no organized *_Sorting folders found under {root}")
+
+    for sorting_root in sorting_roots:
+        retry_index = retry_indices[sorting_root]
+        combined_summary_paths = sorted(sorting_root.glob("combined_batch_summary_*.json"))
+        if not combined_summary_paths:
+            report["all_sessions_complete"] = False
+            report["issues"].append(f"missing combined_batch_summary_*.json under {sorting_root}")
+            continue
+
+        for combined_summary_path in combined_summary_paths:
+            combined_summary = load_json_file(combined_summary_path)
+            session_description = str(
+                combined_summary.get("session_description")
+                or combined_summary_path.stem.replace("combined_batch_summary_", "", 1)
+            )
+            overflow_report_path_raw = combined_summary.get("overflow_error_report")
+            overflow_report_path = (
+                Path(str(overflow_report_path_raw))
+                if overflow_report_path_raw else sorting_root / f"overflow_error_report_{session_description}.json"
+            )
+            overflow_failures_by_key: dict[tuple[str, str, str], dict] = {}
+            if overflow_report_path.is_file():
+                overflow_report = load_json_file(overflow_report_path)
+                for failure in overflow_report.get("failures", []):
+                    if not isinstance(failure, dict):
+                        continue
+                    key = (
+                        session_description,
+                        str(failure.get("shank_id") or ""),
+                        str(failure.get("recording_label") or ""),
+                    )
+                    overflow_failures_by_key[key] = failure
+
+            shank_entries = combined_summary.get("shanks", [])
+            session_runs: list[dict] = []
+            session_issues: list[str] = []
+            seen_run_keys: set[tuple[str, str, str]] = set()
+
+            for shank_entry in shank_entries:
+                if not isinstance(shank_entry, dict):
+                    continue
+
+                shank_id = str(shank_entry.get("shank_id") or "")
+                shank_summary_path_raw = shank_entry.get("summary_path")
+                shank_summary_path = (
+                    Path(str(shank_summary_path_raw))
+                    if shank_summary_path_raw else sorting_root / f"sh{shank_id}" / f"batch_summary_{session_description}_sh{shank_id}.json"
+                )
+                if not shank_id:
+                    session_issues.append(f"missing shank_id in {combined_summary_path}")
+                    continue
+                if not shank_summary_path.is_file():
+                    session_issues.append(f"missing shank summary for session {session_description}, shank {shank_id}: {shank_summary_path}")
+                    continue
+
+                shank_summary = load_json_file(shank_summary_path)
+                runs = shank_summary.get("runs", [])
+                if not runs:
+                    session_issues.append(f"no runs found in {shank_summary_path}")
+                    continue
+
+                for run in runs:
+                    if not isinstance(run, dict):
+                        continue
+
+                    recording_label = str(run.get("recording_label") or "")
+                    run_key = (session_description, shank_id, recording_label)
+                    seen_run_keys.add(run_key)
+                    run_output_folder = Path(str(run["output_folder"])) if run.get("output_folder") else None
+                    run_artifacts_ok, run_artifact_issues = has_complete_sorted_output(run_output_folder)
+                    overflow_failure = overflow_failures_by_key.get(run_key)
+                    retry_entry = retry_index.get(run_key)
+                    final_status = "success"
+                    final_source = "combined_batch_summary"
+                    final_artifacts_ok = run_artifacts_ok
+                    final_output_folder = str(run_output_folder) if run_output_folder is not None else None
+                    run_issues = list(run_artifact_issues)
+
+                    if overflow_failure is not None or str(run.get("status") or "") == "overflow_error":
+                        final_source = "overflow_retry"
+                        if retry_entry is None:
+                            final_status = "missing_retry"
+                            final_artifacts_ok = False
+                            run_issues.append(
+                                f"overflow retry result not found for session {session_description}, shank {shank_id}, recording {recording_label}"
+                            )
+                        else:
+                            final_status = str(retry_entry["retry_status"])
+                            final_artifacts_ok = bool(retry_entry["retry_succeeded"])
+                            final_output_folder = retry_entry["output_folder"]
+                            run_issues = list(retry_entry["artifact_issues"])
+                            if not final_artifacts_ok and not run_issues:
+                                run_issues.append(
+                                    f"overflow retry did not finish successfully for session {session_description}, shank {shank_id}, recording {recording_label}"
+                                )
+
+                    session_runs.append(
+                        {
+                            "session_description": session_description,
+                            "shank_id": shank_id,
+                            "recording_label": recording_label,
+                            "had_overflow_error": overflow_failure is not None,
+                            "final_status": final_status,
+                            "final_source": final_source,
+                            "has_sorted_data": bool(final_artifacts_ok),
+                            "output_folder": final_output_folder,
+                            "issues": run_issues,
+                        }
+                    )
+
+            missing_overflow_runs = sorted(set(overflow_failures_by_key) - seen_run_keys)
+            for session_key, shank_id, recording_label in missing_overflow_runs:
+                retry_entry = retry_index.get((session_key, shank_id, recording_label))
+                has_sorted_data = bool(retry_entry and retry_entry["retry_succeeded"])
+                run_issues = []
+                if retry_entry is None:
+                    run_issues.append(
+                        f"overflow failure listed in report but no retry result found for session {session_key}, shank {shank_id}, recording {recording_label}"
+                    )
+                else:
+                    run_issues.extend(retry_entry["artifact_issues"])
+                session_runs.append(
+                    {
+                        "session_description": session_key,
+                        "shank_id": shank_id,
+                        "recording_label": recording_label,
+                        "had_overflow_error": True,
+                        "final_status": str(retry_entry["retry_status"]) if retry_entry is not None else "missing_retry",
+                        "final_source": "overflow_retry",
+                        "has_sorted_data": has_sorted_data,
+                        "output_folder": retry_entry["output_folder"] if retry_entry is not None else None,
+                        "issues": run_issues,
+                    }
+                )
+
+            session_runs.sort(key=sort_session_run_key)
+            session_complete = len(session_issues) == 0 and all(run["has_sorted_data"] for run in session_runs)
+            report["all_sessions_complete"] = report["all_sessions_complete"] and session_complete
+            report["sessions"].append(
+                {
+                    "sorting_root": str(sorting_root),
+                    "session_description": session_description,
+                    "combined_summary_path": str(combined_summary_path),
+                    "overflow_report_path": str(overflow_report_path) if overflow_report_path.exists() else None,
+                    "num_expected_shanks": int(len(shank_entries)),
+                    "num_runs_checked": int(len(session_runs)),
+                    "num_overflow_failures": int(len(overflow_failures_by_key)),
+                    "session_complete": session_complete,
+                    "issues": session_issues,
+                    "runs": session_runs,
+                }
+            )
+
+    report["num_sessions"] = int(len(report["sessions"]))
+    report["num_incomplete_sessions"] = int(sum(1 for session in report["sessions"] if not session["session_complete"]))
+    return report
+
+
+def check_sorting_completion_for_sorting_folder(sorting_folder: Path) -> dict:
+    """
+    Check sorting completeness for one organized daily sorting folder such as ``260224_Sorting``.
+    """
+    sorting_folder = sorting_folder.resolve()
+    if not sorting_folder.exists():
+        raise FileNotFoundError(f"Sorting folder does not exist: {sorting_folder}")
+    if not sorting_folder.is_dir():
+        raise NotADirectoryError(f"Sorting folder is not a directory: {sorting_folder}")
+    if parse_day_code_from_sorting_root(sorting_folder) is None:
+        raise ValueError(
+            "Expected an organized daily sorting folder like '260224_Sorting', "
+            f"got: {sorting_folder.name}"
+        )
+    return check_sorting_completion(sorting_folder)
+
+
+def print_sorting_completion_report(report: dict) -> None:
+    print(f"Sorting completion root: {report['root']}")
+    print(f"Sorting roots scanned: {report['num_sorting_roots']}")
+    print(f"Sessions checked: {report['num_sessions']}")
+    print(f"Incomplete sessions: {report['num_incomplete_sessions']}")
+    print(f"All sessions complete: {report['all_sessions_complete']}")
+
+    if report.get("issues"):
+        print("Top-level issues:")
+        for issue in report["issues"]:
+            print(f"  - {issue}")
+
+    for session in report.get("sessions", []):
+        print(
+            f"session {session['session_description']}: "
+            f"complete={session['session_complete']} | runs={session['num_runs_checked']} | "
+            f"overflow_failures={session['num_overflow_failures']}"
+        )
+        for issue in session.get("issues", []):
+            print(f"  - {issue}")
+        for run in session.get("runs", []):
+            if run["has_sorted_data"]:
+                continue
+            print(
+                f"  - shank {run['shank_id']} | recording {run['recording_label']} | "
+                f"source={run['final_source']} | status={run['final_status']}"
+            )
+            for issue in run.get("issues", []):
+                print(f"    * {issue}")
+
+
 def ensure_unique_destination(destination: Path) -> Path:
     if not destination.exists():
         return destination
@@ -171,6 +496,70 @@ def prompt_source_roots(default_roots: list[Path]) -> list[Path]:
     if not response:
         return default_roots
     return [Path(part.strip()) for part in response.split(",") if part.strip()]
+
+
+def prompt_sorting_completion_folders(
+    source_roots: list[Path],
+    target_root: Path,
+) -> list[Path]:
+    response = input(
+        "Enter organized sorting folder path(s) to check, such as 260224_Sorting or "
+        r"S:\260224_Sorting. Separate multiple folders with commas: "
+    ).strip()
+    if not response:
+        raise ValueError("No sorting folder was entered for completion checking.")
+
+    candidate_bases = [target_root]
+    candidate_bases.extend(source_roots)
+    candidate_bases.append(Path.cwd())
+
+    folders: list[Path] = []
+    for raw_part in response.split(","):
+        part = raw_part.strip().strip('"').strip("'")
+        if not part:
+            continue
+
+        raw_path = Path(part)
+        resolved_path: Path | None = None
+        if raw_path.is_absolute():
+            resolved_path = raw_path.resolve()
+        else:
+            candidate_paths = []
+            if raw_path.parent != Path("."):
+                candidate_paths.append(raw_path.resolve())
+            else:
+                candidate_paths.extend(base / raw_path for base in candidate_bases)
+                candidate_paths.append(raw_path.resolve())
+
+            for candidate_path in candidate_paths:
+                if candidate_path.exists():
+                    resolved_path = candidate_path.resolve()
+                    break
+
+        if resolved_path is None:
+            raise FileNotFoundError(
+                f"Could not find sorting folder '{part}'. Try a full path like S:\\260224_Sorting."
+            )
+        if not resolved_path.is_dir():
+            raise NotADirectoryError(f"Sorting folder is not a directory: {resolved_path}")
+        if parse_day_code_from_sorting_root(resolved_path) is None:
+            raise ValueError(
+                "Expected an organized daily sorting folder like '260224_Sorting', "
+                f"got: {resolved_path.name}"
+            )
+        folders.append(resolved_path)
+
+    if not folders:
+        raise ValueError("No sorting folder was entered for completion checking.")
+
+    unique_folders: list[Path] = []
+    seen: set[Path] = set()
+    for folder in folders:
+        if folder in seen:
+            continue
+        seen.add(folder)
+        unique_folders.append(folder)
+    return unique_folders
 
 
 def apply_interactive_settings(args: argparse.Namespace) -> argparse.Namespace:
@@ -215,6 +604,12 @@ def apply_interactive_settings(args: argparse.Namespace) -> argparse.Namespace:
             DEFAULT_DELETE_FAILED_SORTING_RESULTS,
         )
 
+    if args.check_sorting_completion is None:
+        args.check_sorting_completion = prompt_yes_no(
+            "Check whether organized *_Sorting folders have complete final sorting outputs?",
+            DEFAULT_CHECK_SORTING_COMPLETION,
+        )
+
     args.rec_dry_run = args.dry_run
     args.sorting_dry_run = args.dry_run
     args.cleanup_empty_dry_run = args.dry_run
@@ -235,6 +630,8 @@ def apply_default_settings(args: argparse.Namespace) -> argparse.Namespace:
         args.delete_preprocess = DEFAULT_DELETE_PREPROCESS
     if args.delete_failed_sorting_results is None:
         args.delete_failed_sorting_results = DEFAULT_DELETE_FAILED_SORTING_RESULTS
+    if args.check_sorting_completion is None:
+        args.check_sorting_completion = DEFAULT_CHECK_SORTING_COMPLETION
     if args.target_root is None:
         args.target_root = DEFAULT_TARGET_ROOT
     args.rec_dry_run = args.dry_run
@@ -542,6 +939,30 @@ def resolve_organization_roots(args: argparse.Namespace) -> tuple[list[Path], Pa
     return source_roots, target_root
 
 
+def resolve_sorting_completion_folders(
+    args: argparse.Namespace,
+    source_roots: list[Path],
+    target_root: Path,
+) -> list[Path]:
+    candidates: list[Path] = []
+    if parse_day_code_from_sorting_root(args.root.resolve()) is not None:
+        candidates.append(args.root.resolve())
+    for source_root in source_roots:
+        if parse_day_code_from_sorting_root(source_root) is not None:
+            candidates.append(source_root)
+    if parse_day_code_from_sorting_root(target_root) is not None:
+        candidates.append(target_root)
+
+    unique_candidates: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -634,6 +1055,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Interactively delete sorting result folders for one session label such as 260224_12.",
     )
+    parser.add_argument(
+        "--check-sorting-completion",
+        action="store_true",
+        default=None,
+        help="Check one or more organized daily sorting folders such as 260224_Sorting for complete final outputs.",
+    )
     return parser.parse_args()
 
 
@@ -686,6 +1113,7 @@ def main() -> None:
     print(f"cleanup_empty: {args.cleanup_empty}")
     print(f"delete_preprocess: {args.delete_preprocess}")
     print(f"delete_failed_sorting_results: {args.delete_failed_sorting_results}")
+    print(f"check_sorting_completion: {args.check_sorting_completion}")
     if args.rec_organization:
         print(f"rec dry run: {args.rec_dry_run}")
     if args.sorting_organization:
@@ -727,6 +1155,21 @@ def main() -> None:
     if args.cleanup_empty:
         for source_root in source_roots:
             remove_empty_directories(source_root, dry_run=args.cleanup_empty_dry_run)
+
+    if args.check_sorting_completion:
+        sorting_completion_folders = resolve_sorting_completion_folders(
+            args,
+            source_roots,
+            target_root,
+        )
+        if not sorting_completion_folders:
+            sorting_completion_folders = prompt_sorting_completion_folders(
+                source_roots,
+                target_root,
+            )
+        for sorting_folder in sorting_completion_folders:
+            report = check_sorting_completion_for_sorting_folder(sorting_folder)
+            print_sorting_completion_report(report)
 
     print("Organization step(s) complete.")
 
