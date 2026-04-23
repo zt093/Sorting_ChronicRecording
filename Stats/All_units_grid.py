@@ -20,6 +20,9 @@ DEFAULT_MS_BEFORE = 1.0
 DEFAULT_MS_AFTER = 2.0
 ACTIVE_WINDOW_LOWER_PERCENTILE = 5.0
 ACTIVE_WINDOW_UPPER_PERCENTILE = 95.0
+DEFAULT_MIN_SESSIONS_PRESENT = 15
+DEFAULT_MIN_SPIKES_AFTER_FILTER = 20
+DEFAULT_WAVEFORM_ABS_THRESHOLD_UV = 2500.0
 
 # True: make one compact figure where each aligned unit is shown once as a summary cell.
 ALL_UNITS_ONLY = True
@@ -105,9 +108,9 @@ class UniqueUnitSummary:
 
 @dataclass(frozen=True)
 class AlignedUnitsGridConfig:
-    min_sessions_present: int = 20
-    min_spikes_after_filter: int = 20
-    waveform_abs_threshold_uv: float = 1500.0
+    min_sessions_present: int = DEFAULT_MIN_SESSIONS_PRESENT
+    min_spikes_after_filter: int = DEFAULT_MIN_SPIKES_AFTER_FILTER
+    waveform_abs_threshold_uv: float = DEFAULT_WAVEFORM_ABS_THRESHOLD_UV
     isi_range_ms: tuple[float, float] = (0.0, 50.0)
     isi_bin_ms: float = 1.0
     waveform_panel_width_ratio: float = 1.0

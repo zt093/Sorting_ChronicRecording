@@ -8,15 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path(r"S:\\")  # Fallback root when you want one path for both source and target.
+DEFAULT_ROOT = Path(r"S:\260403_Sorting")  # Fallback root when you want one path for both source and target.
 DEFAULT_TARGET_ROOT = DEFAULT_ROOT  # Final write location for organized folders.
 DEFAULT_SHANK_COUNT = 32
 DEFAULT_REC_ORGANIZATION = False  # True: move .rec files into daily split *_rec folders.
 DEFAULT_SORTING_ORGANIZATION = False  # True: organize sorting results into *_Sorting folders.
 DEFAULT_CLEANUP_EMPTY = False  # True: remove empty folders left behind after moves.
-DEFAULT_DELETE_PREPROCESS = False  # True: delete preprocessed_recording folders after organization.
+DEFAULT_DELETE_PREPROCESS = True  # True: delete preprocessed_recording folders after organization.
 DEFAULT_DELETE_FAILED_SORTING_RESULTS = False  # True: ask for a failed session label to delete.
-DEFAULT_CHECK_SORTING_COMPLETION = True  # True: verify one or more organized *_Sorting folders are complete.
+DEFAULT_CHECK_SORTING_COMPLETION = False  # True: verify one or more organized *_Sorting folders are complete.
 DEFAULT_SOURCE_ROOTS = [
     Path(r"W:\260224_Sorting"),
     Path(r"W:\260224_rec\0224_12_23\260224_Sorting"),
@@ -880,7 +880,14 @@ def delete_preprocessed_recording_folders(root: Path, dry_run: bool) -> int:
         if dry_run:
             print(f"[delete_preprocess] would remove: {folder}")
             continue
-        shutil.rmtree(folder, ignore_errors=True)
+        try:
+            shutil.rmtree(folder)
+        except OSError as exc:
+            print(f"[delete_preprocess] failed to remove: {folder} ({exc})")
+            continue
+        if folder.exists():
+            print(f"[delete_preprocess] failed to remove: {folder} (folder still exists)")
+            continue
         print(f"[delete_preprocess] removed: {folder}")
     return deleted_count
 
@@ -952,6 +959,23 @@ def resolve_sorting_completion_folders(
             candidates.append(source_root)
     if parse_day_code_from_sorting_root(target_root) is not None:
         candidates.append(target_root)
+
+    unique_candidates: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def resolve_delete_preprocess_roots(
+    args: argparse.Namespace,
+    source_roots: list[Path],
+    target_root: Path,
+) -> list[Path]:
+    candidates = [*source_roots, args.root.resolve(), target_root]
 
     unique_candidates: list[Path] = []
     seen: set[Path] = set()
@@ -1145,9 +1169,9 @@ def main() -> None:
 
     if args.delete_preprocess:
         deleted_count = 0
-        for source_root in source_roots:
+        for delete_root in resolve_delete_preprocess_roots(args, source_roots, target_root):
             deleted_count += delete_preprocessed_recording_folders(
-                source_root,
+                delete_root,
                 dry_run=args.delete_preprocess_dry_run,
             )
         print(f"preprocessed_recording folders matched: {deleted_count}")

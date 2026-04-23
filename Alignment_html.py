@@ -1726,15 +1726,28 @@ class AlignmentState:
             raise ValueError(f"Unknown page: shank={shank_id}, page={page_id}")
         return shank_pages[page_id]
 
-    def _resolve_aliases_for_page(self, page: PageSummary) -> tuple[dict[str, UnitSummary], dict[str, list[UnitSummary]]]:
-        display_rows = self.build_page_display_rows_local(page)
+    def _resolve_aliases_for_page(
+        self,
+        page: PageSummary,
+        display_rows: list[dict[int, list[UnitSummary]]] | None = None,
+    ) -> tuple[dict[str, UnitSummary], dict[str, list[UnitSummary]]]:
+        if display_rows is None:
+            display_rows = self.build_page_display_rows_local(page)
         unit_alias_map, row_alias_map, _alias_by_unit_key = self._build_alias_maps(page, display_rows)
         return unit_alias_map, row_alias_map
 
-    def resolve_command_units(self, page: PageSummary, alias_tokens: list[str]) -> list[UnitSummary]:
+    def resolve_command_units(
+        self,
+        page: PageSummary,
+        alias_tokens: list[str],
+        *,
+        unit_alias_map: dict[str, UnitSummary] | None = None,
+        row_alias_map: dict[str, list[UnitSummary]] | None = None,
+    ) -> list[UnitSummary]:
         if not alias_tokens:
             raise ValueError("Add at least one alias such as u1 or r1.")
-        unit_alias_map, row_alias_map = self._resolve_aliases_for_page(page)
+        if unit_alias_map is None or row_alias_map is None:
+            unit_alias_map, row_alias_map = self._resolve_aliases_for_page(page)
         resolved: list[UnitSummary] = []
         seen: set[str] = set()
         for alias in alias_tokens:
@@ -1757,8 +1770,20 @@ class AlignmentState:
             resolved.append(unit)
         return resolved
 
-    def resolve_single_command_unit(self, page: PageSummary, alias_token: str) -> UnitSummary:
-        units = self.resolve_command_units(page, [alias_token])
+    def resolve_single_command_unit(
+        self,
+        page: PageSummary,
+        alias_token: str,
+        *,
+        unit_alias_map: dict[str, UnitSummary] | None = None,
+        row_alias_map: dict[str, list[UnitSummary]] | None = None,
+    ) -> UnitSummary:
+        units = self.resolve_command_units(
+            page,
+            [alias_token],
+            unit_alias_map=unit_alias_map,
+            row_alias_map=row_alias_map,
+        )
         if len(units) != 1:
             raise ValueError(f"{alias_token} resolved to {len(units)} units. Use a single unit alias like u1 for similarity.")
         return units[0]
@@ -1814,13 +1839,31 @@ class AlignmentState:
                 unit.exclude_from_auto_align = False
         return group_name, len(expanded_keys)
 
-    def run_page_command(self, page: PageSummary, command_name: str, alias_tokens: list[str]) -> tuple[str, bool]:
+    def run_page_command(
+        self,
+        page: PageSummary,
+        command_name: str,
+        alias_tokens: list[str],
+        *,
+        unit_alias_map: dict[str, UnitSummary] | None = None,
+        row_alias_map: dict[str, list[UnitSummary]] | None = None,
+    ) -> tuple[str, bool]:
         normalized = command_name.strip().lower()
         if normalized in {"similarity", "similarities", "compare"}:
             if len(alias_tokens) != 2:
                 raise ValueError("similarity needs exactly two unit aliases, for example: similarity u1 u2")
-            left = self.resolve_single_command_unit(page, alias_tokens[0])
-            right = self.resolve_single_command_unit(page, alias_tokens[1])
+            left = self.resolve_single_command_unit(
+                page,
+                alias_tokens[0],
+                unit_alias_map=unit_alias_map,
+                row_alias_map=row_alias_map,
+            )
+            right = self.resolve_single_command_unit(
+                page,
+                alias_tokens[1],
+                unit_alias_map=unit_alias_map,
+                row_alias_map=row_alias_map,
+            )
             return (
                 f"similarity {alias_tokens[0]} vs {alias_tokens[1]} | "
                 f"waveform={compute_waveform_similarity(left, right):.3f}, "
@@ -1830,7 +1873,12 @@ class AlignmentState:
                 False,
             )
 
-        units = self.resolve_command_units(page, alias_tokens)
+        units = self.resolve_command_units(
+            page,
+            alias_tokens,
+            unit_alias_map=unit_alias_map,
+            row_alias_map=row_alias_map,
+        )
         if normalized == "align":
             session_indices = {unit.session_index for unit in units}
             if len(units) < 2:
@@ -1904,6 +1952,8 @@ class AlignmentState:
     def apply_commands(self, shank_id: int, page_id: str, raw_text: str) -> dict:
         with self._lock:
             page = self.get_page(shank_id, page_id)
+            display_rows = self.build_page_display_rows_local(page)
+            unit_alias_map, row_alias_map = self._resolve_aliases_for_page(page, display_rows=display_rows)
             before_snapshot = self.snapshot()
             messages: list[str] = []
             changed_state = False
@@ -1917,7 +1967,13 @@ class AlignmentState:
                 tokens = line.split()
                 if len(tokens) < 2:
                     raise ValueError(f"Line {line_number}: expected a command followed by one or more aliases.")
-                result_text, command_changed_state = self.run_page_command(page, tokens[0], tokens[1:])
+                result_text, command_changed_state = self.run_page_command(
+                    page,
+                    tokens[0],
+                    tokens[1:],
+                    unit_alias_map=unit_alias_map,
+                    row_alias_map=row_alias_map,
+                )
                 messages.append(f"Line {line_number}: {result_text}")
                 changed_state = changed_state or command_changed_state
             if not messages:
@@ -2077,7 +2133,7 @@ Use aliases like u1 and r1 from the current page.</div>
     async function fetchJson(url, options = undefined) {{ const response = await fetch(url, options); const payload = await response.json(); if (!response.ok) throw new Error(payload.error || "Request failed"); return payload; }}
     function populateShanks() {{ shankSelect.innerHTML = ""; DATA.shanks.forEach((entry) => {{ const option = document.createElement("option"); option.value = String(entry.shank_id); option.textContent = Number(entry.shank_id) === -1 ? "Discarded Units" : `Shank ${{entry.shank_id}}`; shankSelect.appendChild(option); }}); }}
     function populatePages() {{ pageSelect.innerHTML = ""; currentShank().pages.forEach((page) => {{ const option = document.createElement("option"); option.value = page.page_id; option.textContent = page.page_type === "discarded" ? "Discarded Units" : `SG ${{page.sg_channel}}`; pageSelect.appendChild(option); }}); }}
-    function renderUnitCard(unit) {{ const tags = []; const hasAutoMerge = unit.merge_group && (unit.merge_group.startsWith("__alignmerge__") || unit.merge_group.startsWith("__automerge__")); const hasManualMerge = unit.merge_group && !hasAutoMerge; if (unit.align_group) tags.push(`<span class="tag align">align=${{unit.align_group}}</span>`); if (hasManualMerge) tags.push(`<span class="tag">merge=${{unit.merge_group}}</span>`); else if (hasAutoMerge) tags.push('<span class="tag auto">auto-merge</span>'); if (unit.is_discarded) tags.push('<span class="tag discarded">discarded</span>'); if (unit.is_noise && !unit.is_discarded) tags.push('<span class="tag noise">noise</span>'); const cardClass = hasManualMerge ? "unit-card merged" : "unit-card"; const zoomLabel = `${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}} | sh${{unit.shank_id}} | sg${{unit.sg_channel}}`; return `<article class="${{cardClass}}" data-image-src="${{unit.waveform_image_path}}" data-image-label="${{zoomLabel}}"><div class="unit-head"><div><div class="unit-name">${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}}</div><div class="muted">sh${{unit.shank_id}} | sg${{unit.sg_channel}}</div></div></div><div class="unit-tags">${{tags.join("")}}</div><div class="metrics"><div>FR: ${{metric(unit.firing_rate)}} Hz</div><div>SNR: ${{metric(unit.snr)}}</div><div><strong>Amp: ${{metric(unit.amplitude_median)}}</strong></div><div>ISI: ${{metric(unit.isi_violations_ratio)}}</div><div>Spikes: ${{unit.num_spikes ?? "nan"}}</div></div><img loading="lazy" src="${{unit.waveform_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}}"></article>`; }}
+    function renderUnitCard(unit) {{ const tags = []; const mergeGroup = unit.merge_group || ""; const hasAlignMerge = mergeGroup.startsWith("__alignmerge__"); const hasAutoMerge = mergeGroup.startsWith("__automerge__"); const hasGeneratedMerge = hasAlignMerge || hasAutoMerge; const hasManualMerge = mergeGroup && !hasGeneratedMerge; if (unit.align_group) tags.push(`<span class="tag align">align=${{unit.align_group}}</span>`); if (hasManualMerge) tags.push(`<span class="tag">merge=${{mergeGroup}}</span>`); else if (hasAlignMerge) tags.push('<span class="tag auto">align-merge</span>'); else if (hasAutoMerge) tags.push('<span class="tag auto">auto-merge</span>'); if (unit.is_discarded) tags.push('<span class="tag discarded">discarded</span>'); if (unit.is_noise && !unit.is_discarded) tags.push('<span class="tag noise">noise</span>'); const cardClass = hasManualMerge ? "unit-card merged" : "unit-card"; const zoomLabel = `${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}} | sh${{unit.shank_id}} | sg${{unit.sg_channel}}`; return `<article class="${{cardClass}}" data-image-src="${{unit.waveform_image_path}}" data-image-label="${{zoomLabel}}"><div class="unit-head"><div><div class="unit-name">${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}}</div><div class="muted">sh${{unit.shank_id}} | sg${{unit.sg_channel}}</div></div></div><div class="unit-tags">${{tags.join("")}}</div><div class="metrics"><div>FR: ${{metric(unit.firing_rate)}} Hz</div><div>SNR: ${{metric(unit.snr)}}</div><div><strong>Amp: ${{metric(unit.amplitude_median)}}</strong></div><div>ISI: ${{metric(unit.isi_violations_ratio)}}</div><div>Spikes: ${{unit.num_spikes ?? "nan"}}</div></div><img loading="lazy" src="${{unit.waveform_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}}"></article>`; }}
     function openLightbox(imageSrc, label) {{ lightboxImage.src = imageSrc; lightboxCaption.textContent = label || ""; lightbox.classList.add("open"); }}
     function closeLightbox() {{ lightbox.classList.remove("open"); lightboxImage.removeAttribute("src"); lightboxCaption.textContent = ""; }}
     function render() {{ document.getElementById("root-path").textContent = DATA.output_root; document.getElementById("summary-root").textContent = DATA.summary_root; document.getElementById("stat-shanks").textContent = `${{DATA.summary.num_selectable_shanks}} selectable / ${{DATA.summary.num_loaded_shanks}} loaded`; document.getElementById("stat-pages").textContent = `${{DATA.summary.num_selectable_pages}} selectable / ${{DATA.summary.num_loaded_pages}} loaded`; document.getElementById("stat-rows").textContent = DATA.summary.num_selectable_rows; const emptyNotice = document.getElementById("empty-shanks-notice"); const noticeParts = []; if (DATA.empty_shank_folder_ids && DATA.empty_shank_folder_ids.length) noticeParts.push(`No sorted units were loaded for shank folder(s): ${{DATA.empty_shank_folder_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_shank_ids && DATA.hidden_shank_ids.length) noticeParts.push(`No reviewable non-discarded pages for shank(s): ${{DATA.hidden_shank_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_page_labels && DATA.hidden_page_labels.length) noticeParts.push(`Hidden empty pages: ${{DATA.hidden_page_labels.join(", ")}}`); if (noticeParts.length) {{ emptyNotice.innerHTML = noticeParts.map((text) => `<div class="notice">${{text}}</div>`).join(""); }} else {{ emptyNotice.innerHTML = ""; }} const page = currentPage(); const isDiscardedPage = page.page_type === "discarded"; const currentShankId = Number(currentShank().shank_id); const pageHeading = currentShankId === -1 ? page.title : `Shank ${{page.shank_id}} | ${{page.title}}`; const kindFilter = kindSelect.value; const search = searchInput.value.trim().toLowerCase(); const rows = page.rows.filter((row) => {{ if (kindFilter !== "all" && row.row_kind !== kindFilter) return false; if (!search) return true; const haystack = [row.row_alias, row.row_kind, ...row.sessions_present, ...row.units.map((unit) => `${{unit.alias}} ${{unit.session_name}} u${{unit.unit_id}} sh${{unit.shank_id}} sg${{unit.sg_channel}} ${{unit.align_group}} ${{unit.merge_group}}`)].join(" ").toLowerCase(); return haystack.includes(search); }}); const visibleUnits = rows.flatMap((row) => row.units); const summaryText = isDiscardedPage ? `${{page.summary.total_discarded_units}} discarded unit(s) across all shanks` : `${{page.summary.total_units}} unit(s) on this channel, ${{page.summary.total_discarded_units}} auto-discarded`; if (!(isDiscardedPage ? visibleUnits.length : rows.length)) {{ app.innerHTML = `<div class="empty">${{isDiscardedPage ? "No discarded units match the current filters." : "No rows match the current filters."}}</div>`; document.getElementById("apply-btn").disabled = isDiscardedPage; document.getElementById("save-page-btn").disabled = isDiscardedPage; document.getElementById("export-page-btn").disabled = isDiscardedPage; return; }} const contentHtml = isDiscardedPage ? `<div class="unit-grid">${{visibleUnits.map(renderUnitCard).join("")}}</div>` : `<div class="rows">${{rows.map((row) => `<section class="row-card ${{row.row_kind}}"><div class="row-summary"><div><strong>Row ${{row.row_index}} | ${{row.row_alias}}</strong><div class="muted">Shown in: ${{row.sessions_present.join(", ") || "none"}}</div></div><div class="badges"><span class="badge">${{row.row_kind}}</span><span class="badge">${{row.num_units}} unit(s)</span></div></div><div class="unit-grid">${{row.units.map(renderUnitCard).join("")}}</div></section>`).join("")}}</div>`; app.innerHTML = `<div class="page-header"><div><h2>${{pageHeading}}</h2><div class="muted">${{summaryText}}</div></div><div class="pills"><span class="pill">${{isDiscardedPage ? visibleUnits.length : rows.length}} visible ${{isDiscardedPage ? "unit(s)" : "row(s)"}}</span><span class="pill">${{page.available_unit_aliases.length}} unit alias(es)</span>${{isDiscardedPage ? "" : `<span class="pill">${{page.available_row_aliases.length}} row alias(es)</span>`}}${{isDiscardedPage ? '<span class="pill">Commands disabled on this page</span>' : ''}}</div></div>${{contentHtml}}<div class="bottom-nav"><button id="bottom-prev-shank-btn">Previous Shank</button><button id="bottom-next-shank-btn">Next Shank</button><span class="muted" id="bottom-shank-nav-message"></span><button id="bottom-prev-page-btn">Previous Page</button><button id="bottom-next-page-btn">Next Page</button><span class="muted" id="bottom-page-nav-message"></span></div>`; document.getElementById("bottom-prev-shank-btn").addEventListener("click", () => goToShank(-1)); document.getElementById("bottom-next-shank-btn").addEventListener("click", () => goToShank(1)); document.getElementById("bottom-prev-page-btn").addEventListener("click", () => goToPage(-1)); document.getElementById("bottom-next-page-btn").addEventListener("click", () => goToPage(1)); document.getElementById("apply-btn").disabled = isDiscardedPage; document.getElementById("save-page-btn").disabled = isDiscardedPage; document.getElementById("export-page-btn").disabled = isDiscardedPage; const bottomPageMessage = document.getElementById("bottom-page-nav-message"); if (bottomPageMessage) bottomPageMessage.textContent = pageNavMessage.textContent; const bottomShankMessage = document.getElementById("bottom-shank-nav-message"); if (bottomShankMessage) bottomShankMessage.textContent = shankNavMessage.textContent; }}
