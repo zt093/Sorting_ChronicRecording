@@ -362,8 +362,10 @@ def plot_units_by_exact_session_count(
     output_dir: Path,
     *,
     max_sessions: int,
+    session_label: str = "Session",
+    output_name: str = "units_by_exact_session_count.png",
 ) -> Path:
-    log_status("Building plot: units by exact session count")
+    log_status(f"Building plot: units by exact {session_label.lower()} count")
     session_counts = (
         df["num_sessions"]
         .value_counts()
@@ -375,15 +377,15 @@ def plot_units_by_exact_session_count(
     bars = ax.bar(session_counts.index, session_counts.values, color=BAR_COLOR, edgecolor="black", linewidth=0.8)
     annotate_bars(ax, bars, session_counts.astype(int).tolist())
     style_axis(ax)
-    ax.set_title("Unique Units by Exact Number of Sessions", fontsize=14, pad=12)
-    ax.set_xlabel("Number of Sessions Present")
+    ax.set_title(f"Unique Units by Exact Number of {session_label}s", fontsize=14, pad=12)
+    ax.set_xlabel(f"Number of {session_label}s Present")
     ax.set_ylabel("Number of Units")
     ax.set_xticks(range(1, max_sessions + 1))
     ax.set_xlim(0.25, max_sessions + 0.75)
     if session_counts.max() > 0:
         ax.set_ylim(0, session_counts.max() * 1.15 + 1)
 
-    output_path = output_dir / "units_by_exact_session_count.png"
+    output_path = output_dir / output_name
     save_figure(fig, output_path)
     return output_path
 
@@ -394,9 +396,12 @@ def plot_top_channels_by_persistent_units(
     *,
     min_sessions_for_stable: int,
     top_n: int,
+    session_label: str = "Session",
+    output_name: str = "top_channels_by_persistent_units.png",
 ) -> Path | None:
     log_status(
-        f"Building plot: top channels by persistent units (threshold >= {min_sessions_for_stable} sessions)"
+        "Building plot: top channels by persistent units "
+        f"(threshold >= {min_sessions_for_stable} {session_label.lower()}s)"
     )
     filtered = df[df["num_sessions"] >= min_sessions_for_stable].copy()
     if filtered.empty:
@@ -428,7 +433,7 @@ def plot_top_channels_by_persistent_units(
     bars = ax.barh(labels, values, color="#4f7f4f", edgecolor="black", linewidth=0.8)
     style_axis(ax)
     ax.set_title(
-        f"Top Channels by Units Present in >= {min_sessions_for_stable} Sessions",
+        f"Top Channels by Units Present in >= {min_sessions_for_stable} {session_label}s",
         fontsize=14,
         pad=12,
     )
@@ -446,7 +451,7 @@ def plot_top_channels_by_persistent_units(
             fontsize=9,
         )
 
-    output_path = output_dir / "top_channels_by_persistent_units.png"
+    output_path = output_dir / output_name
     save_figure(fig, output_path)
     return output_path
 
@@ -772,12 +777,14 @@ def plot_quality_metrics_vs_persistence(
     output_dir: Path,
     *,
     max_sessions: int,
+    session_label: str = "Session",
+    output_name: str = "quality_metrics_vs_persistence.png",
 ) -> Path | None:
     if quality_df.empty:
         log_status("Skipping quality-metrics figure because no quality data was available")
         return None
 
-    log_status("Building plot: quality metrics vs cross-session persistence")
+    log_status(f"Building plot: quality metrics vs cross-{session_label.lower()} persistence")
     group_metrics = (
         quality_df.groupby(["final_group_key", "num_sessions", "shank_id"], dropna=False)
         .agg(
@@ -843,7 +850,7 @@ def plot_quality_metrics_vs_persistence(
 
         style_axis(ax)
         ax.set_title(title)
-        ax.set_xlabel("Number of Sessions Present")
+        ax.set_xlabel(f"Number of {session_label}s Present")
         ax.set_ylabel(y_label)
         ax.set_xticks(range(1, max_sessions + 1, max(1, max_sessions // 12)))
         ax.set_xlim(0.5, max_sessions + 0.5)
@@ -852,10 +859,10 @@ def plot_quality_metrics_vs_persistence(
         else:
             ax.legend(handles=[scatter], loc="best", fontsize=8, frameon=False)
 
-    fig.suptitle("Quality Metrics vs Cross-Session Persistence", fontsize=16, y=1.01)
+    fig.suptitle(f"Quality Metrics vs Cross-{session_label} Persistence", fontsize=16, y=1.01)
     fig.tight_layout()
 
-    output_path = output_dir / "quality_metrics_vs_persistence.png"
+    output_path = output_dir / output_name
     save_figure(fig, output_path)
     return output_path
 
@@ -865,12 +872,14 @@ def plot_quality_metrics_by_session(
     output_dir: Path,
     *,
     max_sessions: int,
+    session_label: str = "Session",
+    output_name: str = "quality_metrics_by_session.png",
 ) -> Path | None:
     if quality_df.empty:
         log_status("Skipping session-index quality figure because no quality data was available")
         return None
 
-    log_status("Building plot: quality metrics by session index")
+    log_status(f"Building plot: quality metrics by {session_label.lower()} index")
     session_quality_df = quality_df.dropna(subset=["session_index"]).copy()
     if session_quality_df.empty:
         log_status("Skipping session-index quality figure because session indices were unavailable")
@@ -972,7 +981,7 @@ def plot_quality_metrics_by_session(
 
         style_axis(ax)
         ax.set_title(title)
-        ax.set_xlabel("Session Index")
+        ax.set_xlabel(f"{session_label} Index")
         ax.set_ylabel(y_label)
         tick_step = max(1, max_sessions // 12)
         ax.set_xticks(range(0, max_sessions, tick_step))
@@ -982,10 +991,10 @@ def plot_quality_metrics_by_session(
         else:
             ax.legend(handles=[scatter], loc="best", fontsize=8, frameon=False)
 
-    fig.suptitle("Quality Metrics by Session Index", fontsize=16, y=1.01)
+    fig.suptitle(f"Quality Metrics by {session_label} Index", fontsize=16, y=1.01)
     fig.tight_layout()
 
-    output_path = output_dir / "quality_metrics_by_session.png"
+    output_path = output_dir / output_name
     save_figure(fig, output_path)
     return output_path
 

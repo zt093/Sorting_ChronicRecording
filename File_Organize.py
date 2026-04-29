@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path(r"S:\260403_Sorting")  # Fallback root when you want one path for both source and target.
+DEFAULT_ROOT = Path(r"S:\260406_Sorting")  # Fallback root when you want one path for both source and target.
 DEFAULT_TARGET_ROOT = DEFAULT_ROOT  # Final write location for organized folders.
 DEFAULT_SHANK_COUNT = 32
 DEFAULT_REC_ORGANIZATION = False  # True: move .rec files into daily split *_rec folders.
