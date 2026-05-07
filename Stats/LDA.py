@@ -26,7 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.colors import BoundaryNorm
 import numpy as np
 import pandas as pd
 import spikeinterface.full as si
@@ -75,17 +75,10 @@ UNIT_FEATURE_TYPES = (
 )
 
 
-def build_circadian_plasma_colormap() -> LinearSegmentedColormap:
-    base_cmap = plt.get_cmap("plasma")
-    rising = base_cmap(np.linspace(0.0, 1.0, 128))
-    falling = base_cmap(np.linspace(1.0, 0.0, 128))
-    colors = np.vstack([rising, falling])
-    return LinearSegmentedColormap.from_list("circadian_plasma", colors, N=256)
-
-
-CIRCULAR_HOUR_CMAP = build_circadian_plasma_colormap()
-CIRCULAR_HOUR_NORM = Normalize(vmin=0.0, vmax=24.0)
-CIRCULAR_HOUR_TICKS = [0, 6, 12, 18, 24]
+CIRCULAR_HOUR_CMAP = plt.get_cmap("twilight_shifted", 24)
+CIRCULAR_HOUR_BOUNDARIES = np.arange(-0.5, 24.5, 1.0)
+CIRCULAR_HOUR_NORM = BoundaryNorm(CIRCULAR_HOUR_BOUNDARIES, CIRCULAR_HOUR_CMAP.N)
+CIRCULAR_HOUR_TICKS = list(range(24))
 CIRCULAR_HOUR_LABEL = "Hour"
 
 
@@ -1837,7 +1830,7 @@ def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
                 y_values[point_indices],
                 color="#f4a3b5",
                 linewidth=0.8,
-                alpha=0.55,
+                alpha=0.28,
                 zorder=1,
             )
 
@@ -1847,10 +1840,10 @@ def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
         c=hours,
         cmap=CIRCULAR_HOUR_CMAP,
         norm=CIRCULAR_HOUR_NORM,
-        s=34,
-        alpha=0.9,
-        edgecolors="white",
-        linewidths=0.4,
+        s=44,
+        alpha=0.92,
+        edgecolors="black",
+        linewidths=0.35,
         zorder=2,
     )
 
@@ -1864,7 +1857,10 @@ def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
         ax=ax,
         fraction=0.046,
         pad=0.04,
+        boundaries=CIRCULAR_HOUR_BOUNDARIES,
         ticks=CIRCULAR_HOUR_TICKS,
+        spacing="proportional",
+        drawedges=True,
     )
     colorbar.set_label(CIRCULAR_HOUR_LABEL)
     fig.tight_layout()
@@ -1901,7 +1897,7 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
                 z_values[point_indices],
                 color="#f4a3b5",
                 linewidth=0.8,
-                alpha=0.55,
+                alpha=0.28,
                 zorder=1,
             )
 
@@ -1912,8 +1908,10 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
         c=hours,
         cmap=CIRCULAR_HOUR_CMAP,
         norm=CIRCULAR_HOUR_NORM,
-        s=24,
-        alpha=0.85,
+        s=36,
+        alpha=0.92,
+        edgecolors="black",
+        linewidths=0.35,
     )
 
     ax.set_title("Population LDA Projection (3D)")
@@ -1925,7 +1923,10 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
         ax=ax,
         fraction=0.046,
         pad=0.04,
+        boundaries=CIRCULAR_HOUR_BOUNDARIES,
         ticks=CIRCULAR_HOUR_TICKS,
+        spacing="proportional",
+        drawedges=True,
     )
     colorbar.set_label(CIRCULAR_HOUR_LABEL)
     fig.tight_layout()
@@ -1990,8 +1991,9 @@ def save_outputs(
     decoding_results: dict[str, dict],
 ) -> Path:
     mode_slug = str(feature_mode).strip().lower()
+    smoothing_slug = "_smooth" if config.apply_smoothing else ""
     file_stem = (
-        f"lda_{date_label}_minsess_{config.min_sessions_per_unit}_{mode_slug}"
+        f"lda_{date_label}_minsess_{config.min_sessions_per_unit}_{mode_slug}{smoothing_slug}"
     )
     if config.lda_mode == "single_day_5min":
         file_stem = f"{file_stem}_single_day_5min"

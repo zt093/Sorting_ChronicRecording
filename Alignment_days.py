@@ -44,7 +44,6 @@ import webbrowser
 from http.server import ThreadingHTTPServer
 
 import numpy as np
-import spikeinterface.full as si
 
 import Alignment_html as html_review
 from Units_alignment_UI import (
@@ -54,7 +53,6 @@ from Units_alignment_UI import (
     UnitSummary,
     build_metrics_lookup,
     choose_output_root,
-    ensure_required_extensions,
     find_unit_summary_image,
     get_autocorrelogram_vector,
     get_trough_to_peak_duration_ms,
@@ -239,12 +237,7 @@ def load_output_context(output_folder: Path, cache: dict[str, dict]) -> dict:
         return cached
 
     analyzer_folder = resolve_analyzer_folder(output_folder)
-    analyzer = si.load_sorting_analyzer(
-        folder=analyzer_folder,
-        format="zarr",
-        load_extensions=True,
-    )
-    ensure_required_extensions(analyzer)
+    analyzer = load_analyzer_for_day_review(analyzer_folder)
     context = {
         "analyzer_folder": str(analyzer_folder),
         "analyzer": analyzer,
@@ -253,6 +246,18 @@ def load_output_context(output_folder: Path, cache: dict[str, dict]) -> dict:
     }
     cache[cache_key] = context
     return context
+
+
+def load_analyzer_for_day_review(analyzer_folder: Path):
+    compatibility = html_review.ensure_zarr_sorting_analyzer_compatibility(analyzer_folder)
+    if compatibility.get("changed"):
+        print(
+            f"[compatibility] {analyzer_folder}: {compatibility.get('message', 'updated metadata')}",
+            flush=True,
+        )
+    analyzer = html_review.load_sorting_analyzer_for_review(analyzer_folder)
+    html_review.ensure_review_extensions(analyzer)
+    return analyzer
 
 
 def load_member_snapshot(member_payload: dict, cache: dict[str, dict]) -> dict:
@@ -548,6 +553,17 @@ class AlignmentDaysState(html_review.AlignmentState):
             self.root_folder,
             progress_callback=progress_callback,
         )
+        self.load_reports = [
+            {
+                "status": "loaded",
+                "session_name": session.session_name,
+                "session_index": int(session.session_index),
+                "output_folder": session.output_folder,
+                "analyzer_folder": session.analyzer_folder,
+                "unit_count": len(session.units),
+            }
+            for session in self.sessions
+        ]
         self.summary_root = _cache_folder
         self.summary_root.mkdir(parents=True, exist_ok=True)
         self.cache_folder = self.summary_root / "_cache"

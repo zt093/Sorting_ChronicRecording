@@ -4,13 +4,13 @@ HTML alignment review app.
 This script reuses the core alignment logic from Units_alignment_UI.py, but
 serves a browser-based review and editing app that can cover multiple shanks
 from one batch output root.
-
+c
 High-level structure
 --------------------
 1. `load_all_sessions_multi_shank(...)` loads all analyzer folders into
    `SessionSummary` / `UnitSummary` objects.
 2. `AlignmentState` owns all mutable decision state (align, merge, noise,
-   discard-derived visibility, undo snapshots, manifest save/load).
+   undo snapshots, manifest save/load).
 3. `build_app_payload()` converts the current Python state into the JSON payload
    consumed by the browser UI.
 4. `build_html_shell()` is the browser app shell (layout + client-side logic).
@@ -25,10 +25,8 @@ Save/export tiers
 
 Visibility rules
 ----------------
-- Discarded units are hidden from normal SG page review and shown on the global
-  discarded page instead.
-- SG pages with no reviewable non-discarded units are hidden from the page
-  selectors, but still reported in the summary/notice payload.
+- SG pages with no loaded units are hidden from the page selectors, but still
+  reported in the summary/notice payload.
 """
 
 from __future__ import annotations
@@ -41,15 +39,17 @@ import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import math
 from pathlib import Path
+import re
 import shutil
 import threading
 import traceback
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import webbrowser
 
-import spikeinterface.full as si
+import matplotlib.pyplot as plt
+import numpy as np
+from spikeinterface import load_sorting_analyzer
 
 from Units_alignment_UI import (
     AUTO_MERGE_MIN_SIMILARITY,
@@ -57,21 +57,19 @@ from Units_alignment_UI import (
     PageSummary,
     SessionSummary,
     UnitSummary,
-    build_discard_reason,
     build_metrics_lookup,
     choose_output_root,
     compute_amplitude_similarity,
     compute_autocorrelogram_similarity,
     compute_similarity,
     compute_waveform_similarity,
-    discover_analyzer_folders,
+    ensure_required_extensions,
     find_unit_summary_image,
     format_metric,
     get_autocorrelogram_vector,
     get_trough_to_peak_duration_ms,
     get_waveform_vector,
     infer_unit_channel_metadata,
-    is_unit_auto_discarded,
     load_unit_channel_mapping,
     safe_float,
     safe_int,
@@ -86,6 +84,8 @@ HTML_TITLE = "Alignment Review"
 MANIFEST_NAME = "alignment_manifest.json"
 AUTO_ALIGN_MIN_SIMILARITY = 0.75
 FORCE_WAVEFORM_LINK_THRESHOLD = 0.99
+CURATED_ANALYZER_FOLDER_NAME = "curated_analyzer"
+LEGACY_ANALYZER_FOLDER_NAME = "sorting_analyzer_analysis.zarr"
 
 
 def iter_all_units(sessions: list[SessionSummary]) -> list[UnitSummary]:
@@ -95,148 +95,200 @@ def iter_all_units(sessions: list[SessionSummary]) -> list[UnitSummary]:
     return units
 
 
-def format_exception_one_line(exc: Exception) -> str:
-    return "".join(traceback.format_exception_only(type(exc), exc)).strip()
+def session_sort_key(path: Path):
+    name = path.parent.name
+    digits = re.findall(r"\d+", name)
+    numeric_key = int(digits[-1]) if digits else 10**9
+    return (numeric_key, name.lower(), str(path))
 
 
-def make_json_safe(value):
-    """Convert Python non-finite floats to strict browser-parseable JSON values."""
-    if isinstance(value, dict):
-        return {key: make_json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [make_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [make_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
+def discover_alignment_analyzer_folders(root_folder: Path) -> list[Path]:
+    """Find per-session analyzers under a batch root.
 
+    Xiaorong's curated workflow stores each session analyzer as:
+        <animal root>/<session>/curated_analyzer
 
-def ensure_zarr_sorting_analyzer_compatibility(analyzer_folder: Path) -> dict:
+    The older analysis workflow used:
+        <batch root>/<session>/sorting_analyzer_analysis.zarr
+
+    If both are present for the same session, use curated_analyzer.
     """
-    Apply the smallest known metadata repair for older SortingAnalyzer Zarr stores.
+    analyzer_names = (CURATED_ANALYZER_FOLDER_NAME, LEGACY_ANALYZER_FOLDER_NAME)
+    candidates_by_output_folder: dict[Path, dict[str, Path]] = defaultdict(dict)
 
-    Current SpikeInterface expects root attrs["settings"]["return_scaled"]. Some
-    older stores do not have it. This function only writes when that key is
-    missing; unreadable data chunks are reported by the caller and not repaired
-    here.
-    """
-    report = {
-        "changed": False,
-        "return_scaled": None,
-        "message": "",
-    }
-    try:
-        import zarr
-    except Exception as exc:
-        report["message"] = f"zarr import failed: {format_exception_one_line(exc)}"
-        return report
+    if root_folder.is_dir() and root_folder.name in analyzer_names:
+        candidates_by_output_folder[root_folder.parent][root_folder.name] = root_folder
 
-    try:
-        zarr_root = zarr.open(str(analyzer_folder), mode="a")
-        settings = dict(zarr_root.attrs.get("settings", {}) or {})
-        if "return_scaled" in settings:
-            report["return_scaled"] = bool(settings["return_scaled"])
-            return report
+    for analyzer_name in analyzer_names:
+        direct_child = root_folder / analyzer_name
+        if direct_child.is_dir():
+            candidates_by_output_folder[root_folder][analyzer_name] = direct_child
+        if root_folder.exists():
+            for path in root_folder.rglob(analyzer_name):
+                if path.is_dir():
+                    candidates_by_output_folder[path.parent][analyzer_name] = path
 
-        inferred_return_scaled = None
-        extensions = zarr_root.get("extensions")
-        if extensions is not None:
-            for extension_name in ("waveforms", "noise_levels", "templates"):
-                if extension_name not in extensions:
-                    continue
-                params = dict(extensions[extension_name].attrs.get("params", {}) or {})
-                if "return_scaled" in params:
-                    inferred_return_scaled = bool(params["return_scaled"])
-                    break
+    analyzer_folders: list[Path] = []
+    for candidates in candidates_by_output_folder.values():
+        curated_analyzer_folder = candidates.get(CURATED_ANALYZER_FOLDER_NAME)
+        if curated_analyzer_folder is not None:
+            analyzer_folders.append(curated_analyzer_folder)
+        elif LEGACY_ANALYZER_FOLDER_NAME in candidates:
+            analyzer_folders.append(candidates[LEGACY_ANALYZER_FOLDER_NAME])
 
-        if inferred_return_scaled is None:
-            inferred_return_scaled = True
-
-        settings["return_scaled"] = inferred_return_scaled
-        zarr_root.attrs["settings"] = settings
-        zarr.consolidate_metadata(zarr_root.store)
-        report["changed"] = True
-        report["return_scaled"] = bool(inferred_return_scaled)
-        report["message"] = f"added settings.return_scaled={inferred_return_scaled}"
-        return report
-    except Exception as exc:
-        report["message"] = f"compatibility check failed: {format_exception_one_line(exc)}"
-        return report
+    analyzer_folders = sorted(set(analyzer_folders), key=session_sort_key)
+    if not analyzer_folders:
+        raise FileNotFoundError(
+            f"No {CURATED_ANALYZER_FOLDER_NAME} or {LEGACY_ANALYZER_FOLDER_NAME} folders found under {root_folder}"
+        )
+    return analyzer_folders
 
 
-def make_analyzer_load_report(
-    *,
-    status: str,
-    session_name: str,
-    analyzer_folder: Path,
-    compatibility: dict,
-    unit_count: int = 0,
-    shank_ids: list[int] | None = None,
-    sg_channels: list[int] | None = None,
-    error: Exception | None = None,
-) -> dict:
-    report = {
-        "status": status,
-        "session_name": session_name,
-        "analyzer_folder": str(analyzer_folder),
-        "unit_count": int(unit_count),
-        "shank_ids": shank_ids or [],
-        "sg_channels": sg_channels or [],
-        "return_scaled": compatibility.get("return_scaled"),
-        "compatibility_message": compatibility.get("message", ""),
-    }
-    if error is not None:
-        report["error_type"] = type(error).__name__
-        report["error_summary"] = format_exception_one_line(error)
-    return report
+def ensure_binary_analyzer_settings_compatibility(analyzer_folder: Path) -> None:
+    settings_file = analyzer_folder / "settings.json"
+    recording_info_file = analyzer_folder / "recording_info" / "recording_attributes.json"
+    if not recording_info_file.exists():
+        return
 
-
-def load_sorting_analyzer_for_review(analyzer_folder: Path):
-    # Do not preload every saved extension. Some old analyzer folders can load
-    # their core sorting, but fail when SpikeInterface eagerly loads all saved
-    # extensions. The review app only needs a known subset below.
-    return si.load_sorting_analyzer(
-        folder=analyzer_folder,
-        format="zarr",
-        load_extensions=False,
-    )
-
-
-def ensure_review_extensions(analyzer) -> None:
-    required_extensions = {
-        "random_spikes": {"method": "uniform", "max_spikes_per_unit": 500},
-        "waveforms": {"ms_before": 1.0, "ms_after": 2.0},
-        "templates": {"operators": ["average", "median", "std"]},
-        "noise_levels": {},
-        "spike_amplitudes": {"peak_sign": "neg"},
-        "quality_metrics": {},
-        "unit_locations": {"method": "monopolar_triangulation"},
-        "correlograms": {"window_ms": 50.0, "bin_ms": 1.0, "method": "auto"},
-        "isi_histograms": {"window_ms": 50.0, "bin_ms": 1.0, "method": "auto"},
-        "template_similarity": {"method": "cosine_similarity"},
-    }
-    for extension_name, kwargs in required_extensions.items():
+    settings: dict = {}
+    if settings_file.exists():
         try:
-            if analyzer.has_extension(extension_name):
-                analyzer.get_extension(extension_name)
-            else:
-                analyzer.compute(extension_name, **kwargs)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not load or compute required extension '{extension_name}': "
-                f"{format_exception_one_line(exc)}"
-            ) from exc
+            settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+    if "return_scaled" in settings:
+        return
+
+    settings["return_scaled"] = True
+    settings_file.write_text(json.dumps(settings, indent=4), encoding="utf-8")
+
+
+def image_url(path: str | Path) -> str:
+    return f"/image?path={quote(str(Path(path).resolve()))}"
+
+
+def choose_cache_folder(root_folder: Path) -> Path:
+    preferred_cache_folder = root_folder / DEFAULT_EXPORT_FOLDER_NAME / "_cache"
+    try:
+        preferred_cache_folder.mkdir(parents=True, exist_ok=True)
+        probe_path = preferred_cache_folder / ".write_test"
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink()
+        return preferred_cache_folder
+    except Exception:
+        fallback_name = sanitize_token(str(root_folder).replace(":", ""))
+        fallback_cache_folder = Path(__file__).resolve().parent / DEFAULT_EXPORT_FOLDER_NAME / "_cache" / fallback_name
+        fallback_cache_folder.mkdir(parents=True, exist_ok=True)
+        return fallback_cache_folder
+
+
+def get_extension_unit_index(analyzer, unit_id) -> int | None:
+    unit_ids = list(analyzer.sorting.get_unit_ids())
+    if unit_id not in unit_ids:
+        return None
+    return unit_ids.index(unit_id)
+
+
+def save_bar_plot(
+    *,
+    values: np.ndarray,
+    bins: np.ndarray,
+    save_path: Path,
+    title: str,
+    xlabel: str,
+    color: str,
+) -> None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(values, dtype=float)
+    bins = np.asarray(bins, dtype=float)
+    if values.size == 0 or bins.size < 2:
+        return
+
+    centers = (bins[:-1] + bins[1:]) / 2.0
+    if centers.size != values.size:
+        centers = np.arange(values.size, dtype=float)
+        width = 0.8
+    else:
+        width = float(np.median(np.diff(bins))) if bins.size > 2 else 0.8
+
+    fig, ax = plt.subplots(figsize=(4.2, 2.2))
+    ax.bar(centers, values, width=width, color=color, edgecolor=color, alpha=0.9)
+    ax.axhline(0, color="#d0d0d0", linewidth=0.7)
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel("count", fontsize=8)
+    ax.tick_params(axis="both", labelsize=7)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(save_path, dpi=140)
+    plt.close(fig)
+
+
+def save_unit_timing_images(
+    *,
+    analyzer,
+    unit_id,
+    cache_folder: Path,
+    session_index: int,
+    session_name: str,
+    shank_id: int,
+    sg_channel: int,
+) -> tuple[Path | None, Path | None]:
+    unit_id_int = int(unit_id)
+    timing_folder = cache_folder / "timing" / f"session_{session_index:03d}"
+    autocorrelogram_path = timing_folder / f"shank{shank_id}_sg{sg_channel}_unit{unit_id_int}_autocorrelogram.png"
+    isi_path = timing_folder / f"shank{shank_id}_sg{sg_channel}_unit{unit_id_int}_isi.png"
+    unit_index = get_extension_unit_index(analyzer, unit_id)
+    if unit_index is None:
+        return None, None
+
+    if analyzer.has_extension("correlograms") and not autocorrelogram_path.exists():
+        try:
+            correlograms, bins = analyzer.get_extension("correlograms").get_data()
+            if unit_index < correlograms.shape[0]:
+                autocorr = np.asarray(correlograms[unit_index, unit_index], dtype=float).copy()
+                center_index = autocorr.size // 2
+                if 0 <= center_index < autocorr.size:
+                    autocorr[center_index] = 0.0
+                save_bar_plot(
+                    values=autocorr,
+                    bins=np.asarray(bins, dtype=float),
+                    save_path=autocorrelogram_path,
+                    title=f"{session_name} u{unit_id_int} autocorr",
+                    xlabel="lag (ms)",
+                    color="#2f6f9f",
+                )
+        except Exception:
+            autocorrelogram_path = None
+
+    if analyzer.has_extension("isi_histograms") and not isi_path.exists():
+        try:
+            isi_histograms, bins = analyzer.get_extension("isi_histograms").get_data()
+            if unit_index < isi_histograms.shape[0]:
+                save_bar_plot(
+                    values=np.asarray(isi_histograms[unit_index], dtype=float),
+                    bins=np.asarray(bins, dtype=float),
+                    save_path=isi_path,
+                    title=f"{session_name} u{unit_id_int} ISI",
+                    xlabel="interval (ms)",
+                    color="#9a6a1f",
+                )
+        except Exception:
+            isi_path = None
+
+    return (
+        autocorrelogram_path if autocorrelogram_path is not None and autocorrelogram_path.exists() else None,
+        isi_path if isi_path is not None and isi_path.exists() else None,
+    )
 
 
 def load_all_sessions_multi_shank(
     root_folder: Path,
     progress_callback=None,
-) -> tuple[list[SessionSummary], dict[int, dict[str, PageSummary]], Path, list[dict]]:
-    analyzer_folders = discover_analyzer_folders(root_folder)
-    cache_folder = root_folder / DEFAULT_EXPORT_FOLDER_NAME / "_cache"
+) -> tuple[list[SessionSummary], dict[int, dict[str, PageSummary]], Path]:
+    analyzer_folders = discover_alignment_analyzer_folders(root_folder)
+    cache_folder = choose_cache_folder(root_folder)
     sessions: list[SessionSummary] = []
-    load_reports: list[dict] = []
     total_sessions = len(analyzer_folders)
 
     if progress_callback is not None:
@@ -253,29 +305,12 @@ def load_all_sessions_multi_shank(
             )
 
         unit_channel_mapping = load_unit_channel_mapping(output_folder)
-        compatibility = ensure_zarr_sorting_analyzer_compatibility(analyzer_folder)
-        if compatibility.get("changed") and progress_callback is not None:
-            progress_callback(f"Applied analyzer compatibility fix for {session_name}: {compatibility['message']}")
-        try:
-            analyzer = load_sorting_analyzer_for_review(analyzer_folder)
-            ensure_review_extensions(analyzer)
-            metrics_lookup = build_metrics_lookup(analyzer)
-        except Exception as exc:
-            load_reports.append(
-                make_analyzer_load_report(
-                    status="skipped",
-                    session_name=session_name,
-                    analyzer_folder=analyzer_folder,
-                    compatibility=compatibility,
-                    error=exc,
-                )
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    f"Skipped {session_name}: {format_exception_one_line(exc)}\n"
-                    f"Regenerate this analyzer folder when possible: {analyzer_folder}"
-                )
-            continue
+        curated_analyzer_folder = analyzer_folder
+        ensure_binary_analyzer_settings_compatibility(curated_analyzer_folder)
+        sorting_analyzer = load_sorting_analyzer(curated_analyzer_folder)
+        analyzer = sorting_analyzer
+        ensure_required_extensions(analyzer)
+        metrics_lookup = build_metrics_lookup(analyzer)
 
         session_summary = SessionSummary(
             session_name=session_name,
@@ -311,46 +346,40 @@ def load_all_sessions_multi_shank(
                     shank_id=metadata["shank_id"],
                     channel_id=metadata["local_channel_on_shank"],
                 )
-
-            session_summary.units.append(
-                UnitSummary(
-                    session_name=session_name,
-                    session_index=session_index,
-                    analyzer_folder=str(analyzer_folder),
-                    output_folder=str(output_folder),
-                    unit_id=unit_id_int,
-                    shank_id=metadata["shank_id"],
-                    local_channel_on_shank=metadata["local_channel_on_shank"],
-                    sg_channel=metadata["sg_channel"],
-                    amplitude_median=safe_float(metrics.get("amplitude_median")),
-                    firing_rate=safe_float(metrics.get("firing_rate")),
-                    isi_violations_ratio=safe_float(metrics.get("isi_violations_ratio")),
-                    snr=safe_float(metrics.get("snr")),
-                    num_spikes=safe_int(metrics.get("num_spikes")),
-                    waveform_similarity_vector=waveform_vector.tolist(),
-                    autocorrelogram_similarity_vector=autocorrelogram_vector.tolist(),
-                    trough_to_peak_duration_ms=trough_to_peak_duration_ms,
-                    waveform_image_path=str(preferred_image_path or image_path),
-                )
+            autocorrelogram_image_path, isi_histogram_image_path = save_unit_timing_images(
+                analyzer=analyzer,
+                unit_id=unit_id,
+                cache_folder=cache_folder,
+                session_index=session_index,
+                session_name=session_name,
+                shank_id=metadata["shank_id"],
+                sg_channel=metadata["sg_channel"],
             )
+
+            unit_summary = UnitSummary(
+                session_name=session_name,
+                session_index=session_index,
+                analyzer_folder=str(analyzer_folder),
+                output_folder=str(output_folder),
+                unit_id=unit_id_int,
+                shank_id=metadata["shank_id"],
+                local_channel_on_shank=metadata["local_channel_on_shank"],
+                sg_channel=metadata["sg_channel"],
+                amplitude_median=safe_float(metrics.get("amplitude_median")),
+                firing_rate=safe_float(metrics.get("firing_rate")),
+                isi_violations_ratio=safe_float(metrics.get("isi_violations_ratio")),
+                snr=safe_float(metrics.get("snr")),
+                num_spikes=safe_int(metrics.get("num_spikes")),
+                waveform_similarity_vector=waveform_vector.tolist(),
+                autocorrelogram_similarity_vector=autocorrelogram_vector.tolist(),
+                trough_to_peak_duration_ms=trough_to_peak_duration_ms,
+                waveform_image_path=str(preferred_image_path or image_path),
+            )
+            unit_summary.autocorrelogram_image_path = str(autocorrelogram_image_path or "")
+            unit_summary.isi_histogram_image_path = str(isi_histogram_image_path or "")
+            session_summary.units.append(unit_summary)
 
         sessions.append(session_summary)
-        load_reports.append(
-            make_analyzer_load_report(
-                status="loaded",
-                session_name=session_name,
-                analyzer_folder=analyzer_folder,
-                compatibility=compatibility,
-                unit_count=len(session_summary.units),
-                shank_ids=sorted({int(unit.shank_id) for unit in session_summary.units}),
-                sg_channels=sorted({int(unit.sg_channel) for unit in session_summary.units}),
-            )
-        )
-        if progress_callback is not None:
-            progress_callback(
-                f"Loaded {session_name}: {len(session_summary.units)} unit(s), "
-                f"shanks={sorted({int(unit.shank_id) for unit in session_summary.units}) or 'none'}"
-            )
 
     pages_by_shank: dict[int, dict[str, PageSummary]] = defaultdict(dict)
     shank_to_channels: dict[int, set[int]] = defaultdict(set)
@@ -384,7 +413,7 @@ def load_all_sessions_multi_shank(
             )
             pages_by_shank[int(shank_id)][page.page_id] = page
 
-    return sessions, dict(pages_by_shank), cache_folder, load_reports
+    return sessions, dict(pages_by_shank), cache_folder
 
 
 def discover_shank_folder_ids(root_folder: Path) -> list[str]:
@@ -404,7 +433,7 @@ class AlignmentState:
         self.summary_root = root_folder / DEFAULT_EXPORT_FOLDER_NAME
         self.summary_root.mkdir(parents=True, exist_ok=True)
         self.discovered_shank_folder_ids = discover_shank_folder_ids(root_folder)
-        self.sessions, self.pages_by_shank, self.cache_folder, self.load_reports = load_all_sessions_multi_shank(
+        self.sessions, self.pages_by_shank, self.cache_folder = load_all_sessions_multi_shank(
             root_folder,
             progress_callback=progress_callback,
         )
@@ -436,7 +465,6 @@ class AlignmentState:
                 "align_group": unit.align_group,
                 "exclude_from_auto_align": unit.exclude_from_auto_align,
                 "is_noise": unit.is_noise,
-                "is_discarded": unit.is_discarded,
             }
         return snapshot
 
@@ -449,7 +477,7 @@ class AlignmentState:
             unit.align_group = str(state.get("align_group", "") or "")
             unit.exclude_from_auto_align = bool(state.get("exclude_from_auto_align", False))
             unit.is_noise = bool(state.get("is_noise", False))
-            unit.is_discarded = bool(state.get("is_discarded", False))
+            unit.is_discarded = False
         self.sync_auto_merge_groups()
 
     def push_undo_snapshot(self, snapshot: dict[str, dict]) -> None:
@@ -474,10 +502,6 @@ class AlignmentState:
         # Matching does not rely only on session_index because batch loading and
         # older per-shank loading can assign different session indices.
         manifest_paths: list[Path] = []
-        for shank_id in self.discovered_shank_folder_ids:
-            shank_manifest = self.root_folder / f"sh{shank_id}" / DEFAULT_EXPORT_FOLDER_NAME / MANIFEST_NAME
-            if shank_manifest.exists():
-                manifest_paths.append(shank_manifest)
         root_manifest = self.summary_root / MANIFEST_NAME
         if root_manifest.exists():
             manifest_paths.append(root_manifest)
@@ -509,7 +533,7 @@ class AlignmentState:
             unit.align_group = str(saved.get("align_group", "") or "")
             unit.exclude_from_auto_align = bool(saved.get("exclude_from_auto_align", False))
             unit.is_noise = bool(saved.get("is_noise", False))
-            unit.is_discarded = is_unit_auto_discarded(unit)
+            unit.is_discarded = False
 
     def _manifest_lookup_keys_for_unit(self, unit: UnitSummary) -> list[str]:
         analyzer_folder = str(unit.analyzer_folder or "")
@@ -561,7 +585,7 @@ class AlignmentState:
 
         grouped_units: dict[tuple[int, str], list[UnitSummary]] = {}
         for unit in units:
-            if unit.is_discarded or unit.is_noise:
+            if unit.is_noise:
                 continue
             align_name = unit.align_group.strip()
             if not align_name:
@@ -578,7 +602,7 @@ class AlignmentState:
 
         merge_candidate_groups: dict[tuple[int, int], list[UnitSummary]] = {}
         for unit in units:
-            if unit.is_discarded or unit.is_noise:
+            if unit.is_noise:
                 continue
             merge_candidate_groups.setdefault((int(unit.session_index), int(unit.sg_channel)), []).append(unit)
 
@@ -637,16 +661,12 @@ class AlignmentState:
             {
                 "session_name": session.session_name,
                 "unit_count": len(session.units),
-                "discarded_unit_count": sum(
-                    1 for unit in session.units if unit.is_discarded and not unit.is_noise
-                ),
             }
             for session in page.sessions
         ]
         return {
             "session_counts": session_counts,
             "total_units": sum(item["unit_count"] for item in session_counts),
-            "total_discarded_units": sum(item["discarded_unit_count"] for item in session_counts),
         }
 
     def row_kind_for_units(self, row_units: list[UnitSummary]) -> str:
@@ -806,14 +826,11 @@ class AlignmentState:
         # Normal SG page row order:
         # 1. manual align rows
         # 2. auto rows
-        # 3. leftover kept singletons
+        # 3. leftover singletons
         # 4. noise rows
-        #
-        # Discarded units are excluded here and shown only on the global
-        # discarded page.
         all_units = [unit for session in page.sessions for unit in session.units]
-        kept_units = [unit for unit in all_units if not unit.is_discarded and not unit.is_noise]
-        noise_units = [unit for unit in all_units if unit.is_noise and not unit.is_discarded]
+        kept_units = [unit for unit in all_units if not unit.is_noise]
+        noise_units = [unit for unit in all_units if unit.is_noise]
 
         rows: list[dict[int, list[UnitSummary]]] = []
         manual_align_rows: dict[str, list[UnitSummary]] = {}
@@ -978,9 +995,10 @@ class AlignmentState:
                         "merge_group": unit.merge_group,
                         "align_group": unit.align_group,
                         "exclude_from_auto_align": bool(unit.exclude_from_auto_align),
-                        "is_discarded": bool(unit.is_discarded),
                         "is_noise": bool(unit.is_noise),
-                        "waveform_image_path": f"/image?path={quote(str(Path(unit.waveform_image_path).resolve()))}",
+                        "waveform_image_path": image_url(unit.waveform_image_path),
+                        "autocorrelogram_image_path": image_url(getattr(unit, "autocorrelogram_image_path", "")) if getattr(unit, "autocorrelogram_image_path", "") else "",
+                        "isi_histogram_image_path": image_url(getattr(unit, "isi_histogram_image_path", "")) if getattr(unit, "isi_histogram_image_path", "") else "",
                     }
                 )
 
@@ -1018,83 +1036,9 @@ class AlignmentState:
             for session in page.sessions
         )
 
-    def build_discarded_page_payload(self) -> dict:
-        # The discarded view is global across all shanks. It still uses the
-        # shared "rows" payload shape so the client can reuse most rendering
-        # code, even though the page is conceptually a flat discarded gallery.
-        discarded_units = [unit for unit in self._iter_all_units() if unit.is_discarded]
-        groups: dict[str, list[UnitSummary]] = {}
-        for unit in sorted(
-            discarded_units,
-            key=lambda item: (item.shank_id, item.session_index, item.sg_channel, item.unit_id),
-        ):
-            groups.setdefault(self.discard_group_key_for_unit(unit), []).append(unit)
-        alias_by_unit_key = self._get_stable_aliases_for_units(
-            cache_key="discarded_all",
-            ordered_units=[unit for units in groups.values() for unit in units],
-        )
-
-        rows_payload: list[dict] = []
-        for row_index, units in enumerate(groups.values(), start=1):
-            sessions_present = []
-            seen_sessions: set[str] = set()
-            units_payload = []
-            for unit in units:
-                if unit.session_name not in seen_sessions:
-                    sessions_present.append(unit.session_name)
-                    seen_sessions.add(unit.session_name)
-                units_payload.append(
-                    {
-                        "alias": alias_by_unit_key[unit_record_key(unit)],
-                        "session_name": unit.session_name,
-                        "session_index": int(unit.session_index),
-                        "unit_id": int(unit.unit_id),
-                        "shank_id": int(unit.shank_id),
-                        "sg_channel": int(unit.sg_channel),
-                        "local_channel_on_shank": int(unit.local_channel_on_shank),
-                        "amplitude_median": unit.amplitude_median,
-                        "firing_rate": unit.firing_rate,
-                        "isi_violations_ratio": unit.isi_violations_ratio,
-                        "snr": unit.snr,
-                        "num_spikes": unit.num_spikes,
-                        "merge_group": unit.merge_group,
-                        "align_group": unit.align_group,
-                        "exclude_from_auto_align": bool(unit.exclude_from_auto_align),
-                        "is_discarded": True,
-                        "is_noise": bool(unit.is_noise),
-                        "waveform_image_path": f"/image?path={quote(str(Path(unit.waveform_image_path).resolve()))}",
-                    }
-                )
-            rows_payload.append(
-                {
-                    "row_index": row_index,
-                    "row_alias": f"r{row_index}",
-                    "row_kind": "discarded",
-                    "sessions_present": sessions_present,
-                    "num_units": len(units_payload),
-                    "units": units_payload,
-                }
-            )
-
-        return {
-            "page_id": "__discarded_all__",
-            "page_type": "discarded",
-            "title": "Discarded Units Across All Shanks",
-            "shank_id": -1,
-            "sg_channel": None,
-            "summary": {
-                "session_counts": [],
-                "total_units": len(discarded_units),
-                "total_discarded_units": len(discarded_units),
-            },
-            "rows": rows_payload,
-            "available_unit_aliases": self._sorted_aliases(list(alias_by_unit_key.values())),
-            "available_row_aliases": [f"r{i}" for i in range(1, len(rows_payload) + 1)],
-        }
-
     def build_app_payload(self) -> dict:
         # Build the browser-facing state payload. Pages that would render with
-        # no reviewable units are omitted from the selectors and tracked in the
+        # no loaded units are omitted from the selectors and tracked in the
         # hidden-page / hidden-shank summary fields instead.
         shank_entries = []
         selectable_pages = 0
@@ -1118,9 +1062,6 @@ class AlignmentState:
             else:
                 hidden_shank_ids.append(int(shank_id))
 
-        discarded_page = self.build_discarded_page_payload()
-        shank_entries.append({"shank_id": -1, "pages": [discarded_page]})
-
         return {
             "output_root": str(self.root_folder),
             "summary_root": str(self.summary_root),
@@ -1136,7 +1077,6 @@ class AlignmentState:
             "empty_shank_folder_ids": self.empty_shank_folder_ids,
             "hidden_page_labels": hidden_pages,
             "hidden_shank_ids": hidden_shank_ids,
-            "load_reports": self.load_reports,
             "shanks": shank_entries,
         }
 
@@ -1159,76 +1099,15 @@ class AlignmentState:
         return manifest_path
 
     def save_manifest_state_for_all_pages(self) -> dict:
-        # "All pages" keeps both:
-        # 1. the batch-level manifest at the selected root, and
-        # 2. per-shank manifests under each shank folder for compatibility with
-        #    the older per-shank workflow.
-        #
-        # This save scope includes every loaded page/shank, even if a page is
-        # currently hidden from the selectors because it has no reviewable
-        # non-discarded units.
         root_manifest_path = self.save_manifest_state()
-        shank_manifest_paths: list[str] = []
-        for shank_id in sorted(self.pages_by_shank):
-            shank_root = self.root_folder / f"sh{int(shank_id)}" / DEFAULT_EXPORT_FOLDER_NAME
-            shank_root.mkdir(parents=True, exist_ok=True)
-            shank_manifest_path = shank_root / MANIFEST_NAME
-            shank_sessions = []
-            for session in self.sessions:
-                shank_units = [unit for unit in session.units if int(unit.shank_id) == int(shank_id)]
-                shank_sessions.append(
-                    {
-                        "session_name": session.session_name,
-                        "session_index": session.session_index,
-                        "output_folder": session.output_folder,
-                        "analyzer_folder": session.analyzer_folder,
-                        "units": [asdict(unit) for unit in shank_units],
-                    }
-                )
-            shank_payload = {
-                "output_root": str(self.root_folder / f"sh{int(shank_id)}"),
-                "sessions": shank_sessions,
-            }
-            shank_manifest_path.write_text(json.dumps(shank_payload, indent=2), encoding="utf-8")
-            shank_manifest_paths.append(str(shank_manifest_path))
         return {
             "root_manifest_path": str(root_manifest_path),
-            "shank_manifest_paths": shank_manifest_paths,
         }
 
-    def _write_shank_manifest(self, shank_id: int) -> Path:
-        shank_root = self.root_folder / f"sh{int(shank_id)}" / DEFAULT_EXPORT_FOLDER_NAME
-        shank_root.mkdir(parents=True, exist_ok=True)
-        shank_manifest_path = shank_root / MANIFEST_NAME
-        shank_sessions = []
-        for session in self.sessions:
-            shank_units = [unit for unit in session.units if int(unit.shank_id) == int(shank_id)]
-            shank_sessions.append(
-                {
-                    "session_name": session.session_name,
-                    "session_index": session.session_index,
-                    "output_folder": session.output_folder,
-                    "analyzer_folder": session.analyzer_folder,
-                    "units": [asdict(unit) for unit in shank_units],
-                }
-            )
-        shank_payload = {
-            "output_root": str(self.root_folder / f"sh{int(shank_id)}"),
-            "sessions": shank_sessions,
-        }
-        shank_manifest_path.write_text(json.dumps(shank_payload, indent=2), encoding="utf-8")
-        return shank_manifest_path
-
-    def save_manifest_state_for_page(self, shank_id: int, page_id: str) -> tuple[Path, Path]:
+    def save_manifest_state_for_page(self, shank_id: int, page_id: str) -> Path:
         # Page save is intentionally narrow:
         # - only the current SG page is refreshed in the shared root manifest
         # - other pages/shanks already stored in that manifest are preserved
-        # - the current shank's compatibility manifest is also refreshed so a
-        #   later single-shank load sees the newest page decisions immediately
-        #
-        # In other words:
-        # - page save writes root manifest + current shank manifest
-        # - all-pages save writes root manifest + every shank manifest
         page = self.get_page(shank_id, page_id)
         manifest_path = self.summary_root / MANIFEST_NAME
         if manifest_path.exists():
@@ -1285,8 +1164,7 @@ class AlignmentState:
         payload["output_root"] = str(self.root_folder)
         payload["sessions"] = [saved_sessions[index] for index in sorted(saved_sessions)]
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        shank_manifest_path = self._write_shank_manifest(int(page.shank_id))
-        return manifest_path, shank_manifest_path
+        return manifest_path
 
     def build_auto_align_lookup_multi_shank(self, min_similarity: float = 0.75) -> dict[str, str]:
         auto_align_lookup: dict[str, str] = {}
@@ -1296,8 +1174,7 @@ class AlignmentState:
                     unit
                     for session in page.sessions
                     for unit in session.units
-                    if not unit.is_discarded
-                    and not unit.is_noise
+                    if not unit.is_noise
                     and not unit.align_group.strip()
                     and not unit.exclude_from_auto_align
                 ]
@@ -1336,15 +1213,15 @@ class AlignmentState:
                 return auto_group_name
         return merge_key
 
-    def discard_group_key_for_unit(self, unit: UnitSummary) -> str:
+    def noise_group_key_for_unit(self, unit: UnitSummary) -> str:
         if unit.align_group:
-            return f"discarded__sh{unit.shank_id}_sg{unit.sg_channel}__align__{sanitize_token(unit.align_group)}"
+            return f"noise__sh{unit.shank_id}_sg{unit.sg_channel}__align__{sanitize_token(unit.align_group)}"
         if unit.merge_group:
             return (
-                f"discarded__s{unit.session_index:03d}_sh{unit.shank_id}_ch{unit.local_channel_on_shank}"
+                f"noise__s{unit.session_index:03d}_sh{unit.shank_id}_ch{unit.local_channel_on_shank}"
                 f"__merge__{sanitize_token(unit.merge_group)}"
             )
-        return f"discarded__s{unit.session_index:03d}_u{unit.unit_id}"
+        return f"noise__s{unit.session_index:03d}_u{unit.unit_id}"
 
     def build_unique_unit_summary_row(
         self,
@@ -1398,42 +1275,6 @@ class AlignmentState:
             ],
             "representative_waveform_image": copied_images[0] if copied_images else "",
             "waveform_images": copied_images,
-        }
-
-    def build_discarded_unit_summary_row(self, *, group_key: str, units: list[UnitSummary]) -> dict:
-        sorted_units = sorted(units, key=lambda unit: (unit.session_index, unit.unit_id))
-        representative = sorted_units[0]
-        session_names = []
-        seen_session_names: set[str] = set()
-        for unit in sorted_units:
-            if unit.session_name not in seen_session_names:
-                session_names.append(unit.session_name)
-                seen_session_names.add(unit.session_name)
-
-        return {
-            "discard_group_key": group_key,
-            "status": "discarded",
-            "discard_reason": build_discard_reason(representative),
-            "shank_id": int(representative.shank_id),
-            "channel": int(representative.local_channel_on_shank),
-            "sg_channel": int(representative.sg_channel),
-            "num_sessions": len(session_names),
-            "sessions_present": session_names,
-            "num_member_units": len(sorted_units),
-            "member_units": [
-                {
-                    "session_name": unit.session_name,
-                    "session_index": int(unit.session_index),
-                    "unit_id": int(unit.unit_id),
-                    "amplitude_median": unit.amplitude_median,
-                    "snr": unit.snr,
-                    "isi_violations_ratio": unit.isi_violations_ratio,
-                    "merge_group": unit.merge_group,
-                    "align_group": unit.align_group,
-                    "waveform_image_path": unit.waveform_image_path,
-                }
-                for unit in sorted_units
-            ],
         }
 
     def build_noise_unit_summary_row(self, *, group_key: str, units: list[UnitSummary]) -> dict:
@@ -1502,30 +1343,6 @@ class AlignmentState:
                     }
                 )
 
-    def write_discarded_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
-        fieldnames = [
-            "status", "discard_group_key", "discard_reason", "shank_id", "channel",
-            "sg_channel", "num_sessions", "sessions_present", "num_member_units", "member_units",
-        ]
-        with csv_path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(
-                    {
-                        "status": row["status"],
-                        "discard_group_key": row["discard_group_key"],
-                        "discard_reason": row["discard_reason"],
-                        "shank_id": row["shank_id"],
-                        "channel": row["channel"],
-                        "sg_channel": row["sg_channel"],
-                        "num_sessions": row["num_sessions"],
-                        "sessions_present": "; ".join(row["sessions_present"]),
-                        "num_member_units": row["num_member_units"],
-                        "member_units": "; ".join(f"{item['session_name']}:u{item['unit_id']}" for item in row["member_units"]),
-                    }
-                )
-
     def write_noise_units_summary_csv(self, csv_path: Path, rows: list[dict]) -> None:
         fieldnames = [
             "status", "noise_group_key", "shank_id", "channel",
@@ -1576,7 +1393,6 @@ class AlignmentState:
                     f"  isi_violations_ratio={format_metric(unit.isi_violations_ratio)}",
                     f"  snr={format_metric(unit.snr)}",
                     f"  num_spikes={format_metric(unit.num_spikes)}",
-                    f"  is_discarded={unit.is_discarded}",
                     f"  merge_group={unit.merge_group or '<none>'}",
                     f"  align_group={unit.align_group or '<none>'}",
                     f"  analyzer_folder={unit.analyzer_folder}",
@@ -1593,21 +1409,16 @@ class AlignmentState:
 
         auto_align_lookup = self.build_auto_align_lookup_multi_shank()
         final_groups: dict[str, list[UnitSummary]] = {}
-        discarded_groups: dict[str, list[UnitSummary]] = {}
         noise_groups: dict[str, list[UnitSummary]] = {}
 
         for unit in self._iter_all_units():
-            if unit.is_discarded:
-                discarded_groups.setdefault(self.discard_group_key_for_unit(unit), []).append(unit)
-                continue
             if unit.is_noise:
-                noise_groups.setdefault(self.discard_group_key_for_unit(unit).replace("discarded__", "noise__"), []).append(unit)
+                noise_groups.setdefault(self.noise_group_key_for_unit(unit), []).append(unit)
                 continue
             final_groups.setdefault(self.final_group_key_for_unit(unit, auto_align_lookup=auto_align_lookup), []).append(unit)
 
         manifest_rows = []
         unique_unit_rows = []
-        discarded_unit_rows = []
         noise_unit_rows = []
 
         for group_index, (group_key, units) in enumerate(sorted(final_groups.items()), start=1):
@@ -1658,8 +1469,6 @@ class AlignmentState:
                 }
             )
 
-        for group_key, units in sorted(discarded_groups.items()):
-            discarded_unit_rows.append(self.build_discarded_unit_summary_row(group_key=group_key, units=units))
         for group_key, units in sorted(noise_groups.items()):
             noise_unit_rows.append(self.build_noise_unit_summary_row(group_key=group_key, units=units))
 
@@ -1668,10 +1477,6 @@ class AlignmentState:
         unique_units_csv_path = self.summary_root / "unique_units_summary.csv"
         self.write_unique_units_summary_csv(unique_units_csv_path, unique_unit_rows)
 
-        discarded_units_json_path = self.summary_root / "discarded_units_summary.json"
-        discarded_units_json_path.write_text(json.dumps(discarded_unit_rows, indent=2), encoding="utf-8")
-        discarded_units_csv_path = self.summary_root / "discarded_units_summary.csv"
-        self.write_discarded_units_summary_csv(discarded_units_csv_path, discarded_unit_rows)
         noise_units_json_path = self.summary_root / "noise_units_summary.json"
         noise_units_json_path.write_text(json.dumps(noise_unit_rows, indent=2), encoding="utf-8")
         noise_units_csv_path = self.summary_root / "noise_units_summary.csv"
@@ -1684,8 +1489,6 @@ class AlignmentState:
                     "output_root": str(self.root_folder),
                     "unique_units_summary_json": str(unique_units_json_path),
                     "unique_units_summary_csv": str(unique_units_csv_path),
-                    "discarded_units_summary_json": str(discarded_units_json_path),
-                    "discarded_units_summary_csv": str(discarded_units_csv_path),
                     "noise_units_summary_json": str(noise_units_json_path),
                     "noise_units_summary_csv": str(noise_units_csv_path),
                     "cross_session_alignment_groups": manifest_rows,
@@ -1699,22 +1502,16 @@ class AlignmentState:
             "export_manifest_path": str(export_manifest_path),
             "unique_units_json_path": str(unique_units_json_path),
             "unique_units_csv_path": str(unique_units_csv_path),
-            "discarded_units_json_path": str(discarded_units_json_path),
-            "discarded_units_csv_path": str(discarded_units_csv_path),
             "noise_units_json_path": str(noise_units_json_path),
             "noise_units_csv_path": str(noise_units_csv_path),
             "num_unique_units": len(unique_unit_rows),
-            "num_discarded_groups": len(discarded_unit_rows),
             "num_noise_groups": len(noise_unit_rows),
             "num_alignment_groups": len(manifest_rows),
         }
 
     def export_summary_bundle_for_page(self, shank_id: int, page_id: str) -> dict:
-        # Page export writes only one SG page into the corresponding shank's
-        # units_alignment_summary folder, using SG-specific filenames so
-        # multiple page exports from the same shank do not overwrite each other.
         page = self.get_page(shank_id, page_id)
-        page_summary_root = self.root_folder / f"sh{page.shank_id}" / DEFAULT_EXPORT_FOLDER_NAME
+        page_summary_root = self.summary_root
         export_folder = page_summary_root / f"exported_units_sg_{page.sg_channel:03d}"
         export_folder.mkdir(parents=True, exist_ok=True)
 
@@ -1722,8 +1519,7 @@ class AlignmentState:
         eligible_units = [
             unit
             for unit in page_units
-            if not unit.is_discarded
-            and not unit.is_noise
+            if not unit.is_noise
             and not unit.align_group.strip()
             and not unit.exclude_from_auto_align
         ]
@@ -1745,20 +1541,15 @@ class AlignmentState:
                 page_auto_lookup[unit_record_key(unit)] = group_name
 
         final_groups: dict[str, list[UnitSummary]] = {}
-        discarded_groups: dict[str, list[UnitSummary]] = {}
         noise_groups: dict[str, list[UnitSummary]] = {}
         for unit in page_units:
-            if unit.is_discarded:
-                discarded_groups.setdefault(self.discard_group_key_for_unit(unit), []).append(unit)
-                continue
             if unit.is_noise:
-                noise_groups.setdefault(self.discard_group_key_for_unit(unit).replace("discarded__", "noise__"), []).append(unit)
+                noise_groups.setdefault(self.noise_group_key_for_unit(unit), []).append(unit)
                 continue
             final_groups.setdefault(self.final_group_key_for_unit(unit, auto_align_lookup=page_auto_lookup), []).append(unit)
 
         manifest_rows = []
         unique_unit_rows = []
-        discarded_unit_rows = []
         noise_unit_rows = []
 
         for group_index, (group_key, units) in enumerate(sorted(final_groups.items()), start=1):
@@ -1809,8 +1600,6 @@ class AlignmentState:
                 }
             )
 
-        for group_key, units in sorted(discarded_groups.items()):
-            discarded_unit_rows.append(self.build_discarded_unit_summary_row(group_key=group_key, units=units))
         for group_key, units in sorted(noise_groups.items()):
             noise_unit_rows.append(self.build_noise_unit_summary_row(group_key=group_key, units=units))
 
@@ -1819,10 +1608,6 @@ class AlignmentState:
         unique_units_csv_path = page_summary_root / f"unique_units_summary_sg_{page.sg_channel:03d}.csv"
         self.write_unique_units_summary_csv(unique_units_csv_path, unique_unit_rows)
 
-        discarded_units_json_path = page_summary_root / f"discarded_units_summary_sg_{page.sg_channel:03d}.json"
-        discarded_units_json_path.write_text(json.dumps(discarded_unit_rows, indent=2), encoding="utf-8")
-        discarded_units_csv_path = page_summary_root / f"discarded_units_summary_sg_{page.sg_channel:03d}.csv"
-        self.write_discarded_units_summary_csv(discarded_units_csv_path, discarded_unit_rows)
         noise_units_json_path = page_summary_root / f"noise_units_summary_sg_{page.sg_channel:03d}.json"
         noise_units_json_path.write_text(json.dumps(noise_unit_rows, indent=2), encoding="utf-8")
         noise_units_csv_path = page_summary_root / f"noise_units_summary_sg_{page.sg_channel:03d}.csv"
@@ -1840,8 +1625,6 @@ class AlignmentState:
                     },
                     "unique_units_summary_json": str(unique_units_json_path),
                     "unique_units_summary_csv": str(unique_units_csv_path),
-                    "discarded_units_summary_json": str(discarded_units_json_path),
-                    "discarded_units_summary_csv": str(discarded_units_csv_path),
                     "noise_units_summary_json": str(noise_units_json_path),
                     "noise_units_summary_csv": str(noise_units_csv_path),
                     "cross_session_alignment_groups": manifest_rows,
@@ -1855,12 +1638,9 @@ class AlignmentState:
             "export_manifest_path": str(export_manifest_path),
             "unique_units_json_path": str(unique_units_json_path),
             "unique_units_csv_path": str(unique_units_csv_path),
-            "discarded_units_json_path": str(discarded_units_json_path),
-            "discarded_units_csv_path": str(discarded_units_csv_path),
             "noise_units_json_path": str(noise_units_json_path),
             "noise_units_csv_path": str(noise_units_csv_path),
             "num_unique_units": len(unique_unit_rows),
-            "num_discarded_groups": len(discarded_unit_rows),
             "num_noise_groups": len(noise_unit_rows),
             "num_alignment_groups": len(manifest_rows),
             "page_scope": f"shank {page.shank_id}, SG {page.sg_channel}",
@@ -1868,8 +1648,8 @@ class AlignmentState:
 
     def export_all_pages_decisions(self) -> dict:
         # This exports page-style outputs for every loaded SG page, including
-        # pages that are hidden in the UI because they have no reviewable
-        # non-discarded units. That keeps the per-shank page export set
+        # pages that are hidden in the UI because they have no loaded units.
+        # That keeps the per-shank page export set
         # complete, while `export_summary_bundle()` remains the single combined
         # all-shank summary export.
         page_export_results: list[dict] = []
@@ -1887,8 +1667,6 @@ class AlignmentState:
         }
 
     def get_page(self, shank_id: int, page_id: str) -> PageSummary:
-        if page_id == "__discarded_all__":
-            raise ValueError("Commands are only available on SG channel pages, not the discarded-units page.")
         shank_pages = self.pages_by_shank.get(int(shank_id))
         if not shank_pages or page_id not in shank_pages:
             raise ValueError(f"Unknown page: shank={shank_id}, page={page_id}")
@@ -2126,8 +1904,8 @@ class AlignmentState:
             messages: list[str] = []
             changed_state = False
             # Commands are applied top-to-bottom as one batch. If any command
-            # changes state, we recompute discard status and generated
-            # auto-merge groups once at the end, then store one undo snapshot.
+            # changes state, we recompute generated auto-merge groups once at
+            # the end, then store one undo snapshot.
             for line_number, raw_line in enumerate(raw_text.splitlines(), start=1):
                 line = raw_line.strip()
                 if not line or line.startswith("#"):
@@ -2148,7 +1926,7 @@ class AlignmentState:
                 raise ValueError("Only blank lines or comments were provided.")
             if changed_state:
                 for unit in self._iter_all_units():
-                    unit.is_discarded = is_unit_auto_discarded(unit)
+                    unit.is_discarded = False
                 self.sync_auto_merge_groups()
                 self.push_undo_snapshot(before_snapshot)
             return {"messages": messages, "changed_state": changed_state, "app": self.build_app_payload()}
@@ -2201,15 +1979,18 @@ def build_html_shell() -> str:
     .bottom-nav {{ display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }}
     .row-card {{ border:1px solid var(--line); border-radius:20px; overflow:hidden; background:rgba(255,255,255,0.75); }}
     .row-card.manual_align {{ border-color:#2d8a70; }} .row-card.auto_align {{ border-color:#2b73a2; }}
-    .row-card.noise {{ border-color:var(--warn); }} .row-card.singleton {{ border-color:#b8aea2; }} .row-card.discarded {{ border-color:var(--danger); }}
+    .row-card.noise {{ border-color:var(--warn); }} .row-card.singleton {{ border-color:#b8aea2; }}
     .row-summary {{ display:flex; justify-content:space-between; gap:12px; padding:14px 16px; background:rgba(255,250,243,0.95); border-bottom:1px solid var(--line); }}
     .unit-grid {{ display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; padding:16px; }}
     .unit-card {{ background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; min-height:100%; }}
     .unit-card.merged {{ border:2px solid #2b73a2; box-shadow: inset 0 0 0 1px rgba(43,115,162,0.15); }}
     .unit-head {{ display:flex; justify-content:space-between; gap:10px; margin-bottom:8px; }}
     .unit-name {{ font-weight:600; }}
-    .tag.align {{ background:var(--accent-soft); color:var(--accent); }} .tag.noise {{ background:var(--warn-soft); color:var(--warn); }} .tag.discarded {{ background:var(--danger-soft); color:var(--danger); }}
+    .tag.align {{ background:var(--accent-soft); color:var(--accent); }} .tag.noise {{ background:var(--warn-soft); color:var(--warn); }}
     .metrics {{ color:var(--muted); font-size:0.9rem; line-height:1.35; margin-bottom:8px; display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:4px 12px; }}
+    .plot-strip {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }}
+    .plot-strip img {{ aspect-ratio:1.9 / 1; object-fit:contain; }}
+    .waveform-img {{ display:block; }}
     img {{ width:100%; border-radius:12px; border:1px solid var(--line); background:white; }}
     .lightbox {{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:24px; background:rgba(20,16,12,0.72); z-index:9999; }}
     .lightbox.open {{ display:flex; }}
@@ -2237,7 +2018,7 @@ def build_html_shell() -> str:
     <section class="toolbar">
       <div><label for="shank-select">Shank</label><select id="shank-select"></select><div class="actions" style="margin-top:8px;"><button id="prev-shank-btn">Previous Shank</button><button id="next-shank-btn">Next Shank</button><span class="muted" id="shank-nav-message"></span></div></div>
       <div><label for="page-select">Page</label><select id="page-select"></select><div class="actions" style="margin-top:8px;"><button id="prev-page-btn">Previous Page</button><button id="next-page-btn">Next Page</button><span class="muted" id="page-nav-message"></span></div></div>
-      <div><label for="kind-select">Row Kind</label><select id="kind-select"><option value="all">All rows</option><option value="manual_align">Manual align</option><option value="auto_align">Auto align</option><option value="singleton">Singleton</option><option value="noise">Noise</option><option value="discarded">Discarded</option></select></div>
+      <div><label for="kind-select">Row Kind</label><select id="kind-select"><option value="all">All rows</option><option value="manual_align">Manual align</option><option value="auto_align">Auto align</option><option value="singleton">Singleton</option><option value="noise">Noise</option></select></div>
       <div><label for="search-input">Search</label><input id="search-input" type="text" placeholder="session, unit, align, merge"></div>
       <div><label>Summary Folder</label><div class="pill" id="summary-root"></div></div>
     </section>
@@ -2299,17 +2080,17 @@ Use aliases like u1 and r1 from the current page.</div>
     function setButtonsBusy(buttonIds, busyText) {{ buttonIds.forEach((buttonId) => {{ const button = document.getElementById(buttonId); if (!button) return; if (!busyButtonLabels.has(buttonId)) busyButtonLabels.set(buttonId, button.textContent); button.disabled = true; if (busyText) button.textContent = busyText; }}); }}
     function restoreButtons(buttonIds) {{ buttonIds.forEach((buttonId) => {{ const button = document.getElementById(buttonId); if (!button) return; button.disabled = false; if (busyButtonLabels.has(buttonId)) button.textContent = busyButtonLabels.get(buttonId); }}); }}
     async function fetchJson(url, options = undefined) {{ const response = await fetch(url, options); const payload = await response.json(); if (!response.ok) throw new Error(payload.error || "Request failed"); return payload; }}
-    function populateShanks() {{ shankSelect.innerHTML = ""; DATA.shanks.forEach((entry) => {{ const option = document.createElement("option"); option.value = String(entry.shank_id); option.textContent = Number(entry.shank_id) === -1 ? "Discarded Units" : `Shank ${{entry.shank_id}}`; shankSelect.appendChild(option); }}); }}
-    function populatePages() {{ pageSelect.innerHTML = ""; currentShank().pages.forEach((page) => {{ const option = document.createElement("option"); option.value = page.page_id; option.textContent = page.page_type === "discarded" ? "Discarded Units" : `SG ${{page.sg_channel}}`; pageSelect.appendChild(option); }}); }}
-    function renderUnitCard(unit) {{ const tags = []; const mergeGroup = unit.merge_group || ""; const hasAlignMerge = mergeGroup.startsWith("__alignmerge__"); const hasAutoMerge = mergeGroup.startsWith("__automerge__"); const hasGeneratedMerge = hasAlignMerge || hasAutoMerge; const hasManualMerge = mergeGroup && !hasGeneratedMerge; if (unit.align_group) tags.push(`<span class="tag align">align=${{unit.align_group}}</span>`); if (hasManualMerge) tags.push(`<span class="tag">merge=${{mergeGroup}}</span>`); else if (hasAlignMerge) tags.push('<span class="tag auto">align-merge</span>'); else if (hasAutoMerge) tags.push('<span class="tag auto">auto-merge</span>'); if (unit.is_discarded) tags.push('<span class="tag discarded">discarded</span>'); if (unit.is_noise && !unit.is_discarded) tags.push('<span class="tag noise">noise</span>'); const cardClass = hasManualMerge ? "unit-card merged" : "unit-card"; const zoomLabel = `${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}} | sh${{unit.shank_id}} | sg${{unit.sg_channel}}`; return `<article class="${{cardClass}}" data-image-src="${{unit.waveform_image_path}}" data-image-label="${{zoomLabel}}"><div class="unit-head"><div><div class="unit-name">${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}}</div><div class="muted">sh${{unit.shank_id}} | sg${{unit.sg_channel}}</div></div></div><div class="unit-tags">${{tags.join("")}}</div><div class="metrics"><div>FR: ${{metric(unit.firing_rate)}} Hz</div><div>SNR: ${{metric(unit.snr)}}</div><div><strong>Amp: ${{metric(unit.amplitude_median)}}</strong></div><div>ISI: ${{metric(unit.isi_violations_ratio)}}</div><div>Spikes: ${{unit.num_spikes ?? "nan"}}</div></div><img loading="lazy" src="${{unit.waveform_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}}"></article>`; }}
+    function populateShanks() {{ shankSelect.innerHTML = ""; DATA.shanks.forEach((entry) => {{ const option = document.createElement("option"); option.value = String(entry.shank_id); option.textContent = `Shank ${{entry.shank_id}}`; shankSelect.appendChild(option); }}); }}
+    function populatePages() {{ pageSelect.innerHTML = ""; currentShank().pages.forEach((page) => {{ const option = document.createElement("option"); option.value = page.page_id; option.textContent = `SG ${{page.sg_channel}}`; pageSelect.appendChild(option); }}); }}
+    function renderUnitCard(unit) {{ const tags = []; const mergeGroup = unit.merge_group || ""; const hasAlignMerge = mergeGroup.startsWith("__alignmerge__"); const hasAutoMerge = mergeGroup.startsWith("__automerge__"); const hasGeneratedMerge = hasAlignMerge || hasAutoMerge; const hasManualMerge = mergeGroup && !hasGeneratedMerge; if (unit.align_group) tags.push(`<span class="tag align">align=${{unit.align_group}}</span>`); if (hasManualMerge) tags.push(`<span class="tag">merge=${{mergeGroup}}</span>`); else if (hasAlignMerge) tags.push('<span class="tag auto">align-merge</span>'); else if (hasAutoMerge) tags.push('<span class="tag auto">auto-merge</span>'); if (unit.is_noise) tags.push('<span class="tag noise">noise</span>'); const cardClass = hasManualMerge ? "unit-card merged" : "unit-card"; const zoomLabel = `${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}} | sh${{unit.shank_id}} | sg${{unit.sg_channel}}`; const timingPlots = [unit.autocorrelogram_image_path ? `<img loading="lazy" src="${{unit.autocorrelogram_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}} autocorrelogram">` : "", unit.isi_histogram_image_path ? `<img loading="lazy" src="${{unit.isi_histogram_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}} ISI histogram">` : ""].filter(Boolean).join(""); return `<article class="${{cardClass}}" data-image-src="${{unit.waveform_image_path}}" data-image-label="${{zoomLabel}}"><div class="unit-head"><div><div class="unit-name">${{unit.alias}} | ${{unit.session_name}} | u${{unit.unit_id}}</div><div class="muted">sh${{unit.shank_id}} | sg${{unit.sg_channel}}</div></div></div><div class="unit-tags">${{tags.join("")}}</div><div class="metrics"><div>FR: ${{metric(unit.firing_rate)}} Hz</div><div>SNR: ${{metric(unit.snr)}}</div><div><strong>Amp: ${{metric(unit.amplitude_median)}}</strong></div><div>ISI: ${{metric(unit.isi_violations_ratio)}}</div><div>Spikes: ${{unit.num_spikes ?? "nan"}}</div></div><img class="waveform-img" loading="lazy" src="${{unit.waveform_image_path}}" alt="${{unit.session_name}} unit ${{unit.unit_id}} waveform">${{timingPlots ? `<div class="plot-strip">${{timingPlots}}</div>` : ""}}</article>`; }}
     function openLightbox(imageSrc, label) {{ lightboxImage.src = imageSrc; lightboxCaption.textContent = label || ""; lightbox.classList.add("open"); }}
     function closeLightbox() {{ lightbox.classList.remove("open"); lightboxImage.removeAttribute("src"); lightboxCaption.textContent = ""; }}
-    function render() {{ document.getElementById("root-path").textContent = DATA.output_root; document.getElementById("summary-root").textContent = DATA.summary_root; document.getElementById("stat-shanks").textContent = `${{DATA.summary.num_selectable_shanks}} selectable / ${{DATA.summary.num_loaded_shanks}} loaded`; document.getElementById("stat-pages").textContent = `${{DATA.summary.num_selectable_pages}} selectable / ${{DATA.summary.num_loaded_pages}} loaded`; document.getElementById("stat-rows").textContent = DATA.summary.num_selectable_rows; const emptyNotice = document.getElementById("empty-shanks-notice"); const noticeParts = []; if (DATA.empty_shank_folder_ids && DATA.empty_shank_folder_ids.length) noticeParts.push(`No sorted units were loaded for shank folder(s): ${{DATA.empty_shank_folder_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_shank_ids && DATA.hidden_shank_ids.length) noticeParts.push(`No reviewable non-discarded pages for shank(s): ${{DATA.hidden_shank_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_page_labels && DATA.hidden_page_labels.length) noticeParts.push(`Hidden empty pages: ${{DATA.hidden_page_labels.join(", ")}}`); if (noticeParts.length) {{ emptyNotice.innerHTML = noticeParts.map((text) => `<div class="notice">${{text}}</div>`).join(""); }} else {{ emptyNotice.innerHTML = ""; }} const page = currentPage(); const isDiscardedPage = page.page_type === "discarded"; const currentShankId = Number(currentShank().shank_id); const pageHeading = currentShankId === -1 ? page.title : `Shank ${{page.shank_id}} | ${{page.title}}`; const kindFilter = kindSelect.value; const search = searchInput.value.trim().toLowerCase(); const rows = page.rows.filter((row) => {{ if (kindFilter !== "all" && row.row_kind !== kindFilter) return false; if (!search) return true; const haystack = [row.row_alias, row.row_kind, ...row.sessions_present, ...row.units.map((unit) => `${{unit.alias}} ${{unit.session_name}} u${{unit.unit_id}} sh${{unit.shank_id}} sg${{unit.sg_channel}} ${{unit.align_group}} ${{unit.merge_group}}`)].join(" ").toLowerCase(); return haystack.includes(search); }}); const visibleUnits = rows.flatMap((row) => row.units); const summaryText = isDiscardedPage ? `${{page.summary.total_discarded_units}} discarded unit(s) across all shanks` : `${{page.summary.total_units}} unit(s) on this channel, ${{page.summary.total_discarded_units}} auto-discarded`; if (!(isDiscardedPage ? visibleUnits.length : rows.length)) {{ app.innerHTML = `<div class="empty">${{isDiscardedPage ? "No discarded units match the current filters." : "No rows match the current filters."}}</div>`; document.getElementById("apply-btn").disabled = isDiscardedPage; document.getElementById("save-page-btn").disabled = isDiscardedPage; document.getElementById("export-page-btn").disabled = isDiscardedPage; return; }} const contentHtml = isDiscardedPage ? `<div class="unit-grid">${{visibleUnits.map(renderUnitCard).join("")}}</div>` : `<div class="rows">${{rows.map((row) => `<section class="row-card ${{row.row_kind}}"><div class="row-summary"><div><strong>Row ${{row.row_index}} | ${{row.row_alias}}</strong><div class="muted">Shown in: ${{row.sessions_present.join(", ") || "none"}}</div></div><div class="badges"><span class="badge">${{row.row_kind}}</span><span class="badge">${{row.num_units}} unit(s)</span></div></div><div class="unit-grid">${{row.units.map(renderUnitCard).join("")}}</div></section>`).join("")}}</div>`; app.innerHTML = `<div class="page-header"><div><h2>${{pageHeading}}</h2><div class="muted">${{summaryText}}</div></div><div class="pills"><span class="pill">${{isDiscardedPage ? visibleUnits.length : rows.length}} visible ${{isDiscardedPage ? "unit(s)" : "row(s)"}}</span><span class="pill">${{page.available_unit_aliases.length}} unit alias(es)</span>${{isDiscardedPage ? "" : `<span class="pill">${{page.available_row_aliases.length}} row alias(es)</span>`}}${{isDiscardedPage ? '<span class="pill">Commands disabled on this page</span>' : ''}}</div></div>${{contentHtml}}<div class="bottom-nav"><button id="bottom-prev-shank-btn">Previous Shank</button><button id="bottom-next-shank-btn">Next Shank</button><span class="muted" id="bottom-shank-nav-message"></span><button id="bottom-prev-page-btn">Previous Page</button><button id="bottom-next-page-btn">Next Page</button><span class="muted" id="bottom-page-nav-message"></span></div>`; document.getElementById("bottom-prev-shank-btn").addEventListener("click", () => goToShank(-1)); document.getElementById("bottom-next-shank-btn").addEventListener("click", () => goToShank(1)); document.getElementById("bottom-prev-page-btn").addEventListener("click", () => goToPage(-1)); document.getElementById("bottom-next-page-btn").addEventListener("click", () => goToPage(1)); document.getElementById("apply-btn").disabled = isDiscardedPage; document.getElementById("save-page-btn").disabled = isDiscardedPage; document.getElementById("export-page-btn").disabled = isDiscardedPage; const bottomPageMessage = document.getElementById("bottom-page-nav-message"); if (bottomPageMessage) bottomPageMessage.textContent = pageNavMessage.textContent; const bottomShankMessage = document.getElementById("bottom-shank-nav-message"); if (bottomShankMessage) bottomShankMessage.textContent = shankNavMessage.textContent; }}
+    function render() {{ document.getElementById("root-path").textContent = DATA.output_root; document.getElementById("summary-root").textContent = DATA.summary_root; document.getElementById("stat-shanks").textContent = `${{DATA.summary.num_selectable_shanks}} selectable / ${{DATA.summary.num_loaded_shanks}} loaded`; document.getElementById("stat-pages").textContent = `${{DATA.summary.num_selectable_pages}} selectable / ${{DATA.summary.num_loaded_pages}} loaded`; document.getElementById("stat-rows").textContent = DATA.summary.num_selectable_rows; const emptyNotice = document.getElementById("empty-shanks-notice"); const noticeParts = []; if (DATA.empty_shank_folder_ids && DATA.empty_shank_folder_ids.length) noticeParts.push(`No sorted units were loaded for shank folder(s): ${{DATA.empty_shank_folder_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_shank_ids && DATA.hidden_shank_ids.length) noticeParts.push(`No pages with loaded units for shank(s): ${{DATA.hidden_shank_ids.map((item) => `sh${{item}}`).join(", ")}}`); if (DATA.hidden_page_labels && DATA.hidden_page_labels.length) noticeParts.push(`Hidden empty pages: ${{DATA.hidden_page_labels.join(", ")}}`); if (noticeParts.length) {{ emptyNotice.innerHTML = noticeParts.map((text) => `<div class="notice">${{text}}</div>`).join(""); }} else {{ emptyNotice.innerHTML = ""; }} const page = currentPage(); const currentShankId = Number(currentShank().shank_id); const pageHeading = `Shank ${{page.shank_id}} | ${{page.title}}`; const kindFilter = kindSelect.value; const search = searchInput.value.trim().toLowerCase(); const rows = page.rows.filter((row) => {{ if (kindFilter !== "all" && row.row_kind !== kindFilter) return false; if (!search) return true; const haystack = [row.row_alias, row.row_kind, ...row.sessions_present, ...row.units.map((unit) => `${{unit.alias}} ${{unit.session_name}} u${{unit.unit_id}} sh${{unit.shank_id}} sg${{unit.sg_channel}} ${{unit.align_group}} ${{unit.merge_group}}`)].join(" ").toLowerCase(); return haystack.includes(search); }}); const summaryText = `${{page.summary.total_units}} unit(s) on this channel`; if (!rows.length) {{ app.innerHTML = `<div class="empty">No rows match the current filters.</div>`; return; }} const contentHtml = `<div class="rows">${{rows.map((row) => `<section class="row-card ${{row.row_kind}}"><div class="row-summary"><div><strong>Row ${{row.row_index}} | ${{row.row_alias}}</strong><div class="muted">Shown in: ${{row.sessions_present.join(", ") || "none"}}</div></div><div class="badges"><span class="badge">${{row.row_kind}}</span><span class="badge">${{row.num_units}} unit(s)</span></div></div><div class="unit-grid">${{row.units.map(renderUnitCard).join("")}}</div></section>`).join("")}}</div>`; app.innerHTML = `<div class="page-header"><div><h2>${{pageHeading}}</h2><div class="muted">${{summaryText}}</div></div><div class="pills"><span class="pill">${{rows.length}} visible row(s)</span><span class="pill">${{page.available_unit_aliases.length}} unit alias(es)</span><span class="pill">${{page.available_row_aliases.length}} row alias(es)</span></div></div>${{contentHtml}}<div class="bottom-nav"><button id="bottom-prev-shank-btn">Previous Shank</button><button id="bottom-next-shank-btn">Next Shank</button><span class="muted" id="bottom-shank-nav-message"></span><button id="bottom-prev-page-btn">Previous Page</button><button id="bottom-next-page-btn">Next Page</button><span class="muted" id="bottom-page-nav-message"></span></div>`; document.getElementById("bottom-prev-shank-btn").addEventListener("click", () => goToShank(-1)); document.getElementById("bottom-next-shank-btn").addEventListener("click", () => goToShank(1)); document.getElementById("bottom-prev-page-btn").addEventListener("click", () => goToPage(-1)); document.getElementById("bottom-next-page-btn").addEventListener("click", () => goToPage(1)); const bottomPageMessage = document.getElementById("bottom-page-nav-message"); if (bottomPageMessage) bottomPageMessage.textContent = pageNavMessage.textContent; const bottomShankMessage = document.getElementById("bottom-shank-nav-message"); if (bottomShankMessage) bottomShankMessage.textContent = shankNavMessage.textContent; }}
     function insertCommandTemplate(name) {{ const existing = commandText.value; const prefix = existing && !existing.endsWith("\\n") ? "\\n" : ""; commandText.value += `${{prefix}}${{name}} `; commandText.focus(); commandText.selectionStart = commandText.selectionEnd = commandText.value.length; }}
     async function loadState() {{ const payload = await fetchJson("/api/state"); DATA = payload.app; populateShanks(); populatePages(); render(); }}
     async function applyCommands() {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value, commands: commandText.value }}; const result = await fetchJson("/api/commands", {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app; populateShanks(); shankSelect.value = String(payload.shank_id); populatePages(); pageSelect.value = payload.page_id; render(); setLog(result.messages); }}
-    async function postSimple(url) {{ const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.messages) setLog(result.messages); if (result.export_result) {{ if (result.export_result.page_scope) setLog([`Scope: ${{result.export_result.page_scope}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); else if (result.export_result.num_pages_exported !== undefined) setLog([`Scope: all loaded pages`, `Pages exported: ${{result.export_result.num_pages_exported}}`]); else setLog([`Scope: full summary`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }} }}
-    async function postWithPage(url) {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value }}; const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.export_result) setLog([`${{result.export_result.page_scope ? `Scope: ${{result.export_result.page_scope}}` : "Scope: current page"}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Discarded groups: ${{result.export_result.num_discarded_groups}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }}
+    async function postSimple(url) {{ const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.messages) setLog(result.messages); if (result.export_result) {{ if (result.export_result.page_scope) setLog([`Scope: ${{result.export_result.page_scope}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); else if (result.export_result.num_pages_exported !== undefined) setLog([`Scope: all loaded pages`, `Pages exported: ${{result.export_result.num_pages_exported}}`]); else setLog([`Scope: full summary`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }} }}
+    async function postWithPage(url) {{ const payload = {{ shank_id: Number(shankSelect.value), page_id: pageSelect.value }}; const result = await fetchJson(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(payload) }}); DATA = result.app || DATA; render(); if (result.message) setLog(result.message); if (result.export_result) setLog([`${{result.export_result.page_scope ? `Scope: ${{result.export_result.page_scope}}` : "Scope: current page"}}`, `Export manifest: ${{result.export_result.export_manifest_path}}`, `Unique units: ${{result.export_result.num_unique_units}}`, `Noise groups: ${{result.export_result.num_noise_groups ?? 0}}`, `Alignment groups: ${{result.export_result.num_alignment_groups}}`]); }}
     shankSelect.addEventListener("change", () => {{ setPageNavMessage(""); populatePages(); clearCommandsForNavigation(); render(); }});
     pageSelect.addEventListener("change", () => {{ setPageNavMessage(""); clearCommandsForNavigation(); render(); }}); kindSelect.addEventListener("change", render); searchInput.addEventListener("input", render);
     commandText.addEventListener("keydown", (event) => {{ if (event.ctrlKey && event.key === "Enter") {{ event.preventDefault(); applyCommands().catch((err) => setLog(err.message)); }} }});
@@ -2340,7 +2121,7 @@ class AlignmentRequestHandler(BaseHTTPRequestHandler):
     state: AlignmentState | None = None
 
     def _json_response(self, payload: dict, status: int = 200) -> None:
-        encoded = json.dumps(make_json_safe(payload), allow_nan=False).encode("utf-8")
+        encoded = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -2424,16 +2205,13 @@ class AlignmentRequestHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/save_page":
                 payload = self._read_json()
-                root_manifest_path, shank_manifest_path = self.state.save_manifest_state_for_page(
+                root_manifest_path = self.state.save_manifest_state_for_page(
                     shank_id=int(payload.get("shank_id")),
                     page_id=str(payload.get("page_id")),
                 )
                 self._json_response(
                     {
-                        "message": (
-                            f"Saved page decisions to root manifest: {root_manifest_path}\n"
-                            f"Saved current shank manifest to: {shank_manifest_path}"
-                        ),
+                        "message": f"Saved page decisions to root manifest: {root_manifest_path}",
                         "app": self.state.build_app_payload(),
                     }
                 )
@@ -2495,17 +2273,6 @@ def serve_alignment_app(root_folder: Path, host: str = "127.0.0.1", port: int = 
 
     show_progress(f"Preparing alignment app for: {root_folder}")
     state = AlignmentState(root_folder, progress_callback=show_progress)
-    loaded_reports = [report for report in state.load_reports if report.get("status") == "loaded"]
-    skipped_reports = [report for report in state.load_reports if report.get("status") == "skipped"]
-    show_progress(
-        f"Analyzer load summary: {len(loaded_reports)} loaded, "
-        f"{len(skipped_reports)} skipped, {len(iter_all_units(state.sessions))} unit(s)."
-    )
-    for report in skipped_reports:
-        show_progress(
-            f"Skipped analyzer: {report['session_name']} | {report.get('error_summary', 'unknown error')} | "
-            f"{report['analyzer_folder']}"
-        )
     handler_class = type("BoundAlignmentRequestHandler", (AlignmentRequestHandler,), {"state": state})
     server = ThreadingHTTPServer((host, port), handler_class)
     url = f"http://{host}:{port}/"
@@ -2523,7 +2290,11 @@ def serve_alignment_app(root_folder: Path, host: str = "127.0.0.1", port: int = 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve HTML alignment review using Units_alignment_UI logic.")
-    parser.add_argument("output_root", nargs="?", help="Sorting+Analyze batch output root")
+    parser.add_argument(
+        "output_root",
+        nargs="?",
+        help=r"Parent folder containing session curated_analyzer folders, e.g. S:\SNr1",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", default=8765, type=int, help="Port to bind")
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")

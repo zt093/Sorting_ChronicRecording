@@ -43,7 +43,7 @@ import LDA as lda_helpers
 DATA_PATH = None  # Leave as None to enter the alignment export path at runtime.
 OUTPUT_BASE_DIR = Path(r"S:\Tuning")
 
-MIN_SESSIONS_PER_UNIT = 66
+MIN_SESSIONS_PER_UNIT = 138
 BIN_SIZE_SECONDS = 60.0
 MIN_MINUTES_PER_HOUR = 1
 
@@ -55,7 +55,7 @@ METRICS_TO_PLOT = (
 )
 
 # Choose which plot families to generate: ("type1", "type2"), ("type1",), or ("type2",).
-PLOT_TYPES = ("type2",)
+PLOT_TYPES = ("type1", "type2")
 
 # Plot type 1: use "all" to make one plot per selected aligned unit, or provide
 # final_unit_id values / final_group_key strings such as (1, 5, "align_A").
@@ -110,6 +110,22 @@ def safe_slug(value: object) -> str:
     text = str(value).strip()
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
     return text.strip("_") or "value"
+
+
+def shorten_slug(value: object, max_length: int = 48) -> str:
+    slug = safe_slug(value)
+    if len(slug) <= max_length:
+        return slug
+    return slug[:max_length].rstrip("_.-") or slug[:max_length]
+
+
+def build_compact_date_label(calendar_days: pd.Series) -> str:
+    days = sorted(calendar_days.astype(str).unique().tolist())
+    if not days:
+        return "no_dates"
+    if len(days) == 1:
+        return days[0]
+    return f"{days[0]}_to_{days[-1]}"
 
 
 def prompt_for_data_path(default_path: Path | None) -> Path:
@@ -519,13 +535,11 @@ def save_outputs(
     export_summary_path: Path,
     config: Config,
 ) -> list[Path]:
-    date_label = "_".join(sorted(hourly_table["calendar_day"].astype(str).unique()))
-    if len(date_label) > 90:
-        date_label = f"{hourly_table['calendar_day'].min()}_to_{hourly_table['calendar_day'].max()}"
+    date_label = build_compact_date_label(hourly_table["calendar_day"])
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root_dir = (
         config.output_base_dir
-        / f"tuning_{safe_slug(date_label)}_minsess_{int(config.min_sessions_per_unit)}_{run_timestamp}"
+        / f"tuning_{safe_slug(date_label)}_ms{int(config.min_sessions_per_unit)}_{run_timestamp}"
     )
     root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -591,16 +605,19 @@ def save_outputs(
 
     if "type1" in plot_types:
         type1_units = choose_type1_units(hourly_table, config)
-        type1_dir = root_dir / f"plot_type_1_single_unit_across_days_{safe_slug(date_label)}"
+        type1_dir = root_dir / "type1_units_by_day"
         for metric in config.metrics_to_plot:
             for unit_row in type1_units.itertuples(index=False):
                 unit_series = pd.Series(unit_row._asdict())
-                unit_slug = f"unit_{safe_slug(unit_series['final_unit_id'])}_{safe_slug(unit_series['final_group_key'])}"
+                unit_slug = (
+                    f"unit_{safe_slug(unit_series['final_unit_id'])}_"
+                    f"{shorten_slug(unit_series['final_group_key'], max_length=36)}"
+                )
                 plot_single_unit_across_days(
                     hourly_table=hourly_table,
                     metric=metric,
                     unit_row=unit_series,
-                    output_path=type1_dir / metric / f"{unit_slug}_{metric}.png",
+                    output_path=type1_dir / metric / f"{unit_slug}.png",
                     config=config,
                 )
         output_dirs.append(type1_dir)
@@ -624,7 +641,7 @@ def save_outputs(
             raise ValueError("VARIABILITY_MODE must be 'sem' or 'iqr'.")
 
         for selected_day in selected_days:
-            type2_dir = root_dir / f"plot_type_2_all_units_one_day_{safe_slug(selected_day)}"
+            type2_dir = root_dir / "type2_population_by_day" / safe_slug(selected_day)
             for metric in config.metrics_to_plot:
                 for normalization_method in config.normalization_methods:
                     summary_table = summarize_normalized_day(
@@ -639,7 +656,7 @@ def save_outputs(
                     method_dir = type2_dir / metric / normalization_method
                     method_dir.mkdir(parents=True, exist_ok=True)
                     summary_table.to_csv(
-                        method_dir / f"{selected_day}_{metric}_{normalization_method}_{variability_mode}.csv",
+                        method_dir / f"{safe_slug(selected_day)}_{normalization_method}_{variability_mode}.csv",
                         index=False,
                     )
                     plot_day_population_trend(
@@ -648,7 +665,7 @@ def save_outputs(
                         calendar_day=selected_day,
                         normalization_method=normalization_method,
                         variability_mode=variability_mode,
-                        output_path=method_dir / f"{selected_day}_{metric}_{normalization_method}_{variability_mode}.png",
+                        output_path=method_dir / f"{safe_slug(selected_day)}_{normalization_method}_{variability_mode}.png",
                         config=config,
                     )
             output_dirs.append(type2_dir)
