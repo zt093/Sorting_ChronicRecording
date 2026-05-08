@@ -19,10 +19,15 @@ or peak-to-trough width. Feature modes choose which columns enter LDA:
 FR_ONLY, FR_AMP, FR_CV2, FR_PEAK_TO_TROUGH, or MULTI_FEATURE.
 
 Firing-rate features are computed from binned spike counts divided by bin
-duration. When APPLY_ZSCORE is True, every selected feature column is normalized
+duration. Average amplitude is binned from per-spike amplitudes when the
+SpikeInterface `spike_amplitudes` extension is available. CV2 is computed from
+spikes within each bin. Peak-to-trough width is computed from sampled individual
+waveforms within each bin when the `waveforms` and `random_spikes` extensions
+are available; otherwise it falls back to the session template for bins with
+spikes. When APPLY_ZSCORE is True, every selected feature column is normalized
 separately across samples before LDA, so each aligned unit-feature pair has its
-own mean/std scaling. Missing static-feature values are filled by column mean
-before analysis.
+own mean/std scaling. Missing feature values are filled by column mean before
+analysis.
 
 For clock-hour labels, the script evaluates both standard stratified
 cross-validation and grouped-by-day cross-validation. Grouped-by-day CV trains
@@ -187,7 +192,7 @@ def apply_lda_mode_defaults(config: Config) -> Config:
 
 
 # -----------------------------------------------------------------------------
-# Static Unit Feature Extraction
+# Unit Feature Extraction
 # -----------------------------------------------------------------------------
 
 
@@ -316,6 +321,167 @@ def compute_session_unit_static_features(analyzer) -> dict[int, dict[str, float]
         }
 
     return feature_lookup
+
+
+def get_session_spike_amplitudes_by_unit(analyzer) -> dict[int, np.ndarray]:
+    if not analyzer.has_extension("spike_amplitudes"):
+        return {}
+
+    try:
+        amplitudes_by_segment = analyzer.get_extension("spike_amplitudes").get_data(
+            outputs="by_unit"
+        )
+    except Exception:
+        return {}
+
+    if not isinstance(amplitudes_by_segment, dict):
+        return {}
+
+    segment_amplitudes = amplitudes_by_segment.get(0, {})
+    if not isinstance(segment_amplitudes, dict):
+        return {}
+
+    lookup: dict[int, np.ndarray] = {}
+    for unit_id, amplitudes in segment_amplitudes.items():
+        parsed_unit_id = safe_int(unit_id)
+        if parsed_unit_id is None:
+            continue
+        lookup[int(parsed_unit_id)] = np.asarray(amplitudes, dtype=float).ravel()
+    return lookup
+
+
+def binned_mean_abs_amplitude(
+    spike_train_samples: np.ndarray,
+    spike_amplitudes: np.ndarray | None,
+    bin_indices: np.ndarray,
+    n_bins: int,
+) -> np.ndarray:
+    values = np.full(n_bins, np.nan, dtype=float)
+    if spike_amplitudes is None:
+        return values
+
+    spike_amplitudes = np.asarray(spike_amplitudes, dtype=float).ravel()
+    if spike_amplitudes.shape[0] != spike_train_samples.shape[0]:
+        return values
+
+    valid_mask = (
+        (bin_indices >= 0)
+        & (bin_indices < n_bins)
+        & np.isfinite(spike_amplitudes)
+    )
+    if not np.any(valid_mask):
+        return values
+
+    sums = np.zeros(n_bins, dtype=float)
+    counts = np.zeros(n_bins, dtype=float)
+    np.add.at(sums, bin_indices[valid_mask], np.abs(spike_amplitudes[valid_mask]))
+    np.add.at(counts, bin_indices[valid_mask], 1.0)
+    nonzero_mask = counts > 0
+    values[nonzero_mask] = sums[nonzero_mask] / counts[nonzero_mask]
+    return values
+
+
+def binned_cv2(
+    spike_train_samples: np.ndarray,
+    bin_indices: np.ndarray,
+    n_bins: int,
+) -> np.ndarray:
+    values = np.full(n_bins, np.nan, dtype=float)
+    for bin_index in range(n_bins):
+        bin_spike_train = spike_train_samples[bin_indices == bin_index]
+        if bin_spike_train.size >= 3:
+            values[bin_index] = compute_cv2(bin_spike_train)
+    return values
+
+
+def get_session_waveform_snippets_by_unit(
+    analyzer,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    if not analyzer.has_extension("waveforms") or not analyzer.has_extension("random_spikes"):
+        return {}
+
+    try:
+        waveforms_ext = analyzer.get_extension("waveforms")
+        random_spikes = analyzer.get_extension("random_spikes").get_random_spikes()
+    except Exception:
+        return {}
+
+    if random_spikes is None or len(random_spikes) == 0:
+        return {}
+
+    lookup: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for unit_id in analyzer.sorting.get_unit_ids():
+        parsed_unit_id = safe_int(unit_id)
+        if parsed_unit_id is None:
+            continue
+        try:
+            unit_index = analyzer.sorting.id_to_index(unit_id)
+            waveforms = waveforms_ext.get_waveforms_one_unit(unit_id, force_dense=True)
+        except Exception:
+            continue
+        if waveforms is None or getattr(waveforms, "size", 0) == 0:
+            continue
+
+        unit_spike_mask = random_spikes["unit_index"] == unit_index
+        unit_random_spikes = random_spikes[unit_spike_mask]
+        if "segment_index" in unit_random_spikes.dtype.names:
+            segment_mask = unit_random_spikes["segment_index"] == 0
+            unit_random_spikes = unit_random_spikes[segment_mask]
+            waveforms = waveforms[segment_mask]
+
+        if len(unit_random_spikes) != waveforms.shape[0]:
+            continue
+
+        sample_indices = np.asarray(unit_random_spikes["sample_index"], dtype=float)
+        lookup[int(parsed_unit_id)] = (sample_indices, np.asarray(waveforms, dtype=float))
+    return lookup
+
+
+def binned_waveform_peak_to_trough(
+    waveform_spike_samples: np.ndarray | None,
+    waveforms: np.ndarray | None,
+    bin_edges_samples: np.ndarray,
+    n_bins: int,
+    sampling_frequency: float,
+) -> np.ndarray:
+    values = np.full(n_bins, np.nan, dtype=float)
+    if waveform_spike_samples is None or waveforms is None:
+        return values
+
+    waveform_spike_samples = np.asarray(waveform_spike_samples, dtype=float).ravel()
+    waveforms = np.asarray(waveforms, dtype=float)
+    if waveforms.ndim != 3 or waveforms.shape[0] != waveform_spike_samples.shape[0]:
+        return values
+
+    waveform_bin_indices = np.searchsorted(
+        bin_edges_samples,
+        waveform_spike_samples,
+        side="right",
+    ) - 1
+    waveform_bin_indices[waveform_spike_samples == bin_edges_samples[-1]] = n_bins - 1
+
+    for bin_index in range(n_bins):
+        bin_waveforms = waveforms[waveform_bin_indices == bin_index]
+        if bin_waveforms.shape[0] == 0:
+            continue
+        mean_waveform = np.nanmean(bin_waveforms, axis=0)
+        if mean_waveform.ndim != 2 or not np.any(np.isfinite(mean_waveform)):
+            continue
+        best_channel = get_best_channel(mean_waveform)
+        values[bin_index] = trough_to_peak_ms(mean_waveform[:, best_channel], sampling_frequency)
+    return values
+
+
+def binned_template_peak_to_trough(
+    peak_to_trough_ms: float | None,
+    counts: np.ndarray,
+) -> np.ndarray:
+    values = np.full(counts.shape[0], np.nan, dtype=float)
+    parsed_value = safe_float(peak_to_trough_ms)
+    if parsed_value is None:
+        return values
+    values[counts > 0] = float(parsed_value)
+    return values
 
 
 def build_feature_table(selected_units: pd.DataFrame) -> pd.DataFrame:
@@ -1500,6 +1666,18 @@ def build_population_vectors(
         )
         analyzer = analyzers[session_key]
         static_features_by_unit = compute_session_unit_static_features(analyzer)
+        spike_amplitudes_by_unit = get_session_spike_amplitudes_by_unit(analyzer)
+        waveform_snippets_by_unit = get_session_waveform_snippets_by_unit(analyzer)
+        if not spike_amplitudes_by_unit:
+            log_status(
+                f"Session '{session_name}': no spike_amplitudes extension was available; "
+                "binned amplitude features will be missing."
+            )
+        if not waveform_snippets_by_unit:
+            log_status(
+                f"Session '{session_name}': no waveforms/random_spikes extensions were available; "
+                "binned peak-to-trough features will use template fallback for bins with spikes."
+            )
         valid_unit_ids = {int(unit_id) for unit_id in analyzer.sorting.get_unit_ids()}
         sampling_frequency = float(analyzer.sorting.get_sampling_frequency())
         try:
@@ -1525,6 +1703,7 @@ def build_population_vectors(
         bin_edges = np.arange(n_complete_bins + 1, dtype=float) * config.bin_size_seconds
         if len(bin_edges) < 2:
             continue
+        bin_edges_samples = bin_edges * sampling_frequency
 
         session_matrix = np.zeros((len(bin_edges) - 1, len(feature_keys)), dtype=float)
         session_units = members_by_session.get(session_key, pd.DataFrame())
@@ -1545,18 +1724,52 @@ def build_population_vectors(
             )
             spike_times_s = np.asarray(spike_train_samples, dtype=float) / sampling_frequency
             counts, _ = np.histogram(spike_times_s, bins=bin_edges)
+            n_bins = len(bin_edges) - 1
+            bin_indices = np.searchsorted(bin_edges, spike_times_s, side="right") - 1
+            bin_indices[spike_times_s == bin_edges[-1]] = n_bins - 1
             rate_feature_key = f"{feature_key}__firing_rate_hz"
             session_matrix[:, feature_index[rate_feature_key]] = (
                 counts.astype(float) / config.bin_size_seconds
             )
 
             static_features = static_features_by_unit.get(int(member_row.unit_id), {})
-            for static_feature_name in ("average_amplitude_uv", "cv2", "peak_to_trough_ms"):
-                static_feature_key = f"{feature_key}__{static_feature_name}"
-                static_value = safe_float(static_features.get(static_feature_name))
-                session_matrix[:, feature_index[static_feature_key]] = (
-                    float(static_value) if static_value is not None else np.nan
-                )
+            amplitude_feature_key = f"{feature_key}__average_amplitude_uv"
+            session_matrix[:, feature_index[amplitude_feature_key]] = binned_mean_abs_amplitude(
+                spike_train_samples=np.asarray(spike_train_samples, dtype=float),
+                spike_amplitudes=spike_amplitudes_by_unit.get(int(member_row.unit_id)),
+                bin_indices=bin_indices,
+                n_bins=n_bins,
+            )
+
+            cv2_feature_key = f"{feature_key}__cv2"
+            session_matrix[:, feature_index[cv2_feature_key]] = binned_cv2(
+                spike_train_samples=np.asarray(spike_train_samples, dtype=float),
+                bin_indices=bin_indices,
+                n_bins=n_bins,
+            )
+
+            peak_to_trough_feature_key = f"{feature_key}__peak_to_trough_ms"
+            waveform_spike_samples = None
+            waveforms = None
+            waveform_payload = waveform_snippets_by_unit.get(int(member_row.unit_id))
+            if waveform_payload is not None:
+                waveform_spike_samples, waveforms = waveform_payload
+            waveform_peak_to_trough = binned_waveform_peak_to_trough(
+                waveform_spike_samples=waveform_spike_samples,
+                waveforms=waveforms,
+                bin_edges_samples=bin_edges_samples,
+                n_bins=n_bins,
+                sampling_frequency=sampling_frequency,
+            )
+            template_peak_to_trough = binned_template_peak_to_trough(
+                peak_to_trough_ms=static_features.get("peak_to_trough_ms"),
+                counts=counts,
+            )
+            missing_peak_to_trough = ~np.isfinite(waveform_peak_to_trough)
+            waveform_peak_to_trough[missing_peak_to_trough] = template_peak_to_trough[
+                missing_peak_to_trough
+            ]
+            session_matrix[:, feature_index[peak_to_trough_feature_key]] = waveform_peak_to_trough
 
         if skipped_invalid_units > 0:
             log_status(
@@ -1615,8 +1828,8 @@ def build_population_vectors(
         n_missing_static = int(np.isnan(population_matrix[:, missing_static_mask.to_numpy()]).sum())
         if n_missing_static > 0:
             log_status(
-                f"Computed unit static features with {n_missing_static} missing values; "
-                "these will remain NaN until downstream z-scoring/analysis."
+                f"Computed non-firing-rate feature bins with {n_missing_static} missing values; "
+                "these will remain NaN until downstream imputation/z-scoring."
             )
     return population_matrix, metadata_table, feature_table
 

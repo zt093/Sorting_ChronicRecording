@@ -16,16 +16,17 @@ Type 1 - single-unit tuning across days
     day. Values are raw hourly metric values, so this plot is useful for checking
     whether an individual aligned unit shows repeatable day-to-day structure.
 
-Type 2 - population tuning by day
-    For each calendar day, normalize each aligned unit within that day, then
-    summarize the normalized population by clock hour. These by-day plots are
-    kept as QC outputs.
-
-Type 2 also saves an all-days overview
+Type 2 - population tuning, main all-days normalization output
     For each metric and normalization method, normalize each aligned unit across
-    all of its hourly values from all days, then compute a separate population
-    tuning curve for each calendar day. The overview figure overlays those day
-    curves in one plot rather than collapsing days into one average line.
+    all of its hourly values from all available calendar days. Then, for each
+    calendar day and clock hour, average the normalized values across aligned
+    units. The main type 2 figure overlays one population tuning curve per day.
+
+Type 2 also saves per-day normalization QC plots
+    For each calendar day, normalize each aligned unit within that day, then
+    summarize the normalized population by clock hour. These plots are useful QC
+    but are not the main type 2 output because within-day normalization removes
+    day-to-day baseline differences.
 
 Supported metrics are firing rate, average amplitude, peak-to-trough width, and
 CV2. Supported normalization methods are z-score, min-max, relative-to-mean, and
@@ -80,8 +81,9 @@ PLOT_TYPES = ("type1", "type2")
 # final_unit_id values / final_group_key strings such as (1, 5, "align_A").
 TYPE1_UNITS = "all"
 
-# Plot type 2: "all" makes one output set per available calendar day.
-# You can set "YYYY-MM-DD" to target one specific day. None uses the first day.
+# Plot type 2 QC: "all" makes one within-day-normalized QC output set per
+# available calendar day. Set "YYYY-MM-DD" to target one specific day. None uses
+# the first day. The main type 2 all-days-normalized output always uses all days.
 TYPE2_DAY = "all"
 NORMALIZATION_METHODS = (
     "zscore",
@@ -479,12 +481,12 @@ def plot_single_unit_across_days(
 
 
 # =============================================================================
-# Module 6: Plot Type 2 - Population Tuning By Day
+# Module 6: Plot Type 2 - Population Tuning
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# Type 2A Calculation: One Day at a Time
+# Type 2 QC Calculation: One Day at a Time, Normalized Within Day
 # -----------------------------------------------------------------------------
 
 
@@ -554,7 +556,7 @@ def summarize_normalized_day(
 
 
 # -----------------------------------------------------------------------------
-# Type 2B Calculation: All Days in One Table, Kept as Separate Day Curves
+# Type 2 Main Calculation: Normalize Units Across All Days
 # -----------------------------------------------------------------------------
 
 
@@ -627,7 +629,7 @@ def summarize_normalized_all_days(
 
 
 # -----------------------------------------------------------------------------
-# Type 2B Plot: All Days Overlaid
+# Type 2 Main Plot: All Days Overlaid
 # -----------------------------------------------------------------------------
 
 
@@ -676,7 +678,7 @@ def plot_all_days_population_trends(
 
 
 # -----------------------------------------------------------------------------
-# Type 2A Plot: Single-Day QC
+# Type 2 QC Plot: Single-Day Within-Day Normalization
 # -----------------------------------------------------------------------------
 
 
@@ -773,6 +775,8 @@ def save_outputs(
                 "metrics_to_plot": list(config.metrics_to_plot),
                 "plot_types": list(config.plot_types),
                 "type2_day": config.type2_day,
+                "type2_main_normalization_scope": "per_aligned_unit_across_all_calendar_days",
+                "type2_qc_normalization_scope": "per_aligned_unit_within_each_calendar_day",
                 "normalization_methods": list(config.normalization_methods),
                 "variability_mode": str(config.variability_mode),
                 "n_hourly_rows": int(len(hourly_table)),
@@ -829,6 +833,35 @@ def save_outputs(
     if "type2" in plot_types:
         available_days = sorted(hourly_table["calendar_day"].astype(str).unique().tolist())
         requested_type2_day = str(config.type2_day).strip() if config.type2_day is not None else ""
+        variability_mode = str(config.variability_mode).strip().lower()
+        if variability_mode not in {"sem", "iqr"}:
+            raise ValueError("VARIABILITY_MODE must be 'sem' or 'iqr'.")
+
+        main_type2_dir = root_dir / "type2_population_main_all_days_normalized"
+        for metric in config.metrics_to_plot:
+            for normalization_method in config.normalization_methods:
+                summary_table = summarize_normalized_all_days(
+                    hourly_table=hourly_table,
+                    metric=metric,
+                    normalization_method=normalization_method,
+                    variability_mode=variability_mode,
+                )
+                if summary_table.empty:
+                    continue
+                method_dir = main_type2_dir / metric / normalization_method
+                method_dir.mkdir(parents=True, exist_ok=True)
+                output_stem = f"all_days_{normalization_method}_{variability_mode}"
+                summary_table.to_csv(method_dir / f"{output_stem}.csv", index=False)
+                plot_all_days_population_trends(
+                    summary_table=summary_table,
+                    metric=metric,
+                    normalization_method=normalization_method,
+                    variability_mode=variability_mode,
+                    output_path=method_dir / f"{output_stem}.png",
+                    config=config,
+                )
+        output_dirs.append(main_type2_dir)
+
         if requested_type2_day.lower() in {"all", "*"}:
             selected_days = available_days
         elif requested_type2_day:
@@ -840,12 +873,8 @@ def save_outputs(
         else:
             selected_days = [available_days[0]]
 
-        variability_mode = str(config.variability_mode).strip().lower()
-        if variability_mode not in {"sem", "iqr"}:
-            raise ValueError("VARIABILITY_MODE must be 'sem' or 'iqr'.")
-
         for selected_day in selected_days:
-            type2_dir = root_dir / "type2_population_by_day" / safe_slug(selected_day)
+            type2_dir = root_dir / "type2_population_by_day_qc" / safe_slug(selected_day)
             for metric in config.metrics_to_plot:
                 for normalization_method in config.normalization_methods:
                     summary_table = summarize_normalized_day(
@@ -873,31 +902,6 @@ def save_outputs(
                         config=config,
                     )
             output_dirs.append(type2_dir)
-
-        combined_type2_dir = root_dir / "type2_population_all_days_combined"
-        for metric in config.metrics_to_plot:
-            for normalization_method in config.normalization_methods:
-                summary_table = summarize_normalized_all_days(
-                    hourly_table=hourly_table,
-                    metric=metric,
-                    normalization_method=normalization_method,
-                    variability_mode=variability_mode,
-                )
-                if summary_table.empty:
-                    continue
-                method_dir = combined_type2_dir / metric / normalization_method
-                method_dir.mkdir(parents=True, exist_ok=True)
-                output_stem = f"all_days_{normalization_method}_{variability_mode}"
-                summary_table.to_csv(method_dir / f"{output_stem}.csv", index=False)
-                plot_all_days_population_trends(
-                    summary_table=summary_table,
-                    metric=metric,
-                    normalization_method=normalization_method,
-                    variability_mode=variability_mode,
-                    output_path=method_dir / f"{output_stem}.png",
-                    config=config,
-                )
-        output_dirs.append(combined_type2_dir)
     return output_dirs
 
 
