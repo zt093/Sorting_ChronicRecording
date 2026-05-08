@@ -6,11 +6,30 @@ Circadian-style tuning plots for aligned neural units.
 Run this after Alignment_html.py or Alignment_days.py has exported aligned unit
 summaries. The script uses the same alignment export/analyzer loading path as
 LDA.py, bins each recording in real clock time at 1-minute resolution, folds
-minutes into clock hours, and saves two plot families:
+minutes into clock hours, and builds an hourly metric table for aligned unit
+groups.
 
-1. One aligned unit across days, with each calendar day kept as a separate line.
-2. One calendar day across all aligned units, where each unit is normalized
-   within that day before population aggregation.
+The script saves two plot families:
+
+Type 1 - single-unit tuning across days
+    For each selected aligned unit, plot one hourly tuning curve per calendar
+    day. Values are raw hourly metric values, so this plot is useful for checking
+    whether an individual aligned unit shows repeatable day-to-day structure.
+
+Type 2 - population tuning by day
+    For each calendar day, normalize each aligned unit within that day, then
+    summarize the normalized population by clock hour. These by-day plots are
+    kept as QC outputs.
+
+Type 2 also saves an all-days overview
+    For each metric and normalization method, normalize each aligned unit across
+    all of its hourly values from all days, then compute a separate population
+    tuning curve for each calendar day. The overview figure overlays those day
+    curves in one plot rather than collapsing days into one average line.
+
+Supported metrics are firing rate, average amplitude, peak-to-trough width, and
+CV2. Supported normalization methods are z-score, min-max, relative-to-mean, and
+relative-to-first-hour.
 """
 
 from dataclasses import dataclass
@@ -36,16 +55,16 @@ if str(SCRIPT_DIR) not in sys.path:
 import LDA as lda_helpers
 
 
-# -----------------------------------------------------------------------------
-# User configuration
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Module 1: User Configuration
+# =============================================================================
 
 DATA_PATH = None  # Leave as None to enter the alignment export path at runtime.
 OUTPUT_BASE_DIR = Path(r"S:\Tuning")
 
 MIN_SESSIONS_PER_UNIT = 138
 BIN_SIZE_SECONDS = 60.0
-MIN_MINUTES_PER_HOUR = 1
+MIN_MINUTES_PER_HOUR = 30
 
 METRICS_TO_PLOT = (
     "firing_rate_hz",
@@ -99,6 +118,11 @@ class Config:
     metric_labels: dict[str, str] | None = None
 
 
+# =============================================================================
+# Module 2: Shared Utilities
+# =============================================================================
+
+
 def log_status(message: str) -> None:
     print(f"[Tuning] {message}", flush=True)
 
@@ -140,6 +164,11 @@ def prompt_for_data_path(default_path: Path | None) -> Path:
     raise ValueError("A data path is required.")
 
 
+# -----------------------------------------------------------------------------
+# Plot Formatting Helpers
+# -----------------------------------------------------------------------------
+
+
 def parse_time_of_day(value) -> float:
     """Return fractional clock hour in [0, 24)."""
     if pd.isna(value):
@@ -173,6 +202,11 @@ def setup_circadian_axis(ax, ylabel: str, title: str) -> None:
     ax.grid(True, axis="y", color="#d0d0d0", linewidth=0.6, alpha=0.6)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
+
+# -----------------------------------------------------------------------------
+# Metric Normalization Helpers
+# -----------------------------------------------------------------------------
 
 
 def normalize_unit_values(values: pd.Series, method: str) -> pd.Series:
@@ -213,6 +247,11 @@ def normalize_unit_values(values: pd.Series, method: str) -> pd.Series:
 def get_metric_label(metric: str, config: Config) -> str:
     labels = config.metric_labels or METRIC_LABELS
     return labels.get(metric, metric)
+
+
+# =============================================================================
+# Module 3: Input Data Loading
+# =============================================================================
 
 
 def build_lda_config(config: Config) -> lda_helpers.Config:
@@ -266,6 +305,16 @@ def load_aligned_minute_data(config: Config) -> tuple[pd.DataFrame, pd.DataFrame
     )
     minute_wide["time_of_day_hour"] = minute_wide["minute_start_datetime"].map(parse_time_of_day)
     return minute_wide, feature_table, selected_units, export_summary_path
+
+
+# =============================================================================
+# Module 4: Core Calculations
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Hourly Metric Table
+# -----------------------------------------------------------------------------
 
 
 def build_hourly_metric_table(
@@ -356,6 +405,11 @@ def build_hourly_metric_table(
     ).reset_index(drop=True)
 
 
+# -----------------------------------------------------------------------------
+# Type 1 Calculation: Select Single Units
+# -----------------------------------------------------------------------------
+
+
 def choose_type1_units(hourly_table: pd.DataFrame, config: Config) -> pd.DataFrame:
     unit_table = hourly_table[["final_group_key", "final_unit_id", "shank_id", "local_channel_on_shank"]].drop_duplicates()
     if str(config.type1_units).lower() == "all":
@@ -370,6 +424,11 @@ def choose_type1_units(hourly_table: pd.DataFrame, config: Config) -> pd.DataFra
         {int(value) for value in requested if str(value).isdigit()}
     )
     return unit_table.loc[mask].sort_values(["final_unit_id", "final_group_key"], na_position="last")
+
+
+# =============================================================================
+# Module 5: Plot Type 1 - Single Unit Across Days
+# =============================================================================
 
 
 def plot_single_unit_across_days(
@@ -417,6 +476,16 @@ def plot_single_unit_across_days(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+# =============================================================================
+# Module 6: Plot Type 2 - Population Tuning By Day
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Type 2A Calculation: One Day at a Time
+# -----------------------------------------------------------------------------
 
 
 def summarize_normalized_day(
@@ -484,6 +553,133 @@ def summarize_normalized_day(
     return pd.DataFrame(rows)
 
 
+# -----------------------------------------------------------------------------
+# Type 2B Calculation: All Days in One Table, Kept as Separate Day Curves
+# -----------------------------------------------------------------------------
+
+
+def summarize_normalized_all_days(
+    hourly_table: pd.DataFrame,
+    metric: str,
+    normalization_method: str,
+    variability_mode: str,
+) -> pd.DataFrame:
+    metric_table = hourly_table[hourly_table["metric"] == metric].copy()
+    if metric_table.empty:
+        return pd.DataFrame()
+
+    normalized_tables: list[pd.DataFrame] = []
+    for _, unit_table in metric_table.groupby("final_group_key", sort=True):
+        unit_table = unit_table.sort_values(["calendar_day", "clock_hour_of_day"]).copy()
+        unit_table["normalized_value"] = normalize_unit_values(unit_table["value"], normalization_method)
+        normalized_tables.append(unit_table)
+
+    normalized = pd.concat(normalized_tables, ignore_index=True)
+    normalized = normalized[np.isfinite(normalized["normalized_value"])].copy()
+    if normalized.empty:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    available_days = sorted(normalized["calendar_day"].astype(str).unique().tolist())
+    for calendar_day in available_days:
+        day_table = normalized[normalized["calendar_day"].astype(str) == calendar_day].copy()
+        for hour in range(24):
+            hour_table = day_table.loc[day_table["clock_hour_of_day"] == hour].copy()
+            values = hour_table["normalized_value"].dropna().to_numpy(dtype=float)
+            if values.size == 0:
+                rows.append(
+                    {
+                        "calendar_day": calendar_day,
+                        "clock_hour_of_day": hour,
+                        "time_of_day_hour": float(hour),
+                        "center": np.nan,
+                        "lower": np.nan,
+                        "upper": np.nan,
+                        "n_samples": 0,
+                        "n_units": 0,
+                        "n_days": 0,
+                    }
+                )
+                continue
+            if variability_mode == "iqr":
+                center = float(np.nanmedian(values))
+                lower = float(np.nanpercentile(values, 25))
+                upper = float(np.nanpercentile(values, 75))
+            else:
+                center = float(np.nanmean(values))
+                sem = float(np.nanstd(values, ddof=1) / np.sqrt(values.size)) if values.size > 1 else 0.0
+                lower = center - sem
+                upper = center + sem
+            rows.append(
+                {
+                    "calendar_day": calendar_day,
+                    "clock_hour_of_day": hour,
+                    "time_of_day_hour": float(hour),
+                    "center": center,
+                    "lower": lower,
+                    "upper": upper,
+                    "n_samples": int(values.size),
+                    "n_units": int(hour_table["final_group_key"].nunique()),
+                    "n_days": int(hour_table["calendar_day"].astype(str).nunique()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
+# Type 2B Plot: All Days Overlaid
+# -----------------------------------------------------------------------------
+
+
+def plot_all_days_population_trends(
+    summary_table: pd.DataFrame,
+    metric: str,
+    normalization_method: str,
+    variability_mode: str,
+    output_path: Path,
+    config: Config,
+) -> None:
+    if summary_table.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(10.8, 6.0))
+    colors = plt.get_cmap("tab20").colors
+    variability_label = "median + IQR" if variability_mode == "iqr" else "mean +/- SEM"
+    for day_index, (calendar_day, day_table) in enumerate(summary_table.groupby("calendar_day", sort=True)):
+        day_table = day_table.sort_values("clock_hour_of_day")
+        x = day_table["time_of_day_hour"].to_numpy(dtype=float)
+        center = day_table["center"].to_numpy(dtype=float)
+        lower = day_table["lower"].to_numpy(dtype=float)
+        upper = day_table["upper"].to_numpy(dtype=float)
+        color = colors[day_index % len(colors)]
+        ax.fill_between(x, lower, upper, color=color, alpha=0.10, linewidth=0)
+        ax.plot(
+            x,
+            center,
+            color=color,
+            linewidth=2.0,
+            marker="o",
+            markersize=3.8,
+            label=str(calendar_day),
+        )
+
+    setup_circadian_axis(
+        ax,
+        ylabel=f"Normalized {get_metric_label(metric, config)}",
+        title=f"All days: {metric} trend ({normalization_method}, {variability_label})",
+    )
+    ax.legend(title="Day", frameon=False, fontsize=8, ncol=2)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Type 2A Plot: Single-Day QC
+# -----------------------------------------------------------------------------
+
+
 def plot_day_population_trend(
     summary_table: pd.DataFrame,
     metric: str,
@@ -492,6 +688,9 @@ def plot_day_population_trend(
     variability_mode: str,
     output_path: Path,
     config: Config,
+    title_label: str | None = None,
+    count_column: str = "n_units",
+    count_label: str = "Units contributing",
 ) -> None:
     if summary_table.empty:
         return
@@ -508,24 +707,29 @@ def plot_day_population_trend(
     setup_circadian_axis(
         ax,
         ylabel=ylabel,
-        title=f"{calendar_day}: {metric} trend ({normalization_method}, {variability_label})",
+        title=f"{title_label or calendar_day}: {metric} trend ({normalization_method}, {variability_label})",
     )
     secondary = ax.twinx()
     secondary.plot(
         x,
-        summary_table["n_units"].to_numpy(dtype=float),
+        summary_table[count_column].to_numpy(dtype=float),
         color="#555555",
         linewidth=1.0,
         linestyle=":",
         alpha=0.65,
     )
-    secondary.set_ylabel("Units contributing", color="#555555")
+    secondary.set_ylabel(count_label, color="#555555")
     secondary.tick_params(axis="y", labelcolor="#555555")
     secondary.spines["top"].set_visible(False)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+# =============================================================================
+# Module 7: Output Writing and Plot Orchestration
+# =============================================================================
 
 
 def save_outputs(
@@ -539,7 +743,7 @@ def save_outputs(
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root_dir = (
         config.output_base_dir
-        / f"tuning_{safe_slug(date_label)}_ms{int(config.min_sessions_per_unit)}_{run_timestamp}"
+        / f"tuning_{safe_slug(date_label)}_ms{int(config.min_sessions_per_unit)}"
     )
     root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -669,7 +873,37 @@ def save_outputs(
                         config=config,
                     )
             output_dirs.append(type2_dir)
+
+        combined_type2_dir = root_dir / "type2_population_all_days_combined"
+        for metric in config.metrics_to_plot:
+            for normalization_method in config.normalization_methods:
+                summary_table = summarize_normalized_all_days(
+                    hourly_table=hourly_table,
+                    metric=metric,
+                    normalization_method=normalization_method,
+                    variability_mode=variability_mode,
+                )
+                if summary_table.empty:
+                    continue
+                method_dir = combined_type2_dir / metric / normalization_method
+                method_dir.mkdir(parents=True, exist_ok=True)
+                output_stem = f"all_days_{normalization_method}_{variability_mode}"
+                summary_table.to_csv(method_dir / f"{output_stem}.csv", index=False)
+                plot_all_days_population_trends(
+                    summary_table=summary_table,
+                    metric=metric,
+                    normalization_method=normalization_method,
+                    variability_mode=variability_mode,
+                    output_path=method_dir / f"{output_stem}.png",
+                    config=config,
+                )
+        output_dirs.append(combined_type2_dir)
     return output_dirs
+
+
+# =============================================================================
+# Module 8: Pipeline Entry Point
+# =============================================================================
 
 
 def run_pipeline(config: Config) -> list[Path]:
