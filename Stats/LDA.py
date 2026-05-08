@@ -4,10 +4,31 @@ from __future__ import annotations
 Population LDA analysis for aligned spike-sorting outputs.
 
 This script reads the alignment export created by Alignment_html.py or
-Alignment_days.py and builds population firing-rate vectors across aligned good
-units. Each sample in the LDA input matrix represents one time bin from one
-session, and each feature represents one aligned unit group. If a unit group is
-absent in a session, its feature value is filled with zero for that session.
+Alignment_days.py and builds population feature vectors across aligned good
+unit groups. It supports two analysis modes:
+
+single_day_5min
+    Use 5-minute bins from one selected day as LDA samples.
+
+multi_day_hourly
+    Use 1-minute bins, then average them into day x clock-hour samples.
+
+Each sample is a time bin or hourly aggregate. Each feature column is one
+aligned unit-feature pair, such as one unit group's firing rate, amplitude, CV2,
+or peak-to-trough width. Feature modes choose which columns enter LDA:
+FR_ONLY, FR_AMP, FR_CV2, FR_PEAK_TO_TROUGH, or MULTI_FEATURE.
+
+Firing-rate features are computed from binned spike counts divided by bin
+duration. When APPLY_ZSCORE is True, every selected feature column is normalized
+separately across samples before LDA, so each aligned unit-feature pair has its
+own mean/std scaling. Missing static-feature values are filled by column mean
+before analysis.
+
+For clock-hour labels, the script evaluates both standard stratified
+cross-validation and grouped-by-day cross-validation. Grouped-by-day CV trains
+on some calendar days and predicts held-out calendar days. The output includes
+LDA projections, confusion matrices, permutation-test summaries, metadata CSVs,
+feature maps, and a JSON summary.
 
 Multi-day analysis is supported as long as the sessions were aligned together
 in the same export summary before running this script. For Alignment_days.py
@@ -35,16 +56,16 @@ from sklearn.metrics import balanced_accuracy_score, confusion_matrix
 from sklearn.model_selection import GroupKFold, StratifiedKFold
 
 
-# -----------------------------------------------------------------------------
-# User configuration
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Module 1: User Configuration
+# =============================================================================
 
 DATA_PATH = None  # Leave as None to always enter the path in the terminal.
 LDA_MODE = "multi_day_hourly"  # "single_day_5min" or "multi_day_hourly"
 SINGLE_DAY_DATE = None  # Optional "YYYY-MM-DD" date used by single_day_5min mode.
 SINGLE_DAY_5MIN_BIN_SIZE_SECONDS = 300.0
 MULTI_DAY_HOURLY_BIN_SIZE_SECONDS = 60.0
-LABEL_TYPE = "clock_hour_of_day"  # "clock_hour_of_day", "session_id", "calendar_day", or "day_number"
+LABEL_TYPE = "clock_hour_of_day" 
 MIN_FIRING_RATE_HZ = 0.05
 APPLY_ZSCORE = True
 APPLY_SMOOTHING = False
@@ -104,6 +125,16 @@ class Config:
     output_base_dir: Path = OUTPUT_BASE_DIR
 
 
+# =============================================================================
+# Module 2: Shared Utilities and Unit Feature Helpers
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Basic Parsing and Logging
+# -----------------------------------------------------------------------------
+
+
 def safe_float(value) -> float | None:
     try:
         if value is None:
@@ -131,6 +162,11 @@ def log_status(message: str) -> None:
     print(f"[LDA] {message}", flush=True)
 
 
+# -----------------------------------------------------------------------------
+# LDA Mode Configuration
+# -----------------------------------------------------------------------------
+
+
 def normalize_lda_mode(lda_mode: str) -> str:
     normalized_mode = str(lda_mode or "").strip().lower()
     valid_modes = {"single_day_5min", "multi_day_hourly"}
@@ -148,6 +184,11 @@ def apply_lda_mode_defaults(config: Config) -> Config:
     else:
         config.bin_size_seconds = float(MULTI_DAY_HOURLY_BIN_SIZE_SECONDS)
     return config
+
+
+# -----------------------------------------------------------------------------
+# Static Unit Feature Extraction
+# -----------------------------------------------------------------------------
 
 
 def compute_cv2(spike_train_samples: np.ndarray) -> float:
@@ -308,6 +349,16 @@ def build_feature_table(selected_units: pd.DataFrame) -> pd.DataFrame:
         for feature_index in range(1, len(feature_table) + 1)
     ]
     return feature_table
+
+
+# =============================================================================
+# Module 3: Input Paths and Alignment Export Loading
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Session and Path Resolution
+# -----------------------------------------------------------------------------
 
 
 def normalize_session_name(session_name: str) -> str:
@@ -543,6 +594,11 @@ def resolve_analyzer_folder_path(
     )
 
 
+# -----------------------------------------------------------------------------
+# Alignment Export Loading and Member Reconstruction
+# -----------------------------------------------------------------------------
+
+
 def load_export_summary(export_summary_path: Path) -> dict:
     if export_summary_path.is_dir() and export_summary_path.name.lower().startswith(ALIGNMENT_DAYS_SUMMARY_PREFIX):
         top_level_export_summary = export_summary_path / "export_summary.json"
@@ -744,6 +800,16 @@ def infer_group_selection_mode(
     return "member_rows", config.min_sessions_per_unit
 
 
+# =============================================================================
+# Module 4: Labels, Time Metadata, and Matrix Preprocessing
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Label and Session-Time Helpers
+# -----------------------------------------------------------------------------
+
+
 def extract_session_datetime(session_name: str, output_folder: str | None = None) -> datetime | None:
     details = extract_session_datetime_details(
         session_name=session_name,
@@ -897,6 +963,11 @@ def filter_session_table_for_lda_mode(session_table: pd.DataFrame, config: Confi
     return filtered_table
 
 
+# -----------------------------------------------------------------------------
+# Matrix Smoothing, Missing Values, and Feature Scaling
+# -----------------------------------------------------------------------------
+
+
 def build_gaussian_kernel(sigma_bins: float) -> np.ndarray:
     if sigma_bins <= 0:
         return np.array([1.0], dtype=float)
@@ -953,6 +1024,11 @@ def fill_missing_feature_values(population_matrix: np.ndarray) -> np.ndarray:
         row_indices, column_indices = np.where(missing_mask)
         filled[row_indices, column_indices] = column_means[column_indices]
     return filled
+
+
+# -----------------------------------------------------------------------------
+# Feature Mode Selection
+# -----------------------------------------------------------------------------
 
 
 def normalize_feature_modes(feature_modes: tuple[str, ...] | list[str] | str) -> list[str]:
@@ -1029,6 +1105,11 @@ def filter_hourly_samples_by_min_minutes(
             "Lower MIN_MINUTES_PER_HOUR or check the minute-bin coverage."
         )
     return filtered_population, filtered_metadata
+
+
+# =============================================================================
+# Module 5: Cross-Validation and Permutation Statistics
+# =============================================================================
 
 
 def predict_with_cv(
@@ -1138,6 +1219,16 @@ def evaluate_cv_scheme(
         "permutation_balanced_accuracy_std": float(np.std(shuffled_distribution)),
         "permutation_p_value": compute_empirical_p_value(balanced_accuracy, shuffled_distribution),
     }
+
+
+# =============================================================================
+# Module 6: Session Tables, Unit Selection, and Population Matrix Building
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Session Table and Analyzer Loading
+# -----------------------------------------------------------------------------
 
 
 def build_session_table(export_payload: dict, config: Config) -> pd.DataFrame:
@@ -1254,6 +1345,11 @@ def load_session_analyzers(
     return analyzers, resolved_output_folders
 
 
+# -----------------------------------------------------------------------------
+# Aligned Unit Selection
+# -----------------------------------------------------------------------------
+
+
 def select_good_unit_groups(
     export_payload: dict,
     config: Config,
@@ -1366,6 +1462,11 @@ def select_good_unit_groups(
         ["final_unit_id", "session_index", "unit_id"],
         na_position="last",
     ).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# Population Feature Matrix Construction
+# -----------------------------------------------------------------------------
 
 
 def build_population_vectors(
@@ -1518,6 +1619,11 @@ def build_population_vectors(
                 "these will remain NaN until downstream z-scoring/analysis."
             )
     return population_matrix, metadata_table, feature_table
+
+
+# -----------------------------------------------------------------------------
+# LDA Sample Aggregation and Sample Filtering
+# -----------------------------------------------------------------------------
 
 
 def aggregate_minutes_to_hourly_samples(
@@ -1721,6 +1827,11 @@ def print_and_build_clock_hour_verification(metadata_table: pd.DataFrame) -> pd.
     return verification_table
 
 
+# =============================================================================
+# Module 7: LDA Fitting and Decoding Evaluation
+# =============================================================================
+
+
 def filter_labels_for_lda(
     population_matrix: np.ndarray,
     metadata_table: pd.DataFrame,
@@ -1802,6 +1913,16 @@ def evaluate_decoding(
             )
 
     return results
+
+
+# =============================================================================
+# Module 8: Plotting
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# LDA Projection Plots
+# -----------------------------------------------------------------------------
 
 
 def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_path: Path) -> None:
@@ -1934,6 +2055,11 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
     plt.close(fig)
 
 
+# -----------------------------------------------------------------------------
+# Decoding Confusion Matrix Plot
+# -----------------------------------------------------------------------------
+
+
 def plot_confusion_matrix(decoding_result: dict, output_path: Path) -> None:
     confusion = np.asarray(decoding_result["confusion_matrix"], dtype=float)
     labels = [str(label) for label in decoding_result["confusion_labels"]]
@@ -1970,6 +2096,11 @@ def plot_confusion_matrix(decoding_result: dict, output_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+# =============================================================================
+# Module 9: Output Writing
+# =============================================================================
 
 
 def save_outputs(
@@ -2142,6 +2273,11 @@ def save_outputs(
     log_status(f"Saved {file_prefix}_summary.json")
 
     return output_dir
+
+
+# =============================================================================
+# Module 10: Pipeline Entry Point
+# =============================================================================
 
 
 def run_pipeline(config: Config) -> list[Path]:
