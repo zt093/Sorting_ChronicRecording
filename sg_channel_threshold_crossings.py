@@ -267,6 +267,7 @@ def _save_chunk_waveform_plot(
     fixed_y_half: float = 1.0,
     time_bar_ms: float = 1000.0,
     amp_bar_fraction: float = 0.25,
+    amp_bar_uv: float = 100.0,
 ) -> None:
     """All waveforms (thin); bold mean overlay with fixed y scale + scale bars."""
     wf_len = pre_samples + post_samples
@@ -288,7 +289,7 @@ def _save_chunk_waveform_plot(
         )
     else:
         mean_wf = waveforms_uv.mean(axis=0)
-        mean_abs = float(np.mean(np.abs(mean_wf)))
+        template_ptp_uv = float(np.ptp(mean_wf))
         plot_wf = waveforms_uv
         shown = n
         if n > plot_max_traces:
@@ -338,7 +339,7 @@ def _save_chunk_waveform_plot(
             f"SG ch {sg_ch}  |  recording {t_start_min:.2f}–{t_end_min:.2f} min  "
             f"|  N={n}"
             + (f"  (plot shows {shown})" if shown < n else "")
-            + f"  |  mean|µV|={mean_abs:.1f}"
+            + f"  |  template p2p={template_ptp_uv:.1f} uV"
         )
     ax.set_title(title, fontsize=10, pad=6)
 
@@ -351,7 +352,9 @@ def _save_chunk_waveform_plot(
         y0 = y_min + 0.06 * y_span
 
         # Amplitude scale bar
-        amp_bar = max(1e-6, float(amp_bar_fraction) * y_span)
+        amp_bar = max(1e-6, float(amp_bar_uv))
+        if amp_bar > 0.9 * y_span:
+            amp_bar = max(1e-6, float(amp_bar_fraction) * y_span)
         # keep bar inside axes
         if y0 + amp_bar > y_max:
             y0 = y_max - amp_bar - 0.02 * y_span
@@ -712,6 +715,385 @@ def process_recording_save_per_chunk(
         c0 = c1
 
     return total_events, manifest
+
+
+def process_recording_save_per_chunk_multi_channel(
+    rec: BaseRecording,
+    rec_file: Path,
+    chan_ids,
+    *,
+    run_output_dir: Path,
+    meta_run: dict,
+    channel_threshold_pairs: list[dict],
+    session_ordinal: int,
+    session_cumulative_sample_offset: int,
+    session_cumulative_time_offset_sec: float,
+    fs: float,
+    chunk_samples: int,
+    polarity: str,
+    refractory_samples: int,
+    pre_samples: int,
+    post_samples: int,
+    resume: bool,
+    progress: bool = True,
+    progress_prefix: str = "  ",
+) -> int:
+    """
+    Chunk-first threshold detection for all unfinished configured channels.
+
+    Output files and per-recording summaries intentionally match
+    process_recording_save_per_chunk(), but traces are loaded once per chunk for
+    all unfinished channels instead of once per channel/chunk.
+    """
+    n = rec.get_num_samples()
+    dur_s = n / fs
+    wf_len = pre_samples + post_samples
+    n_chunks = max(1, (n + chunk_samples - 1) // chunk_samples)
+    parent, stem = _recording_parent_stem_safe(rec_file)
+    t_detect0 = time.perf_counter()
+
+    completed_pairs = 0
+    states: list[dict] = []
+    for pair in channel_threshold_pairs:
+        sg_ch = int(pair["sg_ch"])
+        threshold_uv = float(pair["threshold_uv"])
+        rec_idx_local = sg_ch
+        if rec_idx_local >= len(chan_ids):
+            print(
+                f"  [skip] sg_ch={sg_ch} rec_idx={rec_idx_local} out of range for this file.",
+                flush=True,
+            )
+            continue
+
+        channel_id = chan_ids[rec_idx_local]
+        pair_folder = _pair_folder_name(sg_ch, threshold_uv)
+        pair_dir = run_output_dir / pair_folder
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        out_base = pair_dir / f"{parent}__{stem}"
+        summary_path = _recording_summary_path_from_out_base(out_base)
+
+        if resume and _is_recording_summary_complete(summary_path):
+            print(
+                f"  [skip] already complete: sg_ch={sg_ch}, thr={threshold_uv:.3f} uV",
+                flush=True,
+            )
+            completed_pairs += 1
+            continue
+
+        states.append(
+            {
+                "sg_ch": sg_ch,
+                "threshold_uv": threshold_uv,
+                "channel_id": channel_id,
+                "out_base": out_base,
+                "summary_path": summary_path,
+                "last_kept": -10**18,
+                "total_events": 0,
+                "manifest": [],
+                "fixed_y_center": None,
+                "fixed_y_half": None,
+            }
+        )
+
+    if not states:
+        return completed_pairs
+
+    print(
+        f"  Running chunk-first detection for {len(states)} unfinished channel/threshold pair(s)...",
+        flush=True,
+    )
+
+    c0 = 0
+    chunk_i = 0
+    while c0 < n:
+        chunk_i += 1
+        c1 = min(n, c0 + chunk_samples)
+        t_chunk0 = time.perf_counter()
+        t_start_min = (c0 / fs) / 60.0
+        t_end_min = (min(c1, n) / fs) / 60.0
+        min_tag = _minutes_tag(t_start_min, t_end_min)
+        chunk_tag = f"chunk_{chunk_i:04d}"
+        states_to_compute: list[dict] = []
+        reused_events = 0
+
+        for state in states:
+            sg_ch = int(state["sg_ch"])
+            threshold_uv = float(state["threshold_uv"])
+            out_base = state["out_base"]
+            npz_path = Path(f"{out_base}_{chunk_tag}_threshold_crossings.npz")
+
+            if resume and npz_path.exists():
+                npz = None
+                wfs_uv = None
+                mean_abs_for_name = 0.0
+                try:
+                    npz = np.load(str(npz_path), allow_pickle=False)
+                    crossings_samples = npz["crossing_samples"]
+                    n_chunk = int(crossings_samples.shape[0])
+                    if n_chunk > 0:
+                        state["last_kept"] = max(
+                            int(state["last_kept"]),
+                            int(crossings_samples[-1]),
+                        )
+
+                    if state["fixed_y_center"] is None or state["fixed_y_half"] is None:
+                        if n_chunk > 0:
+                            wfs_uv = npz["waveforms_uv"]
+                            mean_wf = wfs_uv.mean(axis=0)
+                            mean_min = float(np.min(mean_wf))
+                            mean_max = float(np.max(mean_wf))
+                            mean_range = mean_max - mean_min
+                            if mean_range <= 0:
+                                mean_range = max(1e-6, float(np.max(np.abs(mean_wf))))
+                            y_span = 1.2 * mean_range
+                            state["fixed_y_half"] = y_span / 2.0
+                            state["fixed_y_center"] = 0.5 * (mean_min + mean_max)
+                            mean_abs_for_name = float(np.mean(np.abs(mean_wf)))
+                        else:
+                            state["fixed_y_center"] = 0.0
+                            state["fixed_y_half"] = max(1.0, 1.2 * threshold_uv)
+
+                    fig_pattern = (
+                        f"{out_base.name}_{chunk_tag}_sgch{sg_ch}_{min_tag}_"
+                        f"n{n_chunk}_meanAbs*uV_waveforms.png"
+                    )
+                    fig_candidates = list(out_base.parent.glob(fig_pattern))
+                    fig_path = fig_candidates[0] if fig_candidates else None
+
+                    if fig_path is None or not fig_path.exists():
+                        if n_chunk > 0:
+                            if wfs_uv is None:
+                                wfs_uv = npz["waveforms_uv"]
+                            mean_wf = wfs_uv.mean(axis=0)
+                            mean_abs_for_name = float(np.mean(np.abs(mean_wf)))
+                        else:
+                            wfs_uv = np.zeros((0, wf_len), dtype=np.float32)
+                            mean_abs_for_name = 0.0
+                        fig_name = (
+                            f"{out_base.name}_{chunk_tag}_sgch{sg_ch}_{min_tag}_"
+                            f"n{n_chunk}_meanAbs{mean_abs_for_name:.0f}uV_waveforms.png"
+                        )
+                        fig_path = out_base.parent / fig_name
+                        _save_chunk_waveform_plot(
+                            wfs_uv,
+                            fs=fs,
+                            pre_samples=pre_samples,
+                            post_samples=post_samples,
+                            sg_ch=sg_ch,
+                            t_start_min=t_start_min,
+                            t_end_min=t_end_min,
+                            out_png=fig_path,
+                            fixed_y_center=float(state["fixed_y_center"]),
+                            fixed_y_half=float(state["fixed_y_half"]),
+                        )
+
+                    state["manifest"].append(
+                        {
+                            "chunk_index": chunk_i,
+                            "n_crossings": int(n_chunk),
+                            "time_start_sec": float(c0 / fs),
+                            "time_end_sec": float(min(c1, n) / fs),
+                            "npz": str(npz_path.resolve()),
+                            "figure": str(fig_path.resolve()),
+                        }
+                    )
+                    state["total_events"] += int(n_chunk)
+                    reused_events += int(n_chunk)
+                    del crossings_samples
+                    if wfs_uv is not None:
+                        del wfs_uv
+                    continue
+                except Exception:
+                    pass
+                finally:
+                    if npz is not None:
+                        try:
+                            npz.close()
+                        except Exception:
+                            pass
+
+            states_to_compute.append(state)
+
+        computed_events = 0
+        if states_to_compute:
+            buf_start = max(0, c0 - pre_samples - 1)
+            buf_end = min(n, c1 + post_samples + 1)
+            channel_ids = [state["channel_id"] for state in states_to_compute]
+            traces = rec.get_traces(
+                start_frame=buf_start,
+                end_frame=buf_end,
+                channel_ids=channel_ids,
+                return_scaled=True,
+            )
+            traces = traces.astype(np.float32, copy=False)
+
+            det_start = max(c0, 1)
+            det_end = c1
+            start_rel = det_start - buf_start
+            end_rel = det_end - buf_start
+
+            for col_i, state in enumerate(states_to_compute):
+                sg_ch = int(state["sg_ch"])
+                threshold_uv = float(state["threshold_uv"])
+                out_base = state["out_base"]
+                x = traces[:, col_i]
+
+                if polarity == "negative":
+                    cand = find_threshold_crossings_down(x, threshold_uv, start_rel, end_rel)
+                elif polarity == "positive":
+                    cand = find_threshold_crossings_up(x, threshold_uv, start_rel, end_rel)
+                elif polarity == "both":
+                    c1a = find_threshold_crossings_down(x, threshold_uv, start_rel, end_rel)
+                    c1b = find_threshold_crossings_up(x, threshold_uv, start_rel, end_rel)
+                    cand = np.unique(np.concatenate([c1a, c1b]))
+                else:
+                    raise ValueError(f"Unknown polarity: {polarity}")
+
+                global_cross = cand.astype(np.int64) + buf_start
+                global_cross.sort()
+
+                cap = 1024
+                cross_buf = np.empty(cap, dtype=np.int64)
+                wf_buf = np.empty((cap, wf_len), dtype=np.float32)
+                n_chunk = 0
+                for g in merge_refractory(global_cross, refractory_samples):
+                    if g - int(state["last_kept"]) < refractory_samples:
+                        continue
+                    loc = int(g - buf_start)
+                    if loc < pre_samples or loc + post_samples > x.shape[0]:
+                        continue
+                    cross_buf, wf_buf, cap = _ensure_event_capacity(
+                        cross_buf, wf_buf, n_chunk, wf_len
+                    )
+                    cross_buf[n_chunk] = int(g)
+                    wf_buf[n_chunk, :] = x[loc - pre_samples : loc + post_samples]
+                    n_chunk += 1
+                    state["last_kept"] = int(g)
+
+                mean_abs_for_name = 0.0
+                if n_chunk > 0:
+                    mean_wf = wf_buf[:n_chunk].mean(axis=0)
+                    mean_abs_for_name = float(np.mean(np.abs(mean_wf)))
+                    if state["fixed_y_center"] is None or state["fixed_y_half"] is None:
+                        mean_min = float(np.min(mean_wf))
+                        mean_max = float(np.max(mean_wf))
+                        mean_range = mean_max - mean_min
+                        if mean_range <= 0:
+                            mean_range = max(1e-6, float(np.max(np.abs(mean_wf))))
+                        y_span = 1.2 * mean_range
+                        state["fixed_y_half"] = y_span / 2.0
+                        state["fixed_y_center"] = 0.5 * (mean_min + mean_max)
+                if state["fixed_y_center"] is None or state["fixed_y_half"] is None:
+                    state["fixed_y_center"] = 0.0
+                    state["fixed_y_half"] = max(1.0, 1.2 * threshold_uv)
+
+                npz_path = Path(f"{out_base}_{chunk_tag}_threshold_crossings.npz")
+                crossings = (
+                    cross_buf[:n_chunk].copy() if n_chunk else np.zeros(0, dtype=np.int64)
+                )
+                wfs = (
+                    wf_buf[:n_chunk].copy()
+                    if n_chunk
+                    else np.zeros((0, wf_len), dtype=np.float32)
+                )
+                del cross_buf, wf_buf
+
+                ts_sec = crossings.astype(np.float64) / fs
+                crossing_samples_cumulative = crossings.astype(np.int64, copy=True) + int(
+                    session_cumulative_sample_offset
+                )
+                timestamps_sec_cumulative = ts_sec + float(session_cumulative_time_offset_sec)
+                np.savez_compressed(
+                    str(npz_path),
+                    crossing_samples=crossings,
+                    crossing_samples_cumulative=crossing_samples_cumulative,
+                    timestamps_sec=ts_sec,
+                    timestamps_sec_cumulative=timestamps_sec_cumulative,
+                    waveforms_uv=wfs,
+                    sampling_rate_hz=np.array([fs]),
+                    chunk_index=np.array([chunk_i], dtype=np.int32),
+                    time_start_sec=np.array([c0 / fs], dtype=np.float64),
+                    time_end_sec=np.array([min(c1, n) / fs], dtype=np.float64),
+                )
+
+                fig_name = (
+                    f"{out_base.name}_{chunk_tag}_sgch{sg_ch}_{min_tag}_"
+                    f"n{n_chunk}_meanAbs{mean_abs_for_name:.0f}uV_waveforms.png"
+                )
+                fig_path = out_base.parent / fig_name
+                _save_chunk_waveform_plot(
+                    wfs,
+                    fs=fs,
+                    pre_samples=pre_samples,
+                    post_samples=post_samples,
+                    sg_ch=sg_ch,
+                    t_start_min=t_start_min,
+                    t_end_min=t_end_min,
+                    out_png=fig_path,
+                    fixed_y_center=float(state["fixed_y_center"]),
+                    fixed_y_half=float(state["fixed_y_half"]),
+                )
+
+                state["manifest"].append(
+                    {
+                        "chunk_index": chunk_i,
+                        "n_crossings": int(n_chunk),
+                        "time_start_sec": float(c0 / fs),
+                        "time_end_sec": float(min(c1, n) / fs),
+                        "npz": str(npz_path.resolve()),
+                        "figure": str(fig_path.resolve()),
+                    }
+                )
+                state["total_events"] += int(n_chunk)
+                computed_events += int(n_chunk)
+
+                del crossings, wfs, ts_sec, crossing_samples_cumulative, timestamps_sec_cumulative
+
+            del traces
+
+        gc.collect()
+
+        if progress:
+            t_end = min(c1, n) / fs
+            pct = 100.0 * t_end / (n / fs) if n else 100.0
+            chunk_wall = time.perf_counter() - t_chunk0
+            elapsed = time.perf_counter() - t_detect0
+            print(
+                f"{progress_prefix}chunk {chunk_i}/{n_chunks}  "
+                f"rec time {c0/fs:.2f}-{t_end:.2f} s  ({pct:.1f}%)  "
+                f"channels computed {len(states_to_compute)} reused {len(states) - len(states_to_compute)}  "
+                f"events computed {computed_events} reused {reused_events}  "
+                f"chunk {chunk_wall:.2f}s  elapsed {elapsed:.1f}s  (saved+released)",
+                flush=True,
+            )
+
+        c0 = c1
+
+    for state in states:
+        per_rec = {
+            "rec_file": str(rec_file.resolve()),
+            "n_crossings": int(state["total_events"]),
+            "seconds": float(n / fs),
+            "output_summary": str(state["summary_path"].resolve()),
+            "preprocessing": meta_run["preprocessing"],
+            "session_ordinal": session_ordinal,
+            "cumulative_segment_start_sample": int(session_cumulative_sample_offset),
+            "cumulative_segment_start_sec": float(session_cumulative_time_offset_sec),
+            "cumulative_segment_end_sample": int(session_cumulative_sample_offset + n),
+            "cumulative_segment_end_sec": float(session_cumulative_time_offset_sec + dur_s),
+            "sg_ch": int(state["sg_ch"]),
+            "threshold_uv": float(state["threshold_uv"]),
+            "chunks": state["manifest"],
+        }
+        state["summary_path"].write_text(json.dumps(per_rec, indent=2), encoding="utf-8")
+        completed_pairs += 1
+        print(
+            f"  Pair done: sg_ch={int(state['sg_ch'])}, "
+            f"thr={float(state['threshold_uv']):.3f} uV -> {per_rec['n_crossings']} events.",
+            flush=True,
+        )
+
+    return completed_pairs
 
 
 CHRONIC_REC_NAME_RE = re.compile(
@@ -1146,8 +1528,27 @@ def process_threshold_crossings_run(
 
             previews_written_for_first_loaded_record = True
 
-        pairs_processed = 0
-        for pair in channel_threshold_pairs:
+        pairs_processed = process_recording_save_per_chunk_multi_channel(
+            rec,
+            rec_file,
+            chan_ids,
+            run_output_dir=run_output_dir,
+            meta_run=meta_run,
+            channel_threshold_pairs=channel_threshold_pairs,
+            session_ordinal=session_ordinal,
+            session_cumulative_sample_offset=int(cumulative_sample_offset),
+            session_cumulative_time_offset_sec=float(cumulative_time_offset_sec),
+            fs=fs,
+            chunk_samples=chunk_samples,
+            polarity=polarity,
+            refractory_samples=refractory_samples,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            resume=resume,
+            progress=True,
+            progress_prefix="  ",
+        )
+        for pair in ():
             sg_ch = int(pair["sg_ch"])
             threshold_uv = float(pair["threshold_uv"])
             rec_idx_local = sg_ch

@@ -14,6 +14,7 @@ This is a wrapper around `presentations.py` for the export bundle produced by
 import argparse
 import json
 from pathlib import Path
+import re
 import tkinter as tk
 from tkinter import filedialog
 
@@ -157,6 +158,155 @@ def _first_int_from_members(group_row: dict, key: str) -> int | None:
             if value is not None:
                 return value
     return None
+
+
+def parse_day_label_from_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown_day"
+
+    patterns = [
+        r"(?P<year>20\d{2})[-_]?(\D?)(?P<month>\d{2})[-_]?(\D?)(?P<day>\d{2})",
+        r"(?P<year>\d{2})(?P<month>\d{2})(?P<day>\d{2})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match is None:
+            continue
+        year = int(match.group("year"))
+        if year < 100:
+            year += 2000
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        try:
+            return pd.Timestamp(year=year, month=month, day=day).date().isoformat()
+        except ValueError:
+            continue
+
+    return text
+
+
+def source_session_key(member: dict) -> str:
+    output_folder = str(member.get("output_folder", "") or "").strip()
+    session_name = str(member.get("session_name", "") or "").strip()
+    session_index = _safe_int(member.get("session_index"))
+    if output_folder:
+        return f"output::{output_folder}"
+    if session_name and session_index is not None:
+        return f"session::{session_name}::{int(session_index)}"
+    if session_name:
+        return f"session::{session_name}"
+    return ""
+
+
+def collect_source_session_summary(payload: dict) -> tuple[pd.DataFrame, dict]:
+    session_rows_by_key: dict[str, dict] = {}
+    group_rows = payload.get("cross_session_alignment_groups", []) or []
+    has_source_members = any(group_row.get("source_members") for group_row in group_rows)
+
+    if has_source_members:
+        for group_row in group_rows:
+            for member in group_row.get("source_members") or []:
+                key = source_session_key(member)
+                if not key or key in session_rows_by_key:
+                    continue
+                session_name = str(member.get("session_name", "") or "").strip()
+                output_folder = str(member.get("output_folder", "") or "").strip()
+                day_label = parse_day_label_from_text(session_name or output_folder)
+                session_rows_by_key[key] = {
+                    "calendar_day": day_label,
+                    "session_name": session_name,
+                    "session_index": _safe_int(member.get("session_index")),
+                    "output_folder": output_folder,
+                    "session_key": key,
+                }
+    else:
+        for group_row in group_rows:
+            for day_member in group_row.get("day_members") or []:
+                day_label = parse_day_label_from_text(day_member.get("session_name"))
+                source_sessions = list(day_member.get("source_sessions_present") or [])
+                if not source_sessions:
+                    source_sessions = [
+                        str(item.get("session_name", "") or "").strip()
+                        for item in day_member.get("source_session_members", []) or []
+                    ]
+                if not source_sessions:
+                    source_sessions = [str(day_member.get("session_name", "") or "").strip()]
+
+                for source_session in source_sessions:
+                    if not source_session:
+                        continue
+                    key = f"session::{source_session}"
+                    if key in session_rows_by_key:
+                        continue
+                    session_rows_by_key[key] = {
+                        "calendar_day": day_label,
+                        "session_name": source_session,
+                        "session_index": None,
+                        "output_folder": "",
+                        "session_key": key,
+                    }
+
+    session_rows = list(session_rows_by_key.values())
+    if not session_rows:
+        summary_df = pd.DataFrame(
+            columns=[
+                "calendar_day",
+                "n_sessions",
+                "session_names",
+                "first_session_name",
+                "last_session_name",
+            ]
+        )
+    else:
+        session_df = pd.DataFrame(session_rows).sort_values(
+            ["calendar_day", "session_index", "session_name", "output_folder"],
+            na_position="last",
+        )
+        summary_rows = []
+        for calendar_day, day_table in session_df.groupby("calendar_day", sort=True, dropna=False):
+            session_names = [
+                str(value)
+                for value in day_table["session_name"].fillna("").tolist()
+                if str(value).strip()
+            ]
+            summary_rows.append(
+                {
+                    "calendar_day": str(calendar_day),
+                    "n_sessions": int(len(day_table)),
+                    "session_names": " | ".join(session_names),
+                    "first_session_name": session_names[0] if session_names else "",
+                    "last_session_name": session_names[-1] if session_names else "",
+                }
+            )
+        summary_df = pd.DataFrame(summary_rows)
+
+    total_sessions = int(sum(summary_df["n_sessions"].to_numpy(dtype=int))) if not summary_df.empty else 0
+    summary_payload = {
+        "total_sessions": total_sessions,
+        "n_days": int(len(summary_df)),
+        "source": "source_members" if has_source_members else "day_members",
+        "sessions_by_day": summary_df.to_dict(orient="records"),
+    }
+    return summary_df, summary_payload
+
+
+def save_source_session_summary(payload: dict, output_dir: Path) -> tuple[Path, Path, dict]:
+    summary_df, summary_payload = collect_source_session_summary(payload)
+    csv_path = output_dir / "input_session_counts_by_day.csv"
+    json_path = output_dir / "input_session_counts_summary.json"
+    summary_df.to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+    log_status(
+        f"Input session summary: {summary_payload['total_sessions']} session(s) "
+        f"across {summary_payload['n_days']} day(s)"
+    )
+    if not summary_df.empty:
+        for row in summary_df.itertuples(index=False):
+            log_status(f"  {row.calendar_day}: {int(row.n_sessions)} session(s)")
+    log_status(f"Saved input session count summary: {csv_path}")
+    return csv_path, json_path, summary_payload
 
 
 def total_source_hours_for_group(group_row: dict) -> int:
@@ -384,8 +534,12 @@ def main() -> None:
         raise FileNotFoundError(f"Referenced unique_units_summary.csv not found: {unique_units_csv}")
 
     base_output_dir = resolve_output_dir(export_summary_path, args.output_dir)
+    session_summary_csv, session_summary_json, session_summary_payload = save_source_session_summary(
+        payload,
+        base_output_dir,
+    )
     bases = ["day", "hour"] if args.basis == "both" else [args.basis]
-    all_plot_paths: list[Path] = []
+    all_plot_paths: list[Path] = [session_summary_csv, session_summary_json]
     manifest_runs: list[dict] = []
     quality_df = base_presentations.load_quality_metrics_from_export_summary(export_summary_path)
 
@@ -422,6 +576,9 @@ def main() -> None:
                 "max_sessions": (
                     int(args.max_sessions) if args.max_sessions is not None else None
                 ),
+                "input_session_summary": session_summary_payload,
+                "input_session_counts_by_day_csv": str(session_summary_csv),
+                "input_session_counts_summary_json": str(session_summary_json),
                 "runs": manifest_runs,
                 "plots": [str(path) for path in all_plot_paths],
             },

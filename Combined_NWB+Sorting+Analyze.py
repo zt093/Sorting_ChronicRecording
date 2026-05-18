@@ -868,6 +868,7 @@ def run_sorter_pipeline(
             rec_for_sorting.save,
             folder=preprocessed_folder,
             format="binary",
+            overwrite=True,
         )
 
     sorter_params = dict(MS5_SORTER_PARAMS)

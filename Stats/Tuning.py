@@ -63,7 +63,7 @@ import LDA as lda_helpers
 DATA_PATH = None  # Leave as None to enter the alignment export path at runtime.
 OUTPUT_BASE_DIR = Path(r"S:\Tuning")
 
-MIN_SESSIONS_PER_UNIT = 138
+MIN_SESSIONS_PER_UNIT = 120
 BIN_SIZE_SECONDS = 60.0
 MIN_MINUTES_PER_HOUR = 30
 
