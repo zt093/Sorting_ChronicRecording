@@ -5,9 +5,11 @@ Build per-unit/per-minute feature caches beside SpikeInterface analyzers.
 
 Input
 -----
-Pass a path to one `sorting_analyzer_analysis.zarr`, its parent output folder,
-or a root folder containing many analyzers. The script always builds caches for
-all analyzers found under the input path.
+Pass one or more paths to `sorting_analyzer_analysis.zarr`, parent output
+folders, or root folders containing many analyzers. Multiple paths can be
+provided as separate command-line arguments or as a comma-separated prompt
+value. The script always builds caches for all analyzers found under each input
+path.
 
 Output
 ------
@@ -193,6 +195,23 @@ def select_analyzer_folders(path: Path) -> list[Path]:
 
     log_progress(f"Found {len(analyzer_folders)} analyzer folder(s); building all caches")
     return analyzer_folders
+
+
+def parse_input_paths_text(raw_text: str) -> list[Path]:
+    parts = [part.strip().strip('"').strip("'") for part in raw_text.split(",")]
+    paths = [Path(part).expanduser() for part in parts if part]
+    if not paths:
+        raise ValueError("No input paths were provided.")
+    return paths
+
+
+def parse_input_paths(raw_values: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for raw_value in raw_values:
+        paths.extend(parse_input_paths_text(raw_value))
+    if not paths:
+        raise ValueError("No input paths were provided.")
+    return paths
 
 
 def load_analyzer(analyzer_folder: Path):
@@ -1461,11 +1480,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "path",
-        nargs="?",
+        "paths",
+        nargs="*",
         help=(
-            "Path to sorting_analyzer_analysis.zarr, its parent output folder, "
-            "or a root containing multiple analyzers. If omitted, you will be prompted."
+            "One or more paths to sorting_analyzer_analysis.zarr, parent output folders, "
+            "or roots containing multiple analyzers. Comma-separated values are also accepted. "
+            "If omitted, you will be prompted."
         ),
     )
     parser.add_argument(
@@ -1504,25 +1524,46 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    raw_path = args.path or input(
-        "Enter path to sorting_analyzer_analysis.zarr, output folder, or analyzer root: "
-    ).strip()
-    root_path = Path(raw_path.strip().strip('"').strip("'")).expanduser()
-    analyzer_folders = select_analyzer_folders(root_path)
-    input_base = root_path.parent if root_path.name == ANALYZER_FOLDER_NAME else root_path
-    if args.cache_root is None:
-        cache_root = input_base.parent / f"{input_base.name}_org"
-        cache_root_is_cache_folder = len(analyzer_folders) == 1
-        log_progress(f"Output root: {cache_root}")
+    if args.paths:
+        input_paths = parse_input_paths(args.paths)
     else:
-        cache_root = args.cache_root
-        cache_root_is_cache_folder = False
-        log_progress(f"Output root: {cache_root}")
+        raw_paths = input(
+            "Enter one or more paths to sorting_analyzer_analysis.zarr, output folders, "
+            "or analyzer roots, separated by commas: "
+        ).strip()
+        input_paths = parse_input_paths_text(raw_paths)
+
+    analyzer_jobs: list[tuple[Path, Path, bool]] = []
+    seen_analyzers: set[Path] = set()
+    for input_path in input_paths:
+        analyzer_folders = select_analyzer_folders(input_path)
+        cache_root_is_cache_folder = len(analyzer_folders) == 1
+        for analyzer_folder in analyzer_folders:
+            resolved_analyzer = analyzer_folder.resolve()
+            if resolved_analyzer in seen_analyzers:
+                log_progress(f"Skipping duplicate analyzer folder: {analyzer_folder}")
+                continue
+            seen_analyzers.add(resolved_analyzer)
+            analyzer_jobs.append((input_path, analyzer_folder, cache_root_is_cache_folder))
+
+    if args.cache_root is not None:
+        log_progress(f"Output root: {args.cache_root}")
 
     overall_start = perf_counter()
-    for analyzer_number, analyzer_folder in enumerate(analyzer_folders, start=1):
+    for analyzer_number, (input_path, analyzer_folder, default_cache_root_is_cache_folder) in enumerate(
+        analyzer_jobs,
+        start=1,
+    ):
+        input_base = input_path.parent if input_path.name == ANALYZER_FOLDER_NAME else input_path
+        if args.cache_root is None:
+            cache_root = input_base.parent / f"{input_base.name}_org"
+            cache_root_is_cache_folder = default_cache_root_is_cache_folder
+            log_progress(f"Output root for {input_path}: {cache_root}")
+        else:
+            cache_root = args.cache_root
+            cache_root_is_cache_folder = False
         log_progress(
-            f"Analyzer {analyzer_number}/{len(analyzer_folders)}: {analyzer_folder}",
+            f"Analyzer {analyzer_number}/{len(analyzer_jobs)}: {analyzer_folder}",
             overall_start,
         )
         analyzer = load_analyzer(analyzer_folder)
@@ -1536,7 +1577,7 @@ def main() -> None:
             overwrite=args.overwrite_cache,
             save_minute_waveforms=args.save_minute_waveforms,
         )
-    log_progress(f"Finished {len(analyzer_folders)} analyzer cache build(s)", overall_start)
+    log_progress(f"Finished {len(analyzer_jobs)} analyzer cache build(s)", overall_start)
 
 
 if __name__ == "__main__":

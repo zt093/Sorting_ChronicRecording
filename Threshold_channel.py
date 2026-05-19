@@ -1267,6 +1267,7 @@ def process_recording_save_per_chunk_multi_channel(
                 "sg_ch": sg_ch,
                 "threshold_uv": threshold_uv,
                 "threshold_max_uv": threshold_max_uv,
+                "threshold_interval": str(pair.get("threshold_interval", "lower_inclusive_upper_exclusive")),
                 "channel_id": channel_id,
                 "out_base": out_base,
                 "summary_path": summary_path,
@@ -1475,7 +1476,10 @@ def process_recording_save_per_chunk_multi_channel(
                     threshold_max_uv = state.get("threshold_max_uv")
                     if threshold_max_uv is not None:
                         amp_uv = _event_amplitude_uv(candidate_wf, polarity)
-                        if amp_uv > float(threshold_max_uv):
+                        if str(state.get("threshold_interval", "lower_inclusive_upper_exclusive")) == "lower_inclusive_upper_exclusive":
+                            if amp_uv >= float(threshold_max_uv):
+                                continue
+                        elif amp_uv > float(threshold_max_uv):
                             continue
                     cross_buf, wf_buf, cap = _ensure_event_capacity(
                         cross_buf, wf_buf, n_chunk, wf_len
@@ -1827,19 +1831,20 @@ def _is_recording_summary_complete(summary_path: Path) -> bool:
 
 def load_channel_threshold_pairs(config_path: Path) -> list[dict]:
     """
-    Load (sg_ch, threshold_uv) pairs from JSON.
+    Load channel threshold pairs/ranges from JSON.
 
     Supported formats:
       1) JSON list:
          [{"sg_ch": 72, "threshold_uv": 500.0}, {"sg_ch": 73, "threshold_uv": 600.0}]
       2) JSON object with "pairs":
-         {"pairs": [{"sg_ch": 72, "threshold_uv": 500.0}, ...]}
+         {"pairs": [{"sg_ch": 72, "threshold_uv": 500.0, "threshold_max_uv": 900.0}, ...]}
       3) JSON mapping sg_ch -> threshold:
          {"72": 500.0, "73": 600.0}
 
     Each entry must provide:
       - sg_ch (or "channel") as int
       - threshold_uv (or "threshold") as float (magnitude, must be > 0)
+      - optional threshold_max_uv as upper amplitude bound
     """
     config_path = Path(config_path)
     if not config_path.exists():
@@ -1860,7 +1865,21 @@ def load_channel_threshold_pairs(config_path: Path) -> list[dict]:
         thr = float(thr)
         if thr <= 0:
             raise ValueError(f"threshold_uv must be > 0 magnitude. Got: {thr} for sg_ch={sg_ch}")
-        return {"sg_ch": sg_ch, "threshold_uv": thr}
+        threshold_max_uv = obj.get("threshold_max_uv", obj.get("threshold_max", None))
+        if threshold_max_uv is not None:
+            threshold_max_uv = float(threshold_max_uv)
+            if threshold_max_uv <= thr:
+                raise ValueError(
+                    f"threshold_max_uv must be greater than threshold_uv for sg_ch={sg_ch}. "
+                    f"Got threshold_uv={thr}, threshold_max_uv={threshold_max_uv}"
+                )
+        interval = str(obj.get("threshold_interval", "lower_inclusive_upper_exclusive"))
+        return {
+            "sg_ch": sg_ch,
+            "threshold_uv": thr,
+            "threshold_max_uv": threshold_max_uv,
+            "threshold_interval": interval,
+        }
 
     if isinstance(raw, list):
         for item in raw:
@@ -1880,15 +1899,27 @@ def load_channel_threshold_pairs(config_path: Path) -> list[dict]:
     else:
         raise ValueError("Config JSON must be a list or an object.")
 
-    # De-duplicate identical (sg_ch, threshold_uv) pairs while preserving order.
-    seen: set[tuple[int, float]] = set()
+    # De-duplicate identical ranges while preserving order.
+    seen: set[tuple[int, float, float | None]] = set()
     out: list[dict] = []
     for p in pairs:
-        key = (int(p["sg_ch"]), float(p["threshold_uv"]))
+        threshold_max_uv = (
+            float(p["threshold_max_uv"])
+            if p.get("threshold_max_uv", None) is not None
+            else None
+        )
+        key = (int(p["sg_ch"]), float(p["threshold_uv"]), threshold_max_uv)
         if key in seen:
             continue
         seen.add(key)
-        out.append({"sg_ch": int(p["sg_ch"]), "threshold_uv": float(p["threshold_uv"])})
+        out.append(
+            {
+                "sg_ch": int(p["sg_ch"]),
+                "threshold_uv": float(p["threshold_uv"]),
+                "threshold_max_uv": threshold_max_uv,
+                "threshold_interval": str(p.get("threshold_interval", "lower_inclusive_upper_exclusive")),
+            }
+        )
     return out
 
 
@@ -2658,6 +2689,7 @@ def main() -> int:
             pair = {"sg_ch": int(p["sg_ch"]), "threshold_uv": float(p["threshold_uv"])}
             if p.get("threshold_max_uv", None) is not None:
                 pair["threshold_max_uv"] = float(p["threshold_max_uv"])
+            pair["threshold_interval"] = str(p.get("threshold_interval", "lower_inclusive_upper_exclusive"))
             channel_threshold_pairs.append(pair)
 
         polarity = meta_run["polarity"]
@@ -2721,7 +2753,7 @@ def main() -> int:
 
     output_parent = prompt_path(
         "Parent folder for outputs (a new run subfolder will be created here)",
-        r"S:\Threshold_test",
+        r"I:\Threshold_test",
     )
     run_output_dir = make_run_output_dir(output_parent, rec_files)
     print(f"\nRun output folder: {run_output_dir.resolve()}")
@@ -2801,7 +2833,7 @@ def main() -> int:
     else:
         config_path = prompt_path(
             "Channel/threshold config JSON path",
-            r"W:\channel_thresholds.json",
+            r"S:\channel_thresholds_from_sorted.json",
         )
         try:
             pairs = load_channel_threshold_pairs(config_path)
@@ -2835,6 +2867,7 @@ def main() -> int:
                 "sg_ch": int(p["sg_ch"]),
                 "threshold_uv": float(p["threshold_uv"]),
                 "threshold_max_uv": _safe_float(p.get("threshold_max_uv")),
+                "threshold_interval": str(p.get("threshold_interval", "lower_inclusive_upper_exclusive")),
             }
         )
 

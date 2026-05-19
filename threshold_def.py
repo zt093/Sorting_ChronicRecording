@@ -18,8 +18,60 @@ DEFAULT_SINGLE_LOWER_FACTOR = 0.60
 DEFAULT_SINGLE_UPPER_FACTOR = 1.60
 DEFAULT_MULTI_LOWER_FACTOR = 0.60
 DEFAULT_MULTI_UPPER_FACTOR = 1.60
+HARD_MIN_LOWER_UV = 50.0
 DEFAULT_MIN_LOWER_UV = 25.0
 DEFAULT_ROUND_TO_UV = 5.0
+FORCED_THRESHOLD_MAX_UV = 1500.0
+FORCED_CHANNEL_LOW_THRESHOLDS_UV = {
+    279: 180.0,
+    283: 260.0,
+    311: 160.0,
+    329: 270.0,
+    331: 240.0,
+    332: 340.0,
+    337: 500.0,
+    341: 720.0,
+    348: 860.0,
+    365: 320.0,
+}
+
+
+def clean_path_text(raw: str | Path | None) -> str:
+    if raw is None:
+        return ""
+    return str(raw).strip().strip('"').strip("'")
+
+
+def resolve_summary_folder(raw_path: str | Path) -> Path:
+    path = Path(clean_path_text(raw_path)).expanduser()
+    if path.is_file() and path.name == "unique_units_summary.csv":
+        return path.parent
+    if (path / "unique_units_summary.csv").exists():
+        return path
+
+    candidates: list[Path] = []
+    if path.exists() and path.is_dir():
+        for pattern in (
+            "alignment_days_summary*/unique_units_summary.csv",
+            "units_alignment_summary/unique_units_summary.csv",
+            "sh*/units_alignment_summary/unique_units_summary_sg_*.csv",
+            "sh*/units_alignment_summary/unique_units_summary.csv",
+            "**/unique_units_summary.csv",
+        ):
+            candidates.extend(sorted(path.glob(pattern)))
+
+    if candidates:
+        # Prefer full/root summaries over per-shank or per-page summaries.
+        candidates = sorted(
+            set(candidates),
+            key=lambda item: (
+                0 if item.name == "unique_units_summary.csv" else 1,
+                len(item.parts),
+                str(item).lower(),
+            ),
+        )
+        return candidates[0].parent
+    return path
 
 
 def format_elapsed(seconds: float) -> str:
@@ -232,6 +284,22 @@ def unit_amplitude(row: UnitRow) -> float:
     return 100.0
 
 
+def make_non_overlapping_ranges(range_rows: list[tuple[float, float, list[int], list[str]]]) -> list[tuple[float, float, list[int], list[str]]]:
+    if not range_rows:
+        return []
+    ordered = sorted(range_rows, key=lambda item: (float(item[0]), float(item[1])))
+    fixed: list[tuple[float, float, list[int], list[str]]] = []
+    for lower, upper, ids, labels in ordered:
+        lower = float(lower)
+        upper = float(upper)
+        if fixed and lower < fixed[-1][1]:
+            lower = fixed[-1][1]
+        if upper < lower:
+            upper = lower
+        fixed.append((lower, upper, ids, labels))
+    return fixed
+
+
 def build_channel_ranges(
     units: list[UnitRow],
     *,
@@ -242,43 +310,43 @@ def build_channel_ranges(
     multi_upper_factor: float,
     round_to_uv: float,
 ) -> tuple[list[dict], list[dict]]:
+    effective_min_lower_uv = max(HARD_MIN_LOWER_UV, float(min_lower_uv))
     by_channel: dict[int, list[UnitRow]] = {}
     for row in units:
         by_channel.setdefault(row.sg_channel, []).append(row)
 
     pairs: list[dict] = []
     report_rows: list[dict] = []
-    for sg_channel in sorted(by_channel):
-        ch_units = sorted(by_channel[sg_channel], key=unit_amplitude)
+    all_channels = set(by_channel) | set(FORCED_CHANNEL_LOW_THRESHOLDS_UV)
+    for sg_channel in sorted(all_channels):
+        ch_units = sorted(by_channel.get(sg_channel, []), key=unit_amplitude)
         amps = [unit_amplitude(row) for row in ch_units]
         unit_ids = [int(row.final_unit_id) for row in ch_units]
         labels = [row.label for row in ch_units]
 
-        if len(ch_units) == 1:
+        forced_lower = FORCED_CHANNEL_LOW_THRESHOLDS_UV.get(int(sg_channel))
+        if forced_lower is not None:
+            lower = max(HARD_MIN_LOWER_UV, float(forced_lower))
+            upper = float(FORCED_THRESHOLD_MAX_UV)
+            strategy = "forced_channel_threshold"
+        elif len(ch_units) == 1:
             amp = amps[0]
-            lower = max(float(min_lower_uv), amp * float(single_lower_factor))
+            lower = max(effective_min_lower_uv, amp * float(single_lower_factor))
             upper = max(lower + round_to_uv, amp * float(single_upper_factor))
             lower = round_to(lower, round_to_uv, mode="down")
             upper = round_to(upper, round_to_uv, mode="up")
-            range_rows = [(lower, upper, unit_ids, labels)]
             strategy = "single_unit_scaled_range"
+        elif len(ch_units) > 1:
+            lower = max(effective_min_lower_uv, min(amps) * float(multi_lower_factor))
+            upper = max(lower + round_to_uv, max(amps) * float(multi_upper_factor))
+            lower = round_to(lower, round_to_uv, mode="down")
+            upper = round_to(upper, round_to_uv, mode="up")
+            strategy = "multi_unit_single_channel_range"
         else:
-            gaps = [amps[i + 1] - amps[i] for i in range(len(amps) - 1)]
-            split_i = max(range(len(gaps)), key=lambda i: gaps[i]) if gaps else 0
-            boundary = 0.5 * (amps[split_i] + amps[split_i + 1])
-            lower1 = max(float(min_lower_uv), min(amps[: split_i + 1]) * float(multi_lower_factor))
-            upper1 = boundary
-            lower2 = boundary
-            upper2 = max(lower2 + round_to_uv, max(amps[split_i + 1 :]) * float(multi_upper_factor))
-            lower1 = round_to(lower1, round_to_uv, mode="down")
-            upper1 = round_to(upper1, round_to_uv, mode="up")
-            lower2 = round_to(lower2, round_to_uv, mode="down")
-            upper2 = round_to(upper2, round_to_uv, mode="up")
-            range_rows = [
-                (lower1, upper1, unit_ids[: split_i + 1], labels[: split_i + 1]),
-                (lower2, upper2, unit_ids[split_i + 1 :], labels[split_i + 1 :]),
-            ]
-            strategy = "multi_unit_largest_gap_two_ranges"
+            continue
+
+        lower = max(HARD_MIN_LOWER_UV, float(lower))
+        range_rows = [(lower, upper, unit_ids, labels)]
 
         for range_index, (lower, upper, ids, range_labels) in enumerate(range_rows, start=1):
             if upper <= lower:
@@ -287,6 +355,7 @@ def build_channel_ranges(
                 "sg_ch": int(sg_channel),
                 "threshold_uv": float(lower),
                 "threshold_max_uv": float(upper),
+                "threshold_interval": "lower_inclusive_upper_exclusive",
                 "range_index": int(range_index),
                 "source_final_unit_ids": [int(v) for v in ids],
                 "source_final_unit_labels": range_labels,
@@ -298,6 +367,7 @@ def build_channel_ranges(
                     "range_index": int(range_index),
                     "threshold_uv": float(lower),
                     "threshold_max_uv": float(upper),
+                    "threshold_interval": "lower_inclusive_upper_exclusive",
                     "n_units_on_channel": int(len(ch_units)),
                     "unit_ids_on_channel": ";".join(str(v) for v in unit_ids),
                     "unit_amplitudes_uv": ";".join(f"{v:.3f}" for v in amps),
@@ -363,19 +433,25 @@ def main() -> int:
     timing: dict[str, float] = {}
     log_status("Starting threshold definition")
     args = parse_args()
-    alignment_dir = Path(args.alignment_dir or prompt_line("Aligned summary folder", DEFAULT_ALIGNMENT_DIR)).expanduser()
+    alignment_dir = resolve_summary_folder(args.alignment_dir or prompt_line("Aligned summary folder", DEFAULT_ALIGNMENT_DIR))
     if not alignment_dir.exists():
         print(f"Aligned summary folder not found: {alignment_dir}")
         return 1
+    if not (alignment_dir / "unique_units_summary.csv").exists():
+        print(f"Could not find unique_units_summary.csv in resolved summary folder: {alignment_dir}")
+        return 1
 
     default_output = alignment_dir / "channel_thresholds_from_sorted.json"
-    output_json = Path(args.output_json or prompt_line("Output threshold JSON path", str(default_output)))
+    output_json = Path(clean_path_text(args.output_json or prompt_line("Output threshold JSON path", str(default_output))))
     min_sessions = args.min_sessions if args.min_sessions is not None else prompt_int("Minimum sessions/member sessions per unit", DEFAULT_MIN_SESSIONS)
-    min_lower_uv = args.min_lower_uv if args.min_lower_uv is not None else prompt_float("Minimum lower threshold (uV)", DEFAULT_MIN_LOWER_UV)
-    single_lower_factor = args.single_lower_factor if args.single_lower_factor is not None else prompt_float("Single-unit lower factor", DEFAULT_SINGLE_LOWER_FACTOR)
-    single_upper_factor = args.single_upper_factor if args.single_upper_factor is not None else prompt_float("Single-unit upper factor", DEFAULT_SINGLE_UPPER_FACTOR)
-    multi_lower_factor = args.multi_lower_factor if args.multi_lower_factor is not None else prompt_float("Multi-unit lower factor", DEFAULT_MULTI_LOWER_FACTOR)
-    multi_upper_factor = args.multi_upper_factor if args.multi_upper_factor is not None else prompt_float("Multi-unit upper factor", DEFAULT_MULTI_UPPER_FACTOR)
+    min_lower_uv = args.min_lower_uv if args.min_lower_uv is not None else prompt_float(
+        f"Requested minimum lower threshold (uV; never below {HARD_MIN_LOWER_UV:g})",
+        DEFAULT_MIN_LOWER_UV,
+    )
+    single_lower_factor = args.single_lower_factor if args.single_lower_factor is not None else DEFAULT_SINGLE_LOWER_FACTOR
+    single_upper_factor = args.single_upper_factor if args.single_upper_factor is not None else DEFAULT_SINGLE_UPPER_FACTOR
+    multi_lower_factor = args.multi_lower_factor if args.multi_lower_factor is not None else DEFAULT_MULTI_LOWER_FACTOR
+    multi_upper_factor = args.multi_upper_factor if args.multi_upper_factor is not None else DEFAULT_MULTI_UPPER_FACTOR
     round_to_uv = args.round_to_uv if args.round_to_uv is not None else prompt_float("Round thresholds to nearest uV step", DEFAULT_ROUND_TO_UV)
 
     step_start = perf_counter()
@@ -418,6 +494,9 @@ def main() -> int:
         "note": (
             "Use Threshold_channel.py JSON mode. threshold_uv is the lower threshold; "
             "threshold_max_uv is the upper amplitude limit for range-style thresholding. "
+            "Each channel is emitted with exactly one range. Ranges are intended as "
+            "lower-inclusive and upper-exclusive. The lower threshold is clamped to "
+            f"at least {HARD_MIN_LOWER_UV:g} uV. "
             "Channels/units are discovered from unique_units_summary.csv; amplitudes are read "
             "from exported unit summary.txt amplitude_median values, with found_units_by_sg_channel_threshold.csv "
             "used only as an optional amplitude fallback."
@@ -428,6 +507,13 @@ def main() -> int:
         "min_sessions": int(min_sessions),
         "parameters": {
             "min_lower_uv": float(min_lower_uv),
+            "hard_min_lower_uv": float(HARD_MIN_LOWER_UV),
+            "effective_min_lower_uv": float(max(HARD_MIN_LOWER_UV, float(min_lower_uv))),
+            "forced_threshold_max_uv": float(FORCED_THRESHOLD_MAX_UV),
+            "forced_channel_low_thresholds_uv": {
+                str(channel): float(threshold)
+                for channel, threshold in sorted(FORCED_CHANNEL_LOW_THRESHOLDS_UV.items())
+            },
             "single_lower_factor": float(single_lower_factor),
             "single_upper_factor": float(single_upper_factor),
             "multi_lower_factor": float(multi_lower_factor),
