@@ -1,7 +1,8 @@
 """
 Scan SpikeGadgets .rec files under a root in time chunks, detect threshold crossings
-on one SG channel (0-based electrode id from probe contact_ids), extract waveforms
-(-1 ms .. +2 ms around the crossing sample), and save timestamps + waveforms.
+on configured SG channel/threshold-range pairs, extract waveform windows
+(-1 ms .. +2 ms around each crossing sample), and save minute-level mean waveforms
+plus timestamps/crossing samples.
 
 Pipeline mirrors SortingLSNET_Feb2026.py for SG data:
   read_spikegadgets -> optional 30 kHz wrapper -> HW channel reorder (forward_conversion)
@@ -92,6 +93,21 @@ import spikeinterface.full as si
 import spikeinterface.preprocessing as spre
 from probeinterface import read_probeinterface
 from spikeinterface.core import BaseRecording
+
+COMPUTE_HOURLY_CORRELOGRAMS = False
+DEFAULT_PROBE_JSON = Path(r"E:\Curtis\spikeinterface\LSNET_probe.json")
+DEFAULT_CHANNEL_THRESHOLD_CONFIG_JSON = Path(r"S:\channel_thresholds_from_sorted.json")
+DEFAULT_OUTPUT_PARENT = Path(r"S:\Threshold_test")
+DEFAULT_CHUNK_SEC = 300.0
+DEFAULT_SAMPLING_RATE_HZ = 30000.0
+DEFAULT_POLARITY = "negative"
+DEFAULT_REFRACTORY_MS = 0.5
+DEFAULT_PRE_MS = 1.0
+DEFAULT_POST_MS = 2.0
+DEFAULT_APPLY_SPIKEBAND = True
+DEFAULT_BANDPASS_FREQ_MIN = 300.0
+DEFAULT_BANDPASS_FREQ_MAX = 6000.0
+DEFAULT_SAVE_TRACE_PREVIEWS = False
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +298,18 @@ def _ensure_event_capacity(
         cb[:n_events] = cross_buf[:n_events]
         wb[:n_events] = wf_buf[:n_events]
     return cb, wb, new_cap
+
+
+def _ensure_crossing_capacity(cross_buf: np.ndarray, n_events: int) -> np.ndarray:
+    """Grow a crossing-only buffer without carrying individual waveforms."""
+    cap = cross_buf.shape[0]
+    if n_events < cap:
+        return cross_buf
+    new_cap = max(cap * 2, cap + 65536)
+    cb = np.empty(new_cap, dtype=np.int64)
+    if n_events > 0:
+        cb[:n_events] = cross_buf[:n_events]
+    return cb
 
 
 def _minutes_tag(t0_min: float, t1_min: float) -> str:
@@ -485,6 +513,127 @@ def _waveform_summary(waveforms_uv: np.ndarray, fs: float, wf_len: int) -> dict:
     }
 
 
+def _mean_waveform_summary(mean_wf: np.ndarray, n_spikes: int, fs: float, wf_len: int) -> dict:
+    n_spikes = int(n_spikes)
+    if n_spikes <= 0:
+        mean_wf = np.full(wf_len, np.nan, dtype=np.float32)
+        return {
+            "n_spikes": 0,
+            "mean_waveform_uv": mean_wf,
+            "amplitude_ptp_uv": float("nan"),
+            "mean_abs_waveform_uv": float("nan"),
+            "peak_to_trough_ms": float("nan"),
+        }
+    mean_wf = np.asarray(mean_wf, dtype=np.float32).reshape(wf_len)
+    return {
+        "n_spikes": n_spikes,
+        "mean_waveform_uv": mean_wf,
+        "amplitude_ptp_uv": float(np.ptp(mean_wf)),
+        "mean_abs_waveform_uv": float(np.mean(np.abs(mean_wf))),
+        "peak_to_trough_ms": _peak_to_trough_ms(mean_wf, fs),
+    }
+
+
+def _empty_minute_buffer(wf_len: int) -> dict:
+    return {
+        "crossings": [],
+        "waveform_sum": np.zeros(wf_len, dtype=np.float64),
+        "n_spikes": 0,
+    }
+
+
+def _add_event_to_minute_buffer(state: dict, crossing_sample: int, waveform_uv: np.ndarray, minute_samples: int, wf_len: int) -> None:
+    minute_index = int(crossing_sample // minute_samples)
+    buf = state["minute_buffers"].setdefault(minute_index, _empty_minute_buffer(wf_len))
+    buf["crossings"].append(int(crossing_sample))
+    buf["waveform_sum"] += np.asarray(waveform_uv, dtype=np.float64)
+    buf["n_spikes"] = int(buf["n_spikes"]) + 1
+
+
+def _save_mean_waveform_plot(
+    mean_waveform_uv: np.ndarray,
+    *,
+    n_spikes: int,
+    fs: float,
+    pre_samples: int,
+    post_samples: int,
+    sg_ch: int,
+    t_start_min: float,
+    t_end_min: float,
+    out_png: Path,
+    fixed_y_center: float = 0.0,
+    fixed_y_half: float = 1.0,
+    time_bar_ms: float = 1000.0,
+    amp_bar_fraction: float = 0.25,
+    amp_bar_uv: float = 100.0,
+) -> None:
+    wf_len = pre_samples + post_samples
+    t_ms = (np.arange(wf_len, dtype=np.float64) - pre_samples) / fs * 1000.0
+    mean_wf = np.asarray(mean_waveform_uv, dtype=np.float32).reshape(wf_len)
+    y_span = 2.0 * float(fixed_y_half)
+    y_min = float(fixed_y_center - fixed_y_half)
+    y_max = float(fixed_y_center + fixed_y_half)
+    fig, ax = plt.subplots(figsize=(9, 5.5), dpi=120)
+    if int(n_spikes) <= 0 or not np.any(np.isfinite(mean_wf)):
+        ax.text(
+            0.5,
+            0.5,
+            "No crossings in this hour",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=11,
+        )
+        template_ptp_uv = float("nan")
+    else:
+        template_ptp_uv = float(np.ptp(mean_wf))
+        ax.plot(t_ms, mean_wf, color="k", linewidth=2.8, zorder=10)
+
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(float(t_ms[0]), float(t_ms[-1]))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    title = (
+        f"SG ch {sg_ch}  |  recording {t_start_min:.2f}-{t_end_min:.2f} min  "
+        f"|  N={int(n_spikes)}"
+    )
+    if np.isfinite(template_ptp_uv):
+        title += f"  |  template p2p={template_ptp_uv:.1f} uV"
+    ax.set_title(title, fontsize=10, pad=6)
+
+    time_span_ms = float(t_ms[-1] - t_ms[0])
+    if time_span_ms > 0 and y_span > 0:
+        t_bar_ms = min(float(time_bar_ms), 0.3 * time_span_ms)
+        x0 = float(t_ms[0]) + 0.06 * time_span_ms
+        x1 = x0 + t_bar_ms
+        y0 = y_min + 0.06 * y_span
+        amp_bar = max(1e-6, float(amp_bar_uv))
+        if amp_bar > 0.9 * y_span:
+            amp_bar = max(1e-6, float(amp_bar_fraction) * y_span)
+        if y0 + amp_bar > y_max:
+            y0 = y_max - amp_bar - 0.02 * y_span
+        x_bar = float(t_ms[0]) + 0.92 * time_span_ms
+        ax.plot([x0, x1], [y0, y0], color="k", linewidth=3, solid_capstyle="butt", zorder=20)
+        ax.plot([x_bar, x_bar], [y0, y0 + amp_bar], color="k", linewidth=3, zorder=20)
+        t_lbl = f"{t_bar_ms / 1000.0:.1f} s" if t_bar_ms >= 1000.0 else f"{t_bar_ms:.0f} ms"
+        ax.text((x0 + x1) / 2.0, y0 - 0.03 * y_span, t_lbl, ha="center", va="top", fontsize=9)
+        ax.text(
+            x_bar + 0.01 * time_span_ms,
+            y0 + 0.5 * amp_bar,
+            f"{amp_bar:.0f} uV",
+            ha="left",
+            va="center",
+            fontsize=9,
+        )
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _event_amplitude_uv(waveform_uv: np.ndarray, polarity: str) -> float:
     if waveform_uv.size == 0:
         return 0.0
@@ -517,6 +666,20 @@ def _isi_and_correlogram(
                 counts += np.histogram(diffs_ms, bins=edges_ms)[0].astype(np.int64)
     centers_ms = 0.5 * (edges_ms[:-1] + edges_ms[1:])
     return isi_sec, centers_ms.astype(np.float32), counts
+
+
+def _isi_only_and_empty_correlogram(
+    timestamps_sec: np.ndarray,
+    *,
+    max_lag_ms: float = 100.0,
+    bin_ms: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    timestamps_sec = np.asarray(timestamps_sec, dtype=np.float64).ravel()
+    timestamps_sec = np.sort(timestamps_sec[np.isfinite(timestamps_sec)])
+    isi_sec = np.diff(timestamps_sec).astype(np.float32) if timestamps_sec.size >= 2 else np.zeros(0, dtype=np.float32)
+    edges_ms = np.arange(-max_lag_ms, max_lag_ms + bin_ms, bin_ms, dtype=np.float32)
+    centers_ms = 0.5 * (edges_ms[:-1] + edges_ms[1:])
+    return isi_sec, centers_ms.astype(np.float32), np.zeros(centers_ms.size, dtype=np.int64)
 
 
 def _write_csv_rows(path: Path, rows: list[dict]) -> None:
@@ -673,7 +836,10 @@ def _flush_completed_hours(
         )
         summary = _waveform_summary(waveforms, fs, wf_len)
         cv2 = _compute_cv2_from_timestamps(timestamps)
-        isi_sec, correlogram_lag_ms, correlogram_counts = _isi_and_correlogram(timestamps)
+        if COMPUTE_HOURLY_CORRELOGRAMS:
+            isi_sec, correlogram_lag_ms, correlogram_counts = _isi_and_correlogram(timestamps)
+        else:
+            isi_sec, correlogram_lag_ms, correlogram_counts = _isi_only_and_empty_correlogram(timestamps)
         hour_start_sec = float(hour_index * 3600.0)
         hour_end_sample = min((hour_index + 1) * hour_samples, int(total_samples))
         hour_end_sec = float(hour_end_sample / fs)
@@ -851,6 +1017,301 @@ def _ensure_all_hourly_rows(
                 "peak_to_trough_ms": None,
                 "isi_mean_ms": None,
                 "isi_median_ms": None,
+                "npz": str(npz_path.resolve()),
+                "figure": str(fig_path.resolve()),
+            }
+        )
+    state["hourly_rows"].sort(key=lambda row: int(row["hour_index"]))
+
+
+def _write_recording_minute_npz_outputs(
+    states: list[dict],
+    *,
+    run_output_dir: Path,
+    parent: str,
+    stem: str,
+    rec_file: Path,
+    total_minutes: int,
+    total_samples: int,
+    fs: float,
+    wf_len: int,
+    session_ordinal: int,
+    session_cumulative_sample_offset: int,
+    session_cumulative_time_offset_sec: float,
+    timing_totals: dict[str, float] | None = None,
+) -> list[dict]:
+    minute_dir = run_output_dir / "minute_npz" / f"{parent}__{stem}"
+    minute_dir.mkdir(parents=True, exist_ok=True)
+    pair_ids = np.asarray([str(state["pair_id"]) for state in states])
+    sg_ch = np.asarray([int(state["sg_ch"]) for state in states], dtype=np.int32)
+    threshold_min_uv = np.asarray([float(state["threshold_uv"]) for state in states], dtype=np.float32)
+    threshold_max_uv = np.asarray(
+        [
+            float(state["threshold_max_uv"])
+            if state.get("threshold_max_uv") is not None
+            else np.nan
+            for state in states
+        ],
+        dtype=np.float32,
+    )
+    recording_rows: list[dict] = []
+
+    for minute_index in range(int(total_minutes)):
+        m0 = int(minute_index * round(60.0 * fs))
+        m1 = min(int((minute_index + 1) * round(60.0 * fs)), int(total_samples))
+        minute_start_sec = float(m0 / fs)
+        minute_end_sec = float(m1 / fs)
+        duration_sec = max(0.0, minute_end_sec - minute_start_sec)
+        cumulative_start_sec = float(session_cumulative_time_offset_sec + minute_start_sec)
+        cumulative_end_sec = float(session_cumulative_time_offset_sec + minute_end_sec)
+        cumulative_minute_index = int(np.floor(cumulative_start_sec / 60.0))
+
+        n_pairs = len(states)
+        n_spikes = np.zeros(n_pairs, dtype=np.int64)
+        firing_rate_hz = np.zeros(n_pairs, dtype=np.float32)
+        cv2 = np.full(n_pairs, np.nan, dtype=np.float32)
+        amplitude_ptp_uv = np.full(n_pairs, np.nan, dtype=np.float32)
+        mean_abs_waveform_uv = np.full(n_pairs, np.nan, dtype=np.float32)
+        peak_to_trough_ms = np.full(n_pairs, np.nan, dtype=np.float32)
+        mean_waveform_uv = np.full((n_pairs, wf_len), np.nan, dtype=np.float32)
+        crossing_chunks: list[np.ndarray] = []
+        timestamp_chunks: list[np.ndarray] = []
+        event_pair_chunks: list[np.ndarray] = []
+        timestamp_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+        minute_npz = minute_dir / f"{parent}__{stem}_minute_{minute_index:06d}_all_pairs.npz"
+
+        for pair_i, state in enumerate(states):
+            buf = state["minute_buffers"].get(minute_index)
+            if buf is None or int(buf["n_spikes"]) <= 0:
+                crossings = np.zeros(0, dtype=np.int64)
+                summary = _mean_waveform_summary(
+                    np.full(wf_len, np.nan, dtype=np.float32),
+                    0,
+                    fs,
+                    wf_len,
+                )
+            else:
+                crossings = np.asarray(buf["crossings"], dtype=np.int64)
+                crossings.sort()
+                count = int(buf["n_spikes"])
+                mean_wf = (np.asarray(buf["waveform_sum"], dtype=np.float64) / float(count)).astype(np.float32)
+                summary = _mean_waveform_summary(mean_wf, count, fs, wf_len)
+
+            count = int(crossings.size)
+            n_spikes[pair_i] = count
+            if duration_sec > 0:
+                firing_rate_hz[pair_i] = float(count / duration_sec)
+            ts_sec = crossings.astype(np.float64) / fs
+            ts_cum = ts_sec + float(session_cumulative_time_offset_sec)
+            cv2[pair_i] = np.float32(_compute_cv2_from_timestamps(ts_sec))
+            amplitude_ptp_uv[pair_i] = np.float32(summary["amplitude_ptp_uv"])
+            mean_abs_waveform_uv[pair_i] = np.float32(summary["mean_abs_waveform_uv"])
+            peak_to_trough_ms[pair_i] = np.float32(summary["peak_to_trough_ms"])
+            mean_waveform_uv[pair_i, :] = summary["mean_waveform_uv"]
+            timestamp_offsets[pair_i + 1] = timestamp_offsets[pair_i] + count
+
+            crossing_chunks.append(crossings)
+            timestamp_chunks.append(ts_sec)
+            event_pair_chunks.append(np.full(count, pair_i, dtype=np.int32))
+
+            row = {
+                "minute_index": minute_index,
+                "cumulative_minute_index": cumulative_minute_index,
+                "time_start_sec": minute_start_sec,
+                "time_end_sec": minute_end_sec,
+                "cumulative_start_sec": cumulative_start_sec,
+                "cumulative_end_sec": cumulative_end_sec,
+                "duration_sec": duration_sec,
+                "recording_name": rec_file.name,
+                "session_ordinal": int(session_ordinal),
+                "pair_id": str(state["pair_id"]),
+                "pair_row_index": pair_i,
+                "sg_ch": int(state["sg_ch"]),
+                "threshold_min_uv": float(state["threshold_uv"]),
+                "threshold_max_uv": _safe_float(state.get("threshold_max_uv")),
+                "n_spikes": count,
+                "firing_rate_hz": float(firing_rate_hz[pair_i]),
+                "amplitude_ptp_uv": _safe_float(amplitude_ptp_uv[pair_i]),
+                "mean_abs_waveform_uv": _safe_float(mean_abs_waveform_uv[pair_i]),
+                "cv2": _safe_float(cv2[pair_i]),
+                "peak_to_trough_ms": _safe_float(peak_to_trough_ms[pair_i]),
+                "mean_waveform_uv": json.dumps([_safe_float(v) for v in mean_waveform_uv[pair_i].tolist()]),
+                "npz": str(minute_npz.resolve()),
+            }
+            state["minute_rows"].append(row)
+
+        all_crossing_samples = (
+            np.concatenate(crossing_chunks).astype(np.int64)
+            if crossing_chunks
+            else np.zeros(0, dtype=np.int64)
+        )
+        all_timestamps_sec = (
+            np.concatenate(timestamp_chunks).astype(np.float64)
+            if timestamp_chunks
+            else np.zeros(0, dtype=np.float64)
+        )
+        event_pair_index = (
+            np.concatenate(event_pair_chunks).astype(np.int32)
+            if event_pair_chunks
+            else np.zeros(0, dtype=np.int32)
+        )
+        t_write0 = time.perf_counter()
+        np.savez_compressed(
+            str(minute_npz),
+            pair_ids=pair_ids,
+            sg_ch=sg_ch,
+            threshold_min_uv=threshold_min_uv,
+            threshold_max_uv=threshold_max_uv,
+            n_spikes=n_spikes,
+            firing_rate_hz=firing_rate_hz,
+            cv2=cv2,
+            amplitude_ptp_uv=amplitude_ptp_uv,
+            mean_abs_waveform_uv=mean_abs_waveform_uv,
+            peak_to_trough_ms=peak_to_trough_ms,
+            mean_waveform_uv=mean_waveform_uv,
+            all_timestamps_sec=all_timestamps_sec,
+            all_timestamps_sec_cumulative=all_timestamps_sec + float(session_cumulative_time_offset_sec),
+            all_crossing_samples=all_crossing_samples,
+            all_crossing_samples_cumulative=all_crossing_samples + int(session_cumulative_sample_offset),
+            timestamp_offsets=timestamp_offsets,
+            event_pair_index=event_pair_index,
+            minute_index=np.array([minute_index], dtype=np.int32),
+            minute_start_sec=np.array([minute_start_sec], dtype=np.float64),
+            minute_end_sec=np.array([minute_end_sec], dtype=np.float64),
+            cumulative_minute_index=np.array([cumulative_minute_index], dtype=np.int64),
+            cumulative_start_sec=np.array([cumulative_start_sec], dtype=np.float64),
+            cumulative_end_sec=np.array([cumulative_end_sec], dtype=np.float64),
+            recording_name=np.asarray([rec_file.name]),
+            session_ordinal=np.array([session_ordinal], dtype=np.int32),
+            sampling_rate_hz=np.array([fs], dtype=np.float64),
+        )
+        write_elapsed = time.perf_counter() - t_write0
+        _add_timing(timing_totals, "detection_minute_npz_write", write_elapsed)
+        _add_timing(timing_totals, "detection_npz_write", write_elapsed)
+        recording_rows.append(
+            {
+                "minute_index": minute_index,
+                "cumulative_minute_index": cumulative_minute_index,
+                "time_start_sec": minute_start_sec,
+                "time_end_sec": minute_end_sec,
+                "cumulative_start_sec": cumulative_start_sec,
+                "cumulative_end_sec": cumulative_end_sec,
+                "duration_sec": duration_sec,
+                "recording_name": rec_file.name,
+                "session_ordinal": int(session_ordinal),
+                "n_pairs": n_pairs,
+                "n_events": int(all_crossing_samples.size),
+                "npz": str(minute_npz.resolve()),
+            }
+        )
+    return recording_rows
+
+
+def _write_hourly_outputs_from_minute_means(
+    state: dict,
+    *,
+    total_hours: int,
+    total_samples: int,
+    fs: float,
+    wf_len: int,
+    pre_samples: int,
+    post_samples: int,
+    timing_totals: dict[str, float] | None = None,
+) -> None:
+    hourly_dir = Path(state["out_base"].parent) / "hourly"
+    hourly_dir.mkdir(parents=True, exist_ok=True)
+    minute_samples = int(round(60.0 * fs))
+    hour_samples = int(round(3600.0 * fs))
+    for hour_index in range(int(total_hours)):
+        h0_sample = hour_index * hour_samples
+        h1_sample = min((hour_index + 1) * hour_samples, int(total_samples))
+        h0_sec = float(h0_sample / fs)
+        h1_sec = float(h1_sample / fs)
+        duration_sec = max(0.0, h1_sec - h0_sec)
+        minute0 = int(h0_sample // minute_samples)
+        minute1 = int(np.ceil(h1_sample / minute_samples))
+
+        total_count = 0
+        weighted_sum = np.zeros(wf_len, dtype=np.float64)
+        crossing_parts: list[np.ndarray] = []
+        for minute_index in range(minute0, minute1):
+            buf = state["minute_buffers"].get(minute_index)
+            if buf is None or int(buf["n_spikes"]) <= 0:
+                continue
+            count = int(buf["n_spikes"])
+            total_count += count
+            weighted_sum += np.asarray(buf["waveform_sum"], dtype=np.float64)
+            crossing_parts.append(np.asarray(buf["crossings"], dtype=np.int64))
+
+        crossings = (
+            np.concatenate(crossing_parts).astype(np.int64)
+            if crossing_parts
+            else np.zeros(0, dtype=np.int64)
+        )
+        crossings.sort()
+        timestamps = crossings.astype(np.float64) / fs
+        if total_count > 0:
+            mean_wf = (weighted_sum / float(total_count)).astype(np.float32)
+        else:
+            mean_wf = np.full(wf_len, np.nan, dtype=np.float32)
+        summary = _mean_waveform_summary(mean_wf, total_count, fs, wf_len)
+        cv2 = _compute_cv2_from_timestamps(timestamps)
+        if COMPUTE_HOURLY_CORRELOGRAMS:
+            isi_sec, correlogram_lag_ms, correlogram_counts = _isi_and_correlogram(timestamps)
+        else:
+            isi_sec, correlogram_lag_ms, correlogram_counts = _isi_only_and_empty_correlogram(timestamps)
+        firing_rate_hz = float(total_count / duration_sec) if duration_sec > 0 else 0.0
+        npz_path = hourly_dir / f"{state['out_base'].name}_hour_{hour_index:04d}_isi_correlogram.npz"
+        t_hour_npz0 = time.perf_counter()
+        np.savez_compressed(
+            str(npz_path),
+            crossing_samples=crossings,
+            timestamps_sec=timestamps,
+            mean_waveform_uv=summary["mean_waveform_uv"],
+            isi_sec=isi_sec,
+            correlogram_lag_ms=correlogram_lag_ms,
+            correlogram_counts=correlogram_counts,
+            hour_index=np.array([hour_index], dtype=np.int32),
+            hour_start_sec=np.array([h0_sec], dtype=np.float64),
+            hour_end_sec=np.array([h1_sec], dtype=np.float64),
+            hour_duration_sec=np.array([duration_sec], dtype=np.float64),
+        )
+        hour_npz_elapsed = time.perf_counter() - t_hour_npz0
+        _add_timing(timing_totals, "detection_hourly_npz_write", hour_npz_elapsed)
+        _add_timing(timing_totals, "detection_npz_write", hour_npz_elapsed)
+        fig_path = hourly_dir / f"{state['out_base'].name}_hour_{hour_index:04d}_sgch{state['sg_ch']}_n{total_count}_mean_waveform.png"
+        t_plot0 = time.perf_counter()
+        _save_mean_waveform_plot(
+            summary["mean_waveform_uv"],
+            n_spikes=total_count,
+            fs=fs,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            sg_ch=int(state["sg_ch"]),
+            t_start_min=h0_sec / 60.0,
+            t_end_min=h1_sec / 60.0,
+            out_png=fig_path,
+            fixed_y_center=float(state["fixed_y_center"] if state["fixed_y_center"] is not None else 0.0),
+            fixed_y_half=float(state["fixed_y_half"] if state["fixed_y_half"] is not None else max(1.0, 1.2 * float(state["threshold_uv"]))),
+        )
+        _add_timing(timing_totals, "detection_plot_write", time.perf_counter() - t_plot0)
+        state["hourly_rows"].append(
+            {
+                "hour_index": hour_index,
+                "time_start_sec": h0_sec,
+                "time_end_sec": h1_sec,
+                "duration_sec": duration_sec,
+                "sg_ch": int(state["sg_ch"]),
+                "threshold_min_uv": float(state["threshold_uv"]),
+                "threshold_max_uv": _safe_float(state.get("threshold_max_uv")),
+                "n_spikes": int(total_count),
+                "firing_rate_hz": firing_rate_hz,
+                "amplitude_ptp_uv": _safe_float(summary["amplitude_ptp_uv"]),
+                "mean_abs_waveform_uv": _safe_float(summary["mean_abs_waveform_uv"]),
+                "cv2": _safe_float(cv2),
+                "peak_to_trough_ms": _safe_float(summary["peak_to_trough_ms"]),
+                "isi_mean_ms": _safe_float(float(np.mean(isi_sec) * 1000.0) if isi_sec.size else float("nan")),
+                "isi_median_ms": _safe_float(float(np.median(isi_sec) * 1000.0) if isi_sec.size else float("nan")),
                 "npz": str(npz_path.resolve()),
                 "figure": str(fig_path.resolve()),
             }
@@ -1262,8 +1723,11 @@ def process_recording_save_per_chunk_multi_channel(
             completed_pairs += 1
             continue
 
+        pair_id = _pair_folder_name(sg_ch, threshold_uv, threshold_max_uv)
         states.append(
             {
+                "pair_index": len(states),
+                "pair_id": pair_id,
                 "sg_ch": sg_ch,
                 "threshold_uv": threshold_uv,
                 "threshold_max_uv": threshold_max_uv,
@@ -1278,7 +1742,7 @@ def process_recording_save_per_chunk_multi_channel(
                 "fixed_y_half": None,
                 "minute_rows": [],
                 "hourly_rows": [],
-                "hour_buffers": {},
+                "minute_buffers": {},
             }
         )
 
@@ -1462,9 +1926,10 @@ def process_recording_save_per_chunk_multi_channel(
                 global_cross = cand.astype(np.int64) + buf_start
                 global_cross.sort()
 
+                minute_samples = int(round(60.0 * fs))
                 cap = 1024
                 cross_buf = np.empty(cap, dtype=np.int64)
-                wf_buf = np.empty((cap, wf_len), dtype=np.float32)
+                chunk_waveform_sum = np.zeros(wf_len, dtype=np.float64)
                 n_chunk = 0
                 for g in merge_refractory(global_cross, refractory_samples):
                     if g - int(state["last_kept"]) < refractory_samples:
@@ -1481,17 +1946,22 @@ def process_recording_save_per_chunk_multi_channel(
                                 continue
                         elif amp_uv > float(threshold_max_uv):
                             continue
-                    cross_buf, wf_buf, cap = _ensure_event_capacity(
-                        cross_buf, wf_buf, n_chunk, wf_len
-                    )
+                    cross_buf = _ensure_crossing_capacity(cross_buf, n_chunk)
                     cross_buf[n_chunk] = int(g)
-                    wf_buf[n_chunk, :] = candidate_wf
+                    chunk_waveform_sum += np.asarray(candidate_wf, dtype=np.float64)
+                    _add_event_to_minute_buffer(
+                        state,
+                        int(g),
+                        candidate_wf,
+                        minute_samples,
+                        wf_len,
+                    )
                     n_chunk += 1
                     state["last_kept"] = int(g)
 
                 mean_abs_for_name = 0.0
                 if n_chunk > 0:
-                    mean_wf = wf_buf[:n_chunk].mean(axis=0)
+                    mean_wf = (chunk_waveform_sum / float(n_chunk)).astype(np.float32)
                     mean_abs_for_name = float(np.mean(np.abs(mean_wf)))
                     if state["fixed_y_center"] is None or state["fixed_y_half"] is None:
                         mean_min = float(np.min(mean_wf))
@@ -1506,31 +1976,14 @@ def process_recording_save_per_chunk_multi_channel(
                     state["fixed_y_center"] = 0.0
                     state["fixed_y_half"] = max(1.0, 1.2 * threshold_uv)
 
-                npz_path = Path(f"{out_base}_{chunk_tag}_threshold_crossings.npz")
                 crossings = (
                     cross_buf[:n_chunk].copy() if n_chunk else np.zeros(0, dtype=np.int64)
                 )
-                wfs = (
-                    wf_buf[:n_chunk].copy()
-                    if n_chunk
-                    else np.zeros((0, wf_len), dtype=np.float32)
-                )
-                del cross_buf, wf_buf
+                del cross_buf, chunk_waveform_sum
                 _add_timing(
                     timing_totals,
                     "detection_thresholding",
                     time.perf_counter() - t_thresh0,
-                )
-
-                _save_minute_outputs(
-                    state,
-                    crossings=crossings,
-                    wfs=wfs,
-                    fs=fs,
-                    wf_len=wf_len,
-                    total_samples=int(n),
-                    session_cumulative_sample_offset=int(session_cumulative_sample_offset),
-                    session_cumulative_time_offset_sec=float(session_cumulative_time_offset_sec),
                 )
 
                 state["manifest"].append(
@@ -1546,21 +1999,9 @@ def process_recording_save_per_chunk_multi_channel(
                 state["total_events"] += int(n_chunk)
                 computed_events += int(n_chunk)
 
-                del crossings, wfs
+                del crossings
 
             del traces
-
-        for state in states:
-            _flush_completed_hours(
-                state,
-                fs=fs,
-                wf_len=wf_len,
-                pre_samples=pre_samples,
-                post_samples=post_samples,
-                current_sample=int(c1),
-                total_samples=int(n),
-                force=False,
-            )
 
         t_gc0 = time.perf_counter()
         gc.collect()
@@ -1582,27 +2023,42 @@ def process_recording_save_per_chunk_multi_channel(
 
         c0 = c1
 
+    total_minutes = max(1, int(np.ceil(float(n) / fs / 60.0)))
+    total_hours = max(1, int(np.ceil(float(n) / fs / 3600.0)))
+    t_finalize0 = time.perf_counter()
+    recording_minute_rows = _write_recording_minute_npz_outputs(
+        states,
+        run_output_dir=run_output_dir,
+        parent=parent,
+        stem=stem,
+        rec_file=rec_file,
+        total_minutes=total_minutes,
+        total_samples=int(n),
+        fs=fs,
+        wf_len=wf_len,
+        session_ordinal=session_ordinal,
+        session_cumulative_sample_offset=int(session_cumulative_sample_offset),
+        session_cumulative_time_offset_sec=float(session_cumulative_time_offset_sec),
+        timing_totals=timing_totals,
+    )
+    _add_timing(timing_totals, "detection_minute_finalize", time.perf_counter() - t_finalize0)
+    recording_minute_summary_csv = run_output_dir / "minute_npz" / f"{parent}__{stem}_minute_summary.csv"
+    recording_minute_summary_json = run_output_dir / "minute_npz" / f"{parent}__{stem}_minute_summary.json"
+    t_recording_minute_summary0 = time.perf_counter()
+    _write_csv_rows(recording_minute_summary_csv, recording_minute_rows)
+    recording_minute_summary_json.write_text(
+        json.dumps(_jsonable_rows(recording_minute_rows), indent=2),
+        encoding="utf-8",
+    )
+    _add_timing(
+        timing_totals,
+        "recording_minute_summary_write",
+        time.perf_counter() - t_recording_minute_summary0,
+    )
+
     for state in states:
-        _flush_completed_hours(
-            state,
-            fs=fs,
-            wf_len=wf_len,
-            pre_samples=pre_samples,
-            post_samples=post_samples,
-            current_sample=int(n),
-            total_samples=int(n),
-            force=True,
-        )
-        total_minutes = max(1, int(np.ceil(float(n) / fs / 60.0)))
-        total_hours = max(1, int(np.ceil(float(n) / fs / 3600.0)))
-        _ensure_all_minute_rows(
-            state,
-            total_minutes=total_minutes,
-            total_samples=int(n),
-            fs=fs,
-            wf_len=wf_len,
-        )
-        _ensure_all_hourly_rows(
+        t_hourly_finalize0 = time.perf_counter()
+        _write_hourly_outputs_from_minute_means(
             state,
             total_hours=total_hours,
             total_samples=int(n),
@@ -1610,11 +2066,14 @@ def process_recording_save_per_chunk_multi_channel(
             wf_len=wf_len,
             pre_samples=pre_samples,
             post_samples=post_samples,
+            timing_totals=timing_totals,
         )
+        _add_timing(timing_totals, "detection_hourly_finalize", time.perf_counter() - t_hourly_finalize0)
         minute_summary_csv = state["out_base"].parent / f"{state['out_base'].name}_minute_summary.csv"
         minute_summary_json = state["out_base"].parent / f"{state['out_base'].name}_minute_summary.json"
         hourly_summary_csv = state["out_base"].parent / f"{state['out_base'].name}_hourly_summary.csv"
         hourly_summary_json = state["out_base"].parent / f"{state['out_base'].name}_hourly_summary.json"
+        t_pair_summary0 = time.perf_counter()
         _write_csv_rows(minute_summary_csv, state["minute_rows"])
         minute_summary_json.write_text(
             json.dumps(_jsonable_rows(state["minute_rows"]), indent=2),
@@ -1625,6 +2084,7 @@ def process_recording_save_per_chunk_multi_channel(
             json.dumps(_jsonable_rows(state["hourly_rows"]), indent=2),
             encoding="utf-8",
         )
+        _add_timing(timing_totals, "pair_minute_hourly_summary_write", time.perf_counter() - t_pair_summary0)
         per_rec = {
             "rec_file": str(rec_file.resolve()),
             "n_crossings": int(state["total_events"]),
@@ -1643,14 +2103,17 @@ def process_recording_save_per_chunk_multi_channel(
             "chunks": state["manifest"],
             "minute_summary_csv": str(minute_summary_csv.resolve()),
             "minute_summary_json": str(minute_summary_json.resolve()),
+            "recording_minute_summary_csv": str(recording_minute_summary_csv.resolve()),
+            "recording_minute_summary_json": str(recording_minute_summary_json.resolve()),
             "hourly_summary_csv": str(hourly_summary_csv.resolve()),
             "hourly_summary_json": str(hourly_summary_json.resolve()),
-            "minute_npz_folder": str((state["out_base"].parent / "minute_npz").resolve()),
+            "minute_npz_folder": str((run_output_dir / "minute_npz" / f"{parent}__{stem}").resolve()),
             "hourly_folder": str((state["out_base"].parent / "hourly").resolve()),
             "output_resolution_note": (
-                "Processing chunks are internal. Stable outputs are one NPZ per minute, "
-                "minute CSV/JSON summaries, hourly ISI/correlogram NPZ files, and one "
-                "hourly waveform figure per hour."
+                "Processing chunks are internal. Stable outputs are one recording-level "
+                "NPZ per minute containing every channel/range pair, per-pair minute "
+                "CSV/JSON summaries, hourly ISI/correlogram NPZ files, and one hourly "
+                "mean-waveform figure per hour."
             ),
         }
         t_summary0 = time.perf_counter()
@@ -1802,7 +2265,7 @@ def _is_recording_summary_complete(summary_path: Path) -> bool:
     """
     Decide whether a (recording, sg_ch, threshold_uv) pair is "done".
 
-    We require the summary JSON to exist and every chunk NPZ referenced in it to exist too.
+    We require the summary JSON plus minute/hourly summary artifacts to exist.
     """
     if not summary_path.exists():
         return False
@@ -1822,10 +2285,20 @@ def _is_recording_summary_complete(summary_path: Path) -> bool:
         fig_s = ch.get("figure", None)
         if fig_s and not Path(fig_s).exists():
             return False
-    for key in ("minute_summary_csv", "minute_summary_json", "hourly_summary_csv", "hourly_summary_json"):
+    for key in (
+        "minute_summary_csv",
+        "minute_summary_json",
+        "recording_minute_summary_csv",
+        "recording_minute_summary_json",
+        "hourly_summary_csv",
+        "hourly_summary_json",
+    ):
         path_s = per_rec.get(key, None)
         if path_s and not Path(path_s).exists():
             return False
+    minute_npz_folder = per_rec.get("minute_npz_folder", None)
+    if minute_npz_folder and not Path(minute_npz_folder).exists():
+        return False
     return True
 
 
@@ -1927,30 +2400,6 @@ DEFAULT_CHANNEL_THRESHOLDS_EXAMPLE = [
     {"sg_ch": 72, "threshold_uv": 500.0},
     {"sg_ch": 74, "threshold_uv": 500.0},
 ]
-
-
-def build_global_channel_threshold_pairs(
-    sg_channels: list[int],
-    threshold_ranges: list[dict],
-) -> list[dict]:
-    pairs: list[dict] = []
-    for sg_ch in sorted(int(ch) for ch in sg_channels):
-        for item in threshold_ranges:
-            start_uv = float(item["start_uv"])
-            stop_uv = float(item["stop_uv"])
-            if start_uv <= 0 or stop_uv <= 0:
-                raise ValueError("Threshold range values must be > 0 uV.")
-            if start_uv > stop_uv:
-                start_uv, stop_uv = stop_uv, start_uv
-            pairs.append(
-                {
-                    "sg_ch": int(sg_ch),
-                    "threshold_uv": float(start_uv),
-                    "threshold_max_uv": float(stop_uv),
-                }
-            )
-    return pairs
-
 
 def parse_chronic_rec_boundary_key(user_text: str) -> int:
     """
@@ -2130,10 +2579,16 @@ def _print_timing_summary(timing: dict[str, float], total_wall: float) -> None:
         ("Detection total", timing.get("detection_total", 0.0)),
         ("  trace read/filter realization", timing.get("detection_trace_read", 0.0)),
         ("  threshold + waveform extraction", timing.get("detection_thresholding", 0.0)),
-        ("  NPZ writes", timing.get("detection_npz_write", 0.0)),
+        ("  minute finalization total", timing.get("detection_minute_finalize", 0.0)),
+        ("  hourly finalization total", timing.get("detection_hourly_finalize", 0.0)),
+        ("  NPZ writes total", timing.get("detection_npz_write", 0.0)),
+        ("    minute NPZ writes", timing.get("detection_minute_npz_write", 0.0)),
+        ("    hourly NPZ writes", timing.get("detection_hourly_npz_write", 0.0)),
         ("  waveform PNG plots", timing.get("detection_plot_write", 0.0)),
         ("  resume chunk reuse/checks", timing.get("detection_resume_reuse", 0.0)),
         ("  garbage collection", timing.get("detection_gc", 0.0)),
+        ("Recording-level minute summary writes", timing.get("recording_minute_summary_write", 0.0)),
+        ("Pair minute/hourly summary writes", timing.get("pair_minute_hourly_summary_write", 0.0)),
         ("Recording summary JSON writes", timing.get("recording_summary_write", 0.0)),
         ("Other loop overhead", max(0.0, total_wall - major_accounted)),
     ]
@@ -2235,9 +2690,15 @@ def _recording_timing_row(
         "detection_trace_read",
         "detection_thresholding",
         "detection_npz_write",
+        "detection_minute_npz_write",
+        "detection_hourly_npz_write",
+        "detection_minute_finalize",
+        "detection_hourly_finalize",
         "detection_plot_write",
         "detection_resume_reuse",
         "detection_gc",
+        "recording_minute_summary_write",
+        "pair_minute_hourly_summary_write",
         "recording_summary_write",
     ):
         row[f"{key}_seconds"] = _timing_delta(timing_after, timing_before, key)
@@ -2273,8 +2734,9 @@ def process_threshold_crossings_run(
         flush=True,
     )
     print(
-        "Processing chunks are internal. Stable outputs are minute NPZ/CSV/JSON files, "
-        "hourly summaries, hourly waveform figures, and timing reports.\n",
+        "Processing chunks are internal. Stable outputs are one recording-level NPZ "
+        "per minute, per-pair minute CSV/JSON summaries, hourly summaries, hourly "
+        "mean-waveform figures, and timing reports.\n",
         flush=True,
     )
 
@@ -2299,7 +2761,7 @@ def process_threshold_crossings_run(
             if pair_dir.exists() and any(pair_dir.glob(pattern)):
                 trace_preview_saved_for_pairs.add(pair_key)
 
-    previews_written_for_first_loaded_record = False
+    previews_written_for_first_loaded_record = not DEFAULT_SAVE_TRACE_PREVIEWS
 
     for fi, rec_file in enumerate(rec_files):
         t0 = time.perf_counter()
@@ -2751,10 +3213,7 @@ def main() -> int:
     if len(rec_files) > 5:
         print(f"  ... and {len(rec_files) - 5} more")
 
-    output_parent = prompt_path(
-        "Parent folder for outputs (a new run subfolder will be created here)",
-        r"I:\Threshold_test",
-    )
+    output_parent = DEFAULT_OUTPUT_PARENT
     run_output_dir = make_run_output_dir(output_parent, rec_files)
     print(f"\nRun output folder: {run_output_dir.resolve()}")
     print(
@@ -2763,87 +3222,38 @@ def main() -> int:
         "and timing reports.\n"
     )
 
-    probe_json = prompt_path(
-        "Probe JSON path",
-        r"E:\Curtis\spikeinterface\LSNET_probe.json",
-    )
+    probe_json = DEFAULT_PROBE_JSON
     if not probe_json.exists():
         print(f"Probe file not found: {probe_json}", file=sys.stderr)
         return 1
 
-    chunk_sec = prompt_float("Chunk length (seconds)", 3600.0)
-    fs = prompt_float("Sampling rate (Hz)", 30000.0)
-    polarity = prompt_choice(
-        "Polarity",
-        ("negative", "positive", "both"),
-        "negative",
-    )
-    refractory_ms = prompt_float("Refractory period (ms) between kept events", 0.5)
-    pre_ms = prompt_float("Waveform before crossing (ms)", 1.0)
-    post_ms = prompt_float("Waveform after crossing (ms)", 2.0)
+    chunk_sec = DEFAULT_CHUNK_SEC
+    fs = DEFAULT_SAMPLING_RATE_HZ
+    polarity = DEFAULT_POLARITY
+    refractory_ms = DEFAULT_REFRACTORY_MS
+    pre_ms = DEFAULT_PRE_MS
+    post_ms = DEFAULT_POST_MS
 
-    apply_spikeband = prompt_yes_no(
-        "Apply spikeband bandpass before detection (SortingLSNET-style 300–6000 Hz)",
-        default_yes=True,
-    )
-    bandpass_freq_min = 300.0
-    bandpass_freq_max = 6000.0
-    if apply_spikeband:
-        bandpass_freq_min = prompt_float("  Bandpass high-pass corner (Hz)", 300.0)
-        bandpass_freq_max = prompt_float("  Bandpass low-pass corner (Hz)", 6000.0)
-        if bandpass_freq_min >= bandpass_freq_max:
-            print("bandpass_freq_min must be < bandpass_freq_max.", file=sys.stderr)
-            return 1
+    apply_spikeband = DEFAULT_APPLY_SPIKEBAND
+    bandpass_freq_min = DEFAULT_BANDPASS_FREQ_MIN
+    bandpass_freq_max = DEFAULT_BANDPASS_FREQ_MAX
+    if apply_spikeband and bandpass_freq_min >= bandpass_freq_max:
+        print("bandpass_freq_min must be < bandpass_freq_max.", file=sys.stderr)
+        return 1
 
     pi = read_probeinterface(str(probe_json))
     probe = pi.probes[0]
     sg_map = build_sg_to_recording_index(probe)
-    threshold_mode = prompt_choice(
-        "Threshold mode",
-        ("global", "json"),
-        "global",
+    config_path = DEFAULT_CHANNEL_THRESHOLD_CONFIG_JSON
+    try:
+        pairs = load_channel_threshold_pairs(config_path)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as ex:
+        print(f"Failed to load channel/threshold JSON: {ex}", file=sys.stderr)
+        return 1
+    print(
+        f"Using JSON channel/threshold pairs: {len(pairs)} pair(s) from {config_path}.",
+        flush=True,
     )
-    threshold_ranges: list[dict] = []
-    config_path: Path | None = None
-    if threshold_mode == "global":
-        threshold_range_low_start = prompt_float("Global threshold range 1 min (uV)", 50.0)
-        threshold_range_low_stop = prompt_float("Global threshold range 1 max (uV)", 200.0)
-        threshold_range_high_start = prompt_float("Global threshold range 2 min (uV)", 200.0)
-        threshold_range_high_stop = prompt_float("Global threshold range 2 max (uV)", 1000.0)
-        threshold_ranges = [
-            {
-                "start_uv": threshold_range_low_start,
-                "stop_uv": threshold_range_low_stop,
-            },
-            {
-                "start_uv": threshold_range_high_start,
-                "stop_uv": threshold_range_high_stop,
-            },
-        ]
-        try:
-            pairs = build_global_channel_threshold_pairs(list(sg_map.keys()), threshold_ranges)
-        except ValueError as ex:
-            print(str(ex), file=sys.stderr)
-            return 1
-        print(
-            f"Using global thresholds for all {len(sg_map)} SG channel(s): "
-            f"{len(threshold_ranges)} threshold range(s), {len(pairs)} channel/threshold pair(s).",
-            flush=True,
-        )
-    else:
-        config_path = prompt_path(
-            "Channel/threshold config JSON path",
-            r"S:\channel_thresholds_from_sorted.json",
-        )
-        try:
-            pairs = load_channel_threshold_pairs(config_path)
-        except (FileNotFoundError, ValueError, json.JSONDecodeError) as ex:
-            print(f"Failed to load channel/threshold JSON: {ex}", file=sys.stderr)
-            return 1
-        print(
-            f"Using JSON channel/threshold pairs: {len(pairs)} pair(s) from {config_path}.",
-            flush=True,
-        )
 
     for p in pairs:
         sg_ch = int(p["sg_ch"])
@@ -2891,15 +3301,9 @@ def main() -> int:
         "last_sort_key": chronic_rec_sort_key(rec_files[-1]),
         "n_files": len(rec_files),
         "recording_files": [str(p.resolve()) for p in rec_files],
-        "channel_threshold_mode": (
-            "global_ranges_all_probe_sg_channels"
-            if threshold_mode == "global"
-            else "json_channel_threshold_pairs"
-        ),
-        "channel_threshold_ranges": threshold_ranges if threshold_mode == "global" else None,
-        "channel_threshold_config": (
-            str(config_path.resolve()) if config_path is not None else None
-        ),
+        "channel_threshold_mode": "json_channel_threshold_pairs",
+        "channel_threshold_ranges": None,
+        "channel_threshold_config": str(config_path.resolve()),
         "channel_threshold_pairs": channel_threshold_pairs,
         "polarity": polarity,
         "chunk_sec": chunk_sec,
@@ -2922,11 +3326,14 @@ def main() -> int:
             if apply_spikeband
             else None
         ),
+        "save_trace_previews": bool(DEFAULT_SAVE_TRACE_PREVIEWS),
         "saved_files_note": (
-            "Per recording/channel/range: <parent>__<stem>_recording_summary.json lists "
-            "minute and hourly output artifacts. Minute outputs include summary CSV/JSON "
-            "and per-minute spike/waveform NPZ files. Hourly outputs include summary CSV/JSON, "
-            "ISI/correlogram NPZ files, and waveform PNGs. "
+            "Per recording: minute_npz/<parent>__<stem> contains one aggregate NPZ per "
+            "real recording minute with every channel/range pair. Per channel/range: "
+            "<parent>__<stem>_recording_summary.json lists minute and hourly artifacts. "
+            "Minute outputs include per-pair summary CSV/JSON rows pointing to the "
+            "recording-level minute NPZ files. Hourly outputs include summary CSV/JSON, "
+            "ISI/correlogram NPZ files, and mean-waveform PNGs. "
             "Cumulative sample/time columns chain sessions (see cumulative_timeline)."
         ),
         "cumulative_timeline": {
