@@ -21,6 +21,7 @@ Alignment_html.py is still used during analyzer loading.
 
 import argparse
 import builtins
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -49,6 +50,8 @@ import presentation_multiple as presentation_review
 AUTO_DAY_EXPORT_FOLDER_NAME = "units_alignment_summary_auto"
 AUTO_DAY_SUMMARY_SUFFIX = "_auto"
 AUTO_STATS_SUFFIX = "_auto"
+ORGANIZED_CACHE_FOLDER_NAME = "unit_feature_cache"
+ORGANIZED_DAY_ROOT_PATTERN = re.compile(r"(?P<day_code>\d{6})_Sorting(?:_org)?$")
 
 # User setting: one shared persistence threshold for both LDA.py and Tuning.py.
 # Change this value here when you want both downstream modules to use a new
@@ -137,6 +140,41 @@ class AutoAlignmentDaysState(day_review.AlignmentDaysState):
             setattr(unit, "_source_merge_overrides", {})
 
 
+class OrganizedAutoAlignmentState(AutoAlignmentState):
+    """Alignment_html state loaded from Sorting_organize.py unit_feature_cache outputs."""
+
+    def __init__(self, root_folder: Path, progress_callback=None):
+        self.root_folder = Path(root_folder).resolve()
+        self.summary_root = self.root_folder / AUTO_DAY_EXPORT_FOLDER_NAME
+        self.summary_root.mkdir(parents=True, exist_ok=True)
+        (
+            self.sessions,
+            self.pages_by_shank,
+            self.cache_folder,
+            self.load_reports,
+        ) = load_all_sessions_from_organized_caches(
+            self.root_folder,
+            progress_callback=progress_callback,
+        )
+        self._lock = html_review.threading.RLock()
+        self._undo_stack: list[dict[str, dict]] = []
+        self._stable_unit_aliases: dict[str, dict[str, str]] = {}
+        self._stable_next_alias_index: dict[str, int] = {}
+        self.discovered_shank_folder_ids = sorted(
+            str(shank_id) for shank_id in self.pages_by_shank.keys()
+        )
+        self.loaded_shank_ids = list(self.discovered_shank_folder_ids)
+        self.empty_shank_folder_ids: list[str] = []
+        if progress_callback is not None:
+            progress_callback("Applying organized-cache auto alignment defaults...")
+        self.apply_manifest_if_available()
+        if progress_callback is not None:
+            progress_callback("Building organized-cache auto-merge suggestions...")
+        self.sync_auto_merge_groups()
+        if progress_callback is not None:
+            progress_callback("Organized-cache startup state ready.")
+
+
 _SCRIPT_START_TIME = time.perf_counter()
 
 
@@ -222,6 +260,108 @@ def parse_input_roots_text(raw_text: str) -> list[Path]:
     return roots
 
 
+def parse_day_code_from_auto_root(folder: Path) -> str | None:
+    match = ORGANIZED_DAY_ROOT_PATTERN.fullmatch(Path(folder).name)
+    if not match:
+        return None
+    return match.group("day_code")
+
+
+def is_organized_cache_folder(path: Path) -> bool:
+    path = Path(path)
+    return (
+        path.is_dir()
+        and path.name == ORGANIZED_CACHE_FOLDER_NAME
+        and (path / "unit_summary.json").is_file()
+    )
+
+
+def find_organized_day_root_for_cache(cache_folder: Path) -> Path:
+    cache_folder = Path(cache_folder).resolve()
+    for parent in cache_folder.parents:
+        if parse_day_code_from_auto_root(parent) is not None:
+            return parent
+    return cache_folder.parent
+
+
+def discover_organized_cache_folders(path: Path) -> list[Path]:
+    path = Path(path).resolve()
+    if is_organized_cache_folder(path):
+        return [path]
+    if not path.exists() or not path.is_dir():
+        return []
+    return sorted(
+        cache_folder
+        for cache_folder in path.rglob(ORGANIZED_CACHE_FOLDER_NAME)
+        if is_organized_cache_folder(cache_folder)
+    )
+
+
+def discover_organized_day_roots(input_roots: list[Path]) -> list[Path]:
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+
+    for raw_root in input_roots:
+        root = Path(raw_root).resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"Input path does not exist: {root}")
+        if not root.is_dir():
+            raise NotADirectoryError(f"Input path is not a directory: {root}")
+
+        if parse_day_code_from_auto_root(root) is not None and discover_organized_cache_folders(root):
+            candidate_roots = [root]
+        else:
+            child_day_roots = [
+                child.resolve()
+                for child in sorted(root.iterdir())
+                if child.is_dir()
+                and parse_day_code_from_auto_root(child) is not None
+                and discover_organized_cache_folders(child)
+            ]
+            if child_day_roots:
+                candidate_roots = child_day_roots
+            else:
+                cache_folders = discover_organized_cache_folders(root)
+                candidate_roots = (
+                    [find_organized_day_root_for_cache(cache_folder) for cache_folder in cache_folders]
+                    if cache_folders
+                    else []
+                )
+
+        for candidate_root in candidate_roots:
+            candidate_root = Path(candidate_root).resolve()
+            if candidate_root in seen:
+                continue
+            seen.add(candidate_root)
+            discovered.append(candidate_root)
+
+    return sorted(discovered)
+
+
+def looks_like_organized_input(input_roots: list[Path]) -> bool:
+    return bool(discover_organized_day_roots(input_roots))
+
+
+def discover_day_roots_for_mode(input_roots: list[Path], *, organized_input: bool) -> list[Path]:
+    if organized_input:
+        day_roots = discover_organized_day_roots(input_roots)
+        if not day_roots:
+            joined_roots = ", ".join(str(Path(path).resolve()) for path in input_roots)
+            raise FileNotFoundError(
+                "No Sorting_organize.py unit_feature_cache folders were found in: "
+                f"{joined_roots}"
+            )
+        return day_roots
+    return day_review.discover_day_sorting_roots(input_roots)
+
+
+def patch_day_review_for_auto_roots() -> None:
+    day_review.parse_day_code_from_sorting_root = parse_day_code_from_auto_root
+    day_review.discover_day_sorting_roots = (
+        lambda input_roots: discover_day_roots_for_mode(input_roots, organized_input=True)
+    )
+
+
 def parse_csv_text(raw_text: str | None) -> tuple[str, ...]:
     if raw_text is None:
         return ()
@@ -288,7 +428,7 @@ def immediate_child_under(path: Path, parent: Path) -> Path:
 
 def prompt_for_input_roots() -> list[Path]:
     raw_text = input(
-        "Enter one or more daily *_Sorting folders or parent folders, separated by commas: "
+        "Enter one or more daily *_Sorting folders, *_Sorting_org folders, unit_feature_cache folders, or parent folders, separated by commas: "
     ).strip()
     if not raw_text:
         raise ValueError("No input folders were provided.")
@@ -493,6 +633,198 @@ def build_existing_page_export(page_manifest_paths: list[Path]) -> dict:
     }
 
 
+def load_organized_unit_summary(cache_folder: Path) -> dict:
+    summary_path = Path(cache_folder) / "unit_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Missing organized unit summary: {summary_path}")
+    payload = load_json_file(summary_path)
+    if isinstance(payload, list):
+        return {"units": payload}
+    if not isinstance(payload, dict):
+        raise TypeError(f"{summary_path} is not a JSON object or unit list.")
+    return payload
+
+
+def load_unit_vector(cache_folder: Path, key: str) -> list[float]:
+    if not key:
+        return [0.0]
+    similarity_path = Path(cache_folder) / "unit_similarity_vectors.npz"
+    if not similarity_path.is_file():
+        return [0.0]
+    try:
+        import numpy as np
+
+        with np.load(similarity_path) as arrays:
+            if key not in arrays:
+                return [0.0]
+            vector = np.asarray(arrays[key], dtype=float).ravel()
+            if vector.size == 0:
+                return [0.0]
+            return vector.astype(float).tolist()
+    except Exception:
+        return [0.0]
+
+
+def build_session_from_organized_cache(
+    *,
+    cache_folder: Path,
+    session_index: int,
+) -> tuple[html_review.SessionSummary, dict]:
+    payload = load_organized_unit_summary(cache_folder)
+    units_payload = list(payload.get("units") or [])
+    if not units_payload:
+        raise ValueError(f"No units found in organized cache: {cache_folder}")
+
+    first_unit = units_payload[0]
+    output_folder = Path(str(first_unit.get("output_folder") or payload.get("output_folder") or "")).resolve()
+    analyzer_folder = Path(str(first_unit.get("analyzer_folder") or payload.get("analyzer_folder") or "")).resolve()
+    session_name = str(first_unit.get("session_name") or output_folder.name or f"session_{session_index:03d}")
+
+    session = html_review.SessionSummary(
+        session_name=session_name,
+        session_index=session_index,
+        output_folder=str(output_folder),
+        analyzer_folder=str(analyzer_folder),
+    )
+
+    skipped_units = 0
+    for unit_payload in units_payload:
+        unit_id = html_review.safe_int(unit_payload.get("unit_id"))
+        shank_id = html_review.safe_int(unit_payload.get("shank_id"))
+        local_channel = html_review.safe_int(unit_payload.get("local_channel_on_shank"))
+        sg_channel = html_review.safe_int(unit_payload.get("sg_channel"))
+        if unit_id is None or shank_id is None or local_channel is None or sg_channel is None:
+            skipped_units += 1
+            continue
+
+        waveform_vector = unit_payload.get("waveform_similarity_vector")
+        if not waveform_vector:
+            waveform_vector = load_unit_vector(
+                cache_folder,
+                str(unit_payload.get("waveform_vector_key") or ""),
+            )
+        autocorrelogram_vector = unit_payload.get("autocorrelogram_similarity_vector")
+        if not autocorrelogram_vector:
+            autocorrelogram_vector = load_unit_vector(
+                cache_folder,
+                str(unit_payload.get("autocorrelogram_vector_key") or ""),
+            )
+
+        unit = html_review.UnitSummary(
+            session_name=session_name,
+            session_index=session_index,
+            analyzer_folder=str(analyzer_folder),
+            output_folder=str(output_folder),
+            unit_id=int(unit_id),
+            shank_id=int(shank_id),
+            local_channel_on_shank=int(local_channel),
+            sg_channel=int(sg_channel),
+            amplitude_median=html_review.safe_float(unit_payload.get("amplitude_median")),
+            firing_rate=html_review.safe_float(unit_payload.get("firing_rate")),
+            isi_violations_ratio=html_review.safe_float(unit_payload.get("isi_violations_ratio")),
+            snr=html_review.safe_float(unit_payload.get("snr")),
+            num_spikes=html_review.safe_int(unit_payload.get("num_spikes")),
+            waveform_similarity_vector=list(waveform_vector or [0.0]),
+            autocorrelogram_similarity_vector=list(autocorrelogram_vector or [0.0]),
+            trough_to_peak_duration_ms=html_review.safe_float(
+                unit_payload.get("trough_to_peak_duration_ms")
+            ),
+            waveform_image_path=str(unit_payload.get("waveform_image_path") or ""),
+        )
+        session.units.append(unit)
+
+    report = {
+        "status": "loaded",
+        "source": "Sorting_organize.py",
+        "session_name": session.session_name,
+        "session_index": int(session.session_index),
+        "output_folder": session.output_folder,
+        "analyzer_folder": session.analyzer_folder,
+        "cache_folder": str(cache_folder),
+        "unit_count": len(session.units),
+        "skipped_units": int(skipped_units),
+        "shank_ids": sorted({int(unit.shank_id) for unit in session.units}),
+        "sg_channels": sorted({int(unit.sg_channel) for unit in session.units}),
+    }
+    return session, report
+
+
+def build_pages_from_sessions(
+    sessions: list[html_review.SessionSummary],
+) -> dict[int, dict[str, html_review.PageSummary]]:
+    pages_by_shank: dict[int, dict[str, html_review.PageSummary]] = defaultdict(dict)
+    shank_to_channels: dict[int, set[int]] = defaultdict(set)
+    for session in sessions:
+        for unit in session.units:
+            shank_to_channels[int(unit.shank_id)].add(int(unit.sg_channel))
+
+    for shank_id, sg_channels in sorted(shank_to_channels.items()):
+        for sg_channel in sorted(sg_channels):
+            page_sessions: list[html_review.SessionSummary] = []
+            for session in sessions:
+                filtered_units = [
+                    unit
+                    for unit in session.units
+                    if int(unit.shank_id) == int(shank_id)
+                    and int(unit.sg_channel) == int(sg_channel)
+                ]
+                page_sessions.append(
+                    html_review.SessionSummary(
+                        session_name=session.session_name,
+                        session_index=session.session_index,
+                        output_folder=session.output_folder,
+                        analyzer_folder=session.analyzer_folder,
+                        units=filtered_units,
+                    )
+                )
+            page = html_review.PageSummary(
+                shank_id=int(shank_id),
+                sg_channel=int(sg_channel),
+                sessions=page_sessions,
+            )
+            pages_by_shank[int(shank_id)][page.page_id] = page
+    return dict(pages_by_shank)
+
+
+def load_all_sessions_from_organized_caches(
+    root_folder: Path,
+    progress_callback=None,
+) -> tuple[list[html_review.SessionSummary], dict[int, dict[str, html_review.PageSummary]], Path, list[dict]]:
+    cache_folders = discover_organized_cache_folders(root_folder)
+    if not cache_folders:
+        raise FileNotFoundError(
+            f"No {ORGANIZED_CACHE_FOLDER_NAME} folders with unit_summary.json were found under: {root_folder}"
+        )
+
+    if progress_callback is not None:
+        progress_callback(
+            f"Found {len(cache_folders)} organized feature cache folder(s)."
+        )
+
+    sessions: list[html_review.SessionSummary] = []
+    load_reports: list[dict] = []
+    for session_index, cache_folder in enumerate(cache_folders):
+        if progress_callback is not None:
+            progress_callback(
+                f"Loading organized cache {session_index + 1}/{len(cache_folders)}: {cache_folder}"
+            )
+        session, report = build_session_from_organized_cache(
+            cache_folder=cache_folder,
+            session_index=session_index,
+        )
+        sessions.append(session)
+        load_reports.append(report)
+        if progress_callback is not None:
+            progress_callback(
+                f"Loaded {session.session_name}: {len(session.units)} unit(s) from organized cache"
+            )
+
+    cache_folder = Path(root_folder) / AUTO_DAY_EXPORT_FOLDER_NAME / "_cache"
+    cache_folder.mkdir(parents=True, exist_ok=True)
+    pages_by_shank = build_pages_from_sessions(sessions)
+    return sessions, pages_by_shank, cache_folder, load_reports
+
+
 def existing_day_auto_export_paths(day_root: Path) -> tuple[Path, Path, list[Path]]:
     summary_root = Path(day_root) / AUTO_DAY_EXPORT_FOLDER_NAME
     summary_manifest = summary_root / "export_summary.json"
@@ -609,7 +941,7 @@ def pipeline_options_payload(options: PipelineOptions) -> dict:
     }
 
 
-def run_single_day_auto_export(day_root: Path) -> dict:
+def run_single_day_auto_export(day_root: Path, *, organized_input: bool = False) -> dict:
     summary_root, summary_manifest, page_manifest_paths = existing_day_auto_export_paths(day_root)
     try:
         page_export, reused_payload = build_reused_export_payload(
@@ -635,8 +967,12 @@ def run_single_day_auto_export(day_root: Path) -> dict:
         )
         return payload
 
-    show_progress(f"Preparing within-day auto alignment for: {day_root}")
-    state = AutoAlignmentState(day_root, progress_callback=show_progress)
+    if organized_input:
+        show_progress(f"Preparing within-day auto alignment from organized cache: {day_root}")
+        state = OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
+    else:
+        show_progress(f"Preparing within-day auto alignment for: {day_root}")
+        state = AutoAlignmentState(day_root, progress_callback=show_progress)
     page_export = state.export_all_pages_decisions()
     summary_export = state.export_summary_bundle()
     payload = {
@@ -1011,7 +1347,14 @@ def failed_stage_payload(stage_name: str, exc: Exception) -> dict:
 def run_auto_pipeline(options: PipelineOptions) -> dict:
     timings: list[dict] = []
     selected_roots = [path.resolve() for path in options.input_roots]
-    day_roots = day_review.discover_day_sorting_roots(selected_roots)
+    organized_input = looks_like_organized_input(selected_roots)
+    if organized_input:
+        patch_day_review_for_auto_roots()
+        show_progress("Detected Sorting_organize.py cache input mode.")
+    day_roots = discover_day_roots_for_mode(
+        selected_roots,
+        organized_input=organized_input,
+    )
     common_root = Path(os.path.commonpath([str(day_root) for day_root in day_roots]))
     day_summary_folder_name = auto_day_summary_folder_name(day_roots)
 
@@ -1026,7 +1369,9 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
     day_results = []
     with timed_stage("within-day auto alignment exports", timings):
         for day_root in day_roots:
-            day_results.append(run_single_day_auto_export(day_root))
+            day_results.append(
+                run_single_day_auto_export(day_root, organized_input=organized_input)
+            )
 
     selected_days_match_existing_cross_export = selected_day_folders_match(
         common_root / day_summary_folder_name / "selected_day_folders.txt",
@@ -1105,6 +1450,7 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
 
     run_payload = {
         "input_roots": [str(path) for path in selected_roots],
+        "input_mode": "sorting_organize_cache" if organized_input else "sorting_analyzer",
         "options": pipeline_options_payload(options),
         "day_roots": [str(path) for path in day_roots],
         "common_root": str(common_root),
@@ -1135,8 +1481,9 @@ def main() -> None:
         "input_roots",
         nargs="?",
         help=(
-            "One or more daily *_Sorting folders or parent folders, separated by commas. "
-            "If omitted, you will be prompted in the terminal."
+            "One or more daily *_Sorting folders, Sorting_organize.py *_Sorting_org folders, "
+            "unit_feature_cache folders, or parent folders, separated by commas. If omitted, "
+            "you will be prompted in the terminal."
         ),
     )
     parser.add_argument(

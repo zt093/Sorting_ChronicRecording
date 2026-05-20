@@ -2561,6 +2561,28 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours} h {minutes} min {sec:.1f} s"
 
 
+TIMING_STEP_ROWS = (
+    ("Resume complete-file skips", "resume_skip_complete_recording"),
+    ("Load recording + HW map + probe", "load_recording"),
+    ("Bandpass setup", "bandpass_setup"),
+    ("First-10s preview plots", "preview_plots"),
+    ("Detection total", "detection_total"),
+    ("  trace read/filter realization", "detection_trace_read"),
+    ("  threshold + waveform extraction", "detection_thresholding"),
+    ("  minute finalization total", "detection_minute_finalize"),
+    ("  hourly finalization total", "detection_hourly_finalize"),
+    ("  NPZ writes total", "detection_npz_write"),
+    ("    minute NPZ writes", "detection_minute_npz_write"),
+    ("    hourly NPZ writes", "detection_hourly_npz_write"),
+    ("  waveform PNG plots", "detection_plot_write"),
+    ("  resume chunk reuse/checks", "detection_resume_reuse"),
+    ("  garbage collection", "detection_gc"),
+    ("Recording-level minute summary writes", "recording_minute_summary_write"),
+    ("Pair minute/hourly summary writes", "pair_minute_hourly_summary_write"),
+    ("Recording summary JSON writes", "recording_summary_write"),
+)
+
+
 def _print_timing_summary(timing: dict[str, float], total_wall: float) -> None:
     print("\nWall-time summary:", flush=True)
     major_accounted = (
@@ -2572,24 +2594,7 @@ def _print_timing_summary(timing: dict[str, float], total_wall: float) -> None:
     )
     rows = [
         ("Total wall time", total_wall),
-        ("Resume complete-file skips", timing.get("resume_skip_complete_recording", 0.0)),
-        ("Load recording + HW map + probe", timing.get("load_recording", 0.0)),
-        ("Bandpass setup", timing.get("bandpass_setup", 0.0)),
-        ("First-10s preview plots", timing.get("preview_plots", 0.0)),
-        ("Detection total", timing.get("detection_total", 0.0)),
-        ("  trace read/filter realization", timing.get("detection_trace_read", 0.0)),
-        ("  threshold + waveform extraction", timing.get("detection_thresholding", 0.0)),
-        ("  minute finalization total", timing.get("detection_minute_finalize", 0.0)),
-        ("  hourly finalization total", timing.get("detection_hourly_finalize", 0.0)),
-        ("  NPZ writes total", timing.get("detection_npz_write", 0.0)),
-        ("    minute NPZ writes", timing.get("detection_minute_npz_write", 0.0)),
-        ("    hourly NPZ writes", timing.get("detection_hourly_npz_write", 0.0)),
-        ("  waveform PNG plots", timing.get("detection_plot_write", 0.0)),
-        ("  resume chunk reuse/checks", timing.get("detection_resume_reuse", 0.0)),
-        ("  garbage collection", timing.get("detection_gc", 0.0)),
-        ("Recording-level minute summary writes", timing.get("recording_minute_summary_write", 0.0)),
-        ("Pair minute/hourly summary writes", timing.get("pair_minute_hourly_summary_write", 0.0)),
-        ("Recording summary JSON writes", timing.get("recording_summary_write", 0.0)),
+        *[(label, timing.get(key, 0.0)) for label, key in TIMING_STEP_ROWS],
         ("Other loop overhead", max(0.0, total_wall - major_accounted)),
     ]
     for label, seconds in rows:
@@ -2612,6 +2617,11 @@ def _print_per_recording_timing_summary(per_recording_timings: list[dict]) -> No
             f"{row.get('recording_name')} - {status}, {row.get('wall_time')}{pair_text}",
             flush=True,
         )
+        for label, key in TIMING_STEP_ROWS:
+            seconds = float(row.get(f"{key}_seconds", 0.0) or 0.0)
+            if seconds <= 0.0:
+                continue
+            print(f"      {label:<36} {_format_elapsed(seconds)}", flush=True)
 
 
 def _timing_delta(after: dict[str, float], before: dict[str, float], key: str) -> float:
@@ -2650,6 +2660,48 @@ def _write_run_timing_reports(
         json.dumps(_jsonable_rows(per_recording_timings), indent=2),
         encoding="utf-8",
     )
+    step_rows: list[dict] = []
+    for row in per_recording_timings:
+        wall_seconds = float(row.get("wall_seconds", 0.0) or 0.0)
+        step_rows.append(
+            {
+                "recording_index": int(row.get("recording_index", 0) or 0),
+                "recording_count": int(row.get("recording_count", 0) or 0),
+                "recording_file": row.get("recording_file", ""),
+                "recording_name": row.get("recording_name", ""),
+                "status": row.get("status", ""),
+                "metric": "recording_wall_time",
+                "label": "Recording wall time",
+                "seconds": wall_seconds,
+                "formatted": _format_elapsed(wall_seconds),
+                "percent_of_recording_wall": 100.0 if wall_seconds > 0.0 else 0.0,
+            }
+        )
+        for label, key in TIMING_STEP_ROWS:
+            seconds = float(row.get(f"{key}_seconds", 0.0) or 0.0)
+            step_rows.append(
+                {
+                    "recording_index": int(row.get("recording_index", 0) or 0),
+                    "recording_count": int(row.get("recording_count", 0) or 0),
+                    "recording_file": row.get("recording_file", ""),
+                    "recording_name": row.get("recording_name", ""),
+                    "status": row.get("status", ""),
+                    "metric": key,
+                    "label": label.strip(),
+                    "seconds": seconds,
+                    "formatted": _format_elapsed(seconds),
+                    "percent_of_recording_wall": (
+                        float(seconds / wall_seconds * 100.0)
+                        if wall_seconds > 0.0
+                        else 0.0
+                    ),
+                }
+            )
+    _write_csv_rows(run_output_dir / "per_recording_timing_steps.csv", step_rows)
+    (run_output_dir / "per_recording_timing_steps.json").write_text(
+        json.dumps(_jsonable_rows(step_rows), indent=2),
+        encoding="utf-8",
+    )
 
 
 def _recording_timing_row(
@@ -2681,27 +2733,10 @@ def _recording_timing_row(
         "pairs_processed": "" if pairs_processed is None else int(pairs_processed),
         "pairs_total": "" if pairs_total is None else int(pairs_total),
     }
-    for key in (
-        "resume_skip_complete_recording",
-        "load_recording",
-        "bandpass_setup",
-        "preview_plots",
-        "detection_total",
-        "detection_trace_read",
-        "detection_thresholding",
-        "detection_npz_write",
-        "detection_minute_npz_write",
-        "detection_hourly_npz_write",
-        "detection_minute_finalize",
-        "detection_hourly_finalize",
-        "detection_plot_write",
-        "detection_resume_reuse",
-        "detection_gc",
-        "recording_minute_summary_write",
-        "pair_minute_hourly_summary_write",
-        "recording_summary_write",
-    ):
-        row[f"{key}_seconds"] = _timing_delta(timing_after, timing_before, key)
+    for _, key in TIMING_STEP_ROWS:
+        seconds = _timing_delta(timing_after, timing_before, key)
+        row[f"{key}_seconds"] = seconds
+        row[f"{key}_time"] = _format_elapsed(seconds)
     return row
 
 
