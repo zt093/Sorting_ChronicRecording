@@ -4,19 +4,16 @@ from __future__ import annotations
 Automatic unit alignment/export pipeline.
 
 This script combines the non-interactive parts of Alignment_html.py and
-Alignment_days.py:
+Alignment_days.py. It supports two input modes:
 
-1. For each input daily `*_Sorting` folder, load the raw analyzer outputs from
-   Combined_NWB+Sorting+Analyze.py, apply the same automatic discard/merge/align
-   thresholds used by Alignment_html.py, and export the same per-page and
-   all-shank summary bundle into `units_alignment_summary_auto`.
-2. If more than one day is present, load those per-day auto exports, apply the
-   same cross-day alignment logic used by Alignment_days.py, and export the
-   same cross-day summary bundle into `alignment_days_summary_<first>_<last>_auto`.
+1. Raw analyzer mode: daily `*_Sorting` folders are loaded through the original
+   SpikeInterface analyzer path.
+2. Sorting_organize cache mode: `*_Sorting_org` / `unit_feature_cache` outputs
+   from Sorting_organize.py are used for alignment, presentation, LDA, and
+   tuning without reopening analyzers.
 
 There is no manual HTML review server, no browser launch, and existing manual
-alignment manifests are ignored. SpikeInterface/Zarr compatibility handling from
-Alignment_html.py is still used during analyzer loading.
+alignment manifests are ignored.
 """
 
 import argparse
@@ -428,6 +425,13 @@ def prompt_yes_no(prompt_text: str, *, default: bool = False) -> bool:
     return parse_yes_no(input(prompt_text + suffix), default=default)
 
 
+def prompt_int(prompt_text: str, *, default: int) -> int:
+    raw_text = input(f"{prompt_text} [{default}]: ").strip()
+    if not raw_text:
+        return int(default)
+    return int(raw_text)
+
+
 def parse_type1_units_text(raw_text: str | None):
     if raw_text is None:
         return tuning_review.TYPE1_UNITS
@@ -493,7 +497,6 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
         parse_csv_text(args.tuning_normalization_methods)
         or tuning_review.NORMALIZATION_METHODS
     )
-    min_sessions_per_unit = int(args.min_sessions_per_unit)
 
     if args.skip_lda:
         use_baseline_sham_drug = False
@@ -522,6 +525,14 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
             "Auto-confirm the derived baseline/sham/drug intervals after session matching?",
             default=False,
         )
+
+    if args.min_sessions_per_unit is None:
+        min_sessions_per_unit = prompt_int(
+            "Minimum sessions an aligned unit must appear in for LDA and Tuning",
+            default=MIN_SESSIONS_PER_UNIT_AUTO,
+        )
+    else:
+        min_sessions_per_unit = int(args.min_sessions_per_unit)
 
     return PipelineOptions(
         input_roots=selected_roots,
@@ -1111,8 +1122,10 @@ def load_cached_unit_minute_summary(cache_info: dict, unit_id: int):
 def infer_cached_waveform_sample_count(cache_index: dict[str, dict], configured_sample_count: int | None) -> int:
     if configured_sample_count is not None:
         sample_count = html_review.safe_int(configured_sample_count)
-        if sample_count is None or sample_count < 1:
-            raise ValueError("waveform_feature_sample_count must be None or a positive integer.")
+        if sample_count is None or sample_count < 0:
+            raise ValueError("waveform_feature_sample_count must be None or a non-negative integer.")
+        if sample_count == 0:
+            return 0
         return int(sample_count)
 
     for cache_info in cache_index.values():
@@ -1125,6 +1138,14 @@ def infer_cached_waveform_sample_count(cache_index: dict[str, dict], configured_
                 if waveform:
                     return int(len(waveform))
     return 0
+
+
+def first_row_if_dataframe(row_or_table, pd_module):
+    if isinstance(row_or_table, pd_module.DataFrame):
+        if row_or_table.empty:
+            return None
+        return row_or_table.iloc[0]
+    return row_or_table
 
 
 def build_population_vectors_from_organized_cache(
@@ -1235,8 +1256,9 @@ def build_population_vectors_from_organized_cache(
                 source_row = unit_table.loc[minute_row.minute_index] if minute_row.minute_index in unit_table.index else None
                 if source_row is None:
                     continue
-                if hasattr(source_row, "iloc"):
-                    source_row = source_row.iloc[0]
+                source_row = first_row_if_dataframe(source_row, pd)
+                if source_row is None:
+                    continue
                 for feature_type, metric_column in metric_column_by_feature_type.items():
                     full_feature_key = f"{feature_key_prefix}__{feature_type}"
                     if full_feature_key not in feature_index or metric_column not in unit_table.columns:
@@ -1246,8 +1268,9 @@ def build_population_vectors_from_organized_cache(
                     )
                 if waveform_table is not None and int(minute_row.minute_index) in waveform_table.index:
                     waveform_row = waveform_table.loc[int(minute_row.minute_index)]
-                    if hasattr(waveform_row, "iloc"):
-                        waveform_row = waveform_row.iloc[0]
+                    waveform_row = first_row_if_dataframe(waveform_row, pd)
+                    if waveform_row is None:
+                        continue
                     waveform = parse_cached_waveform(waveform_row.get("mean_waveform_uv"))
                     if waveform:
                         waveform_features = lda_review.resample_waveform_vector(
@@ -1777,11 +1800,18 @@ def run_presentation_auto_export(
     }
 
 
+def default_stats_output_base_dir(export_summary_path: Path, name: str) -> Path:
+    return Path(export_summary_path).parent / name
+
+
 def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) -> dict:
     lda_settings = require_lda_settings(options)
     config = lda_review.Config()
     config.data_path = export_summary_path
-    config.output_base_dir = ensure_auto_folder(Path(lda_settings.lda_output_base_dir))
+    if lda_settings.lda_output_base_dir == lda_review.OUTPUT_BASE_DIR:
+        config.output_base_dir = default_stats_output_base_dir(export_summary_path, "LDA_auto")
+    else:
+        config.output_base_dir = ensure_auto_folder(Path(lda_settings.lda_output_base_dir))
     config.lda_mode = lda_settings.lda_mode
     config.single_day_date = lda_settings.lda_single_day_date
     config.min_firing_rate_hz = float(lda_settings.lda_min_firing_rate_hz)
@@ -1960,7 +1990,10 @@ def run_tuning_auto_export(export_summary_path: Path, *, options: PipelineOption
     tuning_settings = require_tuning_settings(options)
     config = tuning_review.Config()
     config.data_path = export_summary_path
-    config.output_base_dir = ensure_auto_folder(Path(tuning_settings.tuning_output_base_dir))
+    if tuning_settings.tuning_output_base_dir == tuning_review.OUTPUT_BASE_DIR:
+        config.output_base_dir = default_stats_output_base_dir(export_summary_path, "Tuning_auto")
+    else:
+        config.output_base_dir = ensure_auto_folder(Path(tuning_settings.tuning_output_base_dir))
     config.min_sessions_per_unit = int(tuning_settings.tuning_min_sessions_per_unit)
     config.min_minutes_per_hour = int(tuning_settings.tuning_min_minutes_per_hour)
     config.bin_size_seconds = float(tuning_settings.tuning_bin_size_seconds)
@@ -1980,6 +2013,7 @@ def run_tuning_auto_export(export_summary_path: Path, *, options: PipelineOption
 
     def cache_load_aligned_minute_data(tuning_config):
         lda_config = tuning_review.build_lda_config(tuning_config)
+        lda_config.waveform_feature_sample_count = 0
         export_path = lda_review.resolve_export_summary_path(tuning_config.data_path)
         tuning_review.log_status(f"Loading alignment export: {export_path}")
         export_payload = lda_review.load_export_summary(export_path)
@@ -2066,6 +2100,15 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
 
     show_progress("Pipeline inputs and configuration are locked in at startup.")
     show_progress(html_review.json.dumps(pipeline_options_payload(options), indent=2))
+    if options.overwrite_auto_exports:
+        show_progress(
+            "Existing per-day and cross-day auto alignment exports will be deleted and recomputed."
+        )
+    else:
+        show_progress(
+            "Existing per-day auto alignment exports will be reused when complete; "
+            "cross-day alignment is recomputed when the selected day range changes."
+        )
     show_progress(f"Discovered {len(day_roots)} day folder(s)")
     for day_root in day_roots:
         show_progress(f"  day: {day_root}")
@@ -2170,6 +2213,11 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
     run_payload = {
         "input_roots": [str(path) for path in selected_roots],
         "input_mode": "sorting_organize_cache" if organized_input else "sorting_analyzer",
+        "reuse_policy": {
+            "reuse_existing_within_day_auto_exports": not bool(options.overwrite_auto_exports),
+            "reuse_existing_cross_day_auto_export": bool(allow_cross_day_reuse),
+            "cross_day_recomputed_when_day_selection_changes": True,
+        },
         "options": pipeline_options_payload(options),
         "day_roots": [str(path) for path in day_roots],
         "common_root": str(common_root),
@@ -2222,8 +2270,14 @@ def main() -> None:
             "instead of reusing complete manifests."
         ),
     )
-    parser.add_argument("--lda-output-base-dir", help="Base folder for LDA auto outputs. Defaults to OUTPUT_BASE_DIR_auto.")
-    parser.add_argument("--tuning-output-base-dir", help="Base folder for Tuning auto outputs. Defaults to OUTPUT_BASE_DIR_auto.")
+    parser.add_argument(
+        "--lda-output-base-dir",
+        help="Base folder for LDA auto outputs. Defaults to LDA_auto beside the alignment export.",
+    )
+    parser.add_argument(
+        "--tuning-output-base-dir",
+        help="Base folder for Tuning auto outputs. Defaults to Tuning_auto beside the alignment export.",
+    )
     parser.add_argument(
         "--presentation-basis",
         choices=["day", "hour", "both"],
@@ -2243,10 +2297,10 @@ def main() -> None:
     parser.add_argument(
         "--min-sessions-per-unit",
         type=int,
-        default=MIN_SESSIONS_PER_UNIT_AUTO,
+        default=None,
         help=(
             "Shared minimum sessions per aligned unit for both LDA and Tuning. "
-            "Defaults to MIN_SESSIONS_PER_UNIT_AUTO at the top of this script."
+            f"If omitted, prompts at startup. Default prompt value: {MIN_SESSIONS_PER_UNIT_AUTO}."
         ),
     )
     parser.add_argument("--lda-min-bins-per-label", type=int, default=lda_review.MIN_BINS_PER_LABEL)
