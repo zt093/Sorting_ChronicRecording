@@ -112,6 +112,7 @@ class PipelineOptions:
     skip_lda: bool = False
     skip_tuning: bool = False
     stop_on_error: bool = False
+    overwrite_auto_exports: bool = False
     lda: LDASettings | None = None
     tuning: TuningSettings | None = None
     presentation: PresentationSettings | None = None
@@ -372,7 +373,12 @@ def patch_day_review_for_auto_roots() -> None:
             "autocorrelogram_similarity_vector",
         }
         if not required_keys.issubset(member_payload.keys()):
-            return _ORIGINAL_DAY_LOAD_MEMBER_SNAPSHOT(member_payload, cache)
+            missing_keys = sorted(required_keys.difference(member_payload.keys()))
+            raise RuntimeError(
+                "Organized-cache cross-day alignment requires enriched per-day export members, "
+                f"but this member is missing: {missing_keys}. Rerun with --overwrite-auto-exports "
+                "so within-day cache exports are regenerated."
+            )
         return {
             "output_folder": str(member_payload.get("output_folder", "") or ""),
             "analyzer_folder": str(member_payload.get("analyzer_folder", "") or ""),
@@ -524,6 +530,7 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
         skip_lda=bool(args.skip_lda),
         skip_tuning=bool(args.skip_tuning),
         stop_on_error=bool(args.stop_on_error),
+        overwrite_auto_exports=bool(args.overwrite_auto_exports),
         lda=LDASettings(
             lda_output_base_dir=Path(args.lda_output_base_dir) if args.lda_output_base_dir else lda_review.OUTPUT_BASE_DIR,
             lda_mode=str(args.lda_mode),
@@ -1056,6 +1063,70 @@ def select_good_unit_groups_from_organized_cache(
     ).reset_index(drop=True)
 
 
+def parse_cached_waveform(value) -> list[float]:
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        values = html_review.json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+    parsed = []
+    for item in values:
+        value_float = html_review.safe_float(item)
+        if value_float is not None:
+            parsed.append(float(value_float))
+    return parsed
+
+
+def load_cached_unit_minute_summary(cache_info: dict, unit_id: int):
+    pd = lda_review.pd
+    cache_folder = Path(cache_info["cache_folder"])
+    index_path = cache_folder / "sorted_unit_feature_outputs" / "sorted_unit_feature_output_index.json"
+    if index_path.is_file():
+        try:
+            payload = load_json_file(index_path)
+            for unit_record in payload.get("units", []) or []:
+                if html_review.safe_int(unit_record.get("unit_id")) == int(unit_id):
+                    minute_csv = Path(str(unit_record.get("minute_summary_csv") or ""))
+                    if minute_csv.is_file():
+                        return pd.read_csv(minute_csv)
+        except Exception:
+            pass
+
+    matches = sorted(
+        (cache_folder / "sorted_unit_feature_outputs").glob(
+            f"sgch*_unit{int(unit_id)}/*_unit{int(unit_id)}_minute_summary.csv"
+        )
+    )
+    if matches:
+        return pd.read_csv(matches[0])
+    return None
+
+
+def infer_cached_waveform_sample_count(cache_index: dict[str, dict], configured_sample_count: int | None) -> int:
+    if configured_sample_count is not None:
+        sample_count = html_review.safe_int(configured_sample_count)
+        if sample_count is None or sample_count < 1:
+            raise ValueError("waveform_feature_sample_count must be None or a positive integer.")
+        return int(sample_count)
+
+    for cache_info in cache_index.values():
+        for unit_id in sorted(cache_info.get("unit_ids") or []):
+            unit_minutes = load_cached_unit_minute_summary(cache_info, int(unit_id))
+            if unit_minutes is None or "mean_waveform_uv" not in unit_minutes.columns:
+                continue
+            for raw_value in unit_minutes["mean_waveform_uv"].dropna().tolist():
+                waveform = parse_cached_waveform(raw_value)
+                if waveform:
+                    return int(len(waveform))
+    return 0
+
+
 def build_population_vectors_from_organized_cache(
     *,
     selected_units,
@@ -1065,7 +1136,19 @@ def build_population_vectors_from_organized_cache(
 ):
     np = lda_review.np
     pd = lda_review.pd
-    feature_table = lda_review.build_feature_table(selected_units, waveform_sample_count=0)
+    waveform_sample_count = infer_cached_waveform_sample_count(
+        cache_index,
+        getattr(config, "waveform_feature_sample_count", None),
+    )
+    if waveform_sample_count > 0:
+        lda_review.log_status(
+            f"Adding {waveform_sample_count} cached mean-waveform sample feature(s) "
+            "per aligned unit group."
+        )
+    feature_table = lda_review.build_feature_table(
+        selected_units,
+        waveform_sample_count=waveform_sample_count,
+    )
     feature_keys = feature_table["feature_key"].astype(str).tolist()
     feature_index = {key: index for index, key in enumerate(feature_keys)}
     members_by_session = {
@@ -1121,6 +1204,7 @@ def build_population_vectors_from_organized_cache(
             for unit_id, table in minute_stats.groupby("unit_id", sort=False)
             if lda_review.safe_int(unit_id) is not None
         }
+        unit_waveform_rows_by_id = {}
         session_units = members_by_session.get(session_key, pd.DataFrame())
         for member_row in session_units.itertuples(index=False):
             unit_id = int(member_row.unit_id)
@@ -1128,6 +1212,24 @@ def build_population_vectors_from_organized_cache(
             if unit_table is None or unit_table.empty:
                 continue
             unit_table = unit_table.set_index("minute_index", drop=False)
+            waveform_table = None
+            if waveform_sample_count > 0:
+                if unit_id not in unit_waveform_rows_by_id:
+                    cached_waveforms = load_cached_unit_minute_summary(cache_info, unit_id)
+                    if cached_waveforms is not None and not cached_waveforms.empty:
+                        cached_waveforms["minute_index"] = pd.to_numeric(
+                            cached_waveforms["minute_index"],
+                            errors="coerce",
+                        )
+                        cached_waveforms = cached_waveforms.dropna(subset=["minute_index"])
+                        cached_waveforms["minute_index"] = cached_waveforms["minute_index"].astype(int)
+                        unit_waveform_rows_by_id[unit_id] = cached_waveforms.set_index(
+                            "minute_index",
+                            drop=False,
+                        )
+                    else:
+                        unit_waveform_rows_by_id[unit_id] = None
+                waveform_table = unit_waveform_rows_by_id.get(unit_id)
             feature_key_prefix = str(member_row.final_group_key)
             for minute_position, minute_row in enumerate(minute_rows.itertuples(index=False)):
                 source_row = unit_table.loc[minute_row.minute_index] if minute_row.minute_index in unit_table.index else None
@@ -1142,6 +1244,25 @@ def build_population_vectors_from_organized_cache(
                     session_matrix[minute_position, feature_index[full_feature_key]] = lda_review.safe_float(
                         source_row.get(metric_column)
                     )
+                if waveform_table is not None and int(minute_row.minute_index) in waveform_table.index:
+                    waveform_row = waveform_table.loc[int(minute_row.minute_index)]
+                    if hasattr(waveform_row, "iloc"):
+                        waveform_row = waveform_row.iloc[0]
+                    waveform = parse_cached_waveform(waveform_row.get("mean_waveform_uv"))
+                    if waveform:
+                        waveform_features = lda_review.resample_waveform_vector(
+                            lda_review.np.asarray(waveform, dtype=float),
+                            waveform_sample_count,
+                        )
+                        for waveform_sample_index, waveform_value in enumerate(waveform_features):
+                            waveform_feature_key = (
+                                f"{feature_key_prefix}__mean_waveform_uv_s{waveform_sample_index:03d}"
+                            )
+                            if waveform_feature_key in feature_index:
+                                session_matrix[
+                                    minute_position,
+                                    feature_index[waveform_feature_key],
+                                ] = waveform_value
 
         session_start_datetime = session_row.session_start_datetime
         for bin_index, minute_row in enumerate(minute_rows.itertuples(index=False)):
@@ -1193,6 +1314,75 @@ def build_population_vectors_from_organized_cache(
     return population_matrix, metadata_table, feature_table
 
 
+def load_cache_metadata(cache_info: dict) -> dict:
+    metadata_path = Path(cache_info.get("metadata_path", ""))
+    if not metadata_path.is_file():
+        return {}
+    try:
+        return load_json_file(metadata_path)
+    except Exception:
+        return {}
+
+
+def build_quality_metrics_from_organized_export(
+    export_summary_path: Path,
+    *,
+    cache_index: dict[str, dict],
+):
+    pd = presentation_review.pd
+    payload = load_json_file(export_summary_path)
+    rows: list[dict] = []
+    for group_row in payload.get("cross_session_alignment_groups", []) or []:
+        final_group_key = str(group_row.get("final_group_key", "") or "")
+        final_unit_id = html_review.safe_int(group_row.get("final_unit_id"))
+        shank_id = html_review.safe_int(group_row.get("shank_id"))
+        members = group_row.get("source_members") or group_row.get("members") or []
+        unique_session_count = len(
+            {
+                str(member.get("session_name", "") or "").strip()
+                for member in members
+                if str(member.get("session_name", "") or "").strip()
+            }
+        )
+        for member in members:
+            output_folder = str(member.get("output_folder", "") or "").strip()
+            cache_info = resolve_cache_for_output_folder(cache_index, output_folder)
+            metadata = load_cache_metadata(cache_info) if cache_info is not None else {}
+            session_duration_s = html_review.safe_float(metadata.get("session_duration_seconds"))
+            num_spikes = html_review.safe_float(member.get("num_spikes"))
+            firing_rate = html_review.safe_float(member.get("firing_rate"))
+            amplitude_median = html_review.safe_float(member.get("amplitude_median"))
+            rows.append(
+                {
+                    "final_group_key": final_group_key,
+                    "final_unit_id": final_unit_id,
+                    "shank_id": shank_id or html_review.safe_int(member.get("shank_id")),
+                    "session_name": str(member.get("session_name", "") or ""),
+                    "session_index": html_review.safe_int(member.get("session_index")),
+                    "unit_id": html_review.safe_int(member.get("unit_id")),
+                    "num_sessions": int(unique_session_count),
+                    "amplitude_median": amplitude_median,
+                    "amplitude_median_abs": abs(amplitude_median) if amplitude_median is not None else None,
+                    "firing_rate_full_session": firing_rate,
+                    "firing_rate_active_window": firing_rate,
+                    "isi_violations_ratio": html_review.safe_float(member.get("isi_violations_ratio")),
+                    "snr": html_review.safe_float(member.get("snr")),
+                    "num_spikes": num_spikes,
+                    "session_duration_s": session_duration_s,
+                    "active_window_start_s": 0.0 if session_duration_s is not None else None,
+                    "active_window_end_s": session_duration_s,
+                    "active_duration_s": session_duration_s,
+                    "active_fraction_of_session": 1.0 if session_duration_s is not None else None,
+                    "quality_source": "Sorting_organize.py",
+                }
+            )
+    quality_df = pd.DataFrame(rows)
+    presentation_review.log_status(
+        f"Loaded organized-cache quality-metric rows: {len(quality_df)}"
+    )
+    return quality_df
+
+
 def existing_day_auto_export_paths(day_root: Path) -> tuple[Path, Path, list[Path]]:
     summary_root = Path(day_root) / AUTO_DAY_EXPORT_FOLDER_NAME
     summary_manifest = summary_root / "export_summary.json"
@@ -1207,6 +1397,34 @@ def existing_cross_day_auto_export_paths(common_root: Path, summary_folder_name:
     summary_manifest = summary_root / "export_summary.json"
     page_manifest_paths = sorted(summary_root.glob("sh*/export_summary_sg_*.json"))
     return summary_root, summary_manifest, page_manifest_paths
+
+
+def remove_dir_if_exists(path: Path, *, label: str) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise NotADirectoryError(f"Cannot overwrite {label}; path is not a directory: {path}")
+    show_progress(f"Removing existing {label}: {path}")
+    html_review.shutil.rmtree(path)
+
+
+def remove_within_day_auto_exports(day_root: Path) -> None:
+    summary_root, _summary_manifest, _page_manifest_paths = existing_day_auto_export_paths(day_root)
+    remove_dir_if_exists(summary_root, label="within-day auto summary")
+    for shank_folder in sorted(Path(day_root).glob("sh*")):
+        if not shank_folder.is_dir():
+            continue
+        page_summary_root = shank_folder / AUTO_DAY_EXPORT_FOLDER_NAME
+        remove_dir_if_exists(page_summary_root, label="within-day per-page auto summary")
+
+
+def remove_cross_day_auto_exports(common_root: Path, summary_folder_name: str) -> None:
+    summary_root, _summary_manifest, _page_manifest_paths = existing_cross_day_auto_export_paths(
+        common_root,
+        summary_folder_name,
+    )
+    remove_dir_if_exists(summary_root, label="cross-day auto summary")
 
 
 def selected_day_folders_match(selection_file: Path, day_roots: list[Path]) -> bool:
@@ -1303,44 +1521,55 @@ def pipeline_options_payload(options: PipelineOptions) -> dict:
         "skip_lda": bool(options.skip_lda),
         "skip_tuning": bool(options.skip_tuning),
         "stop_on_error": bool(options.stop_on_error),
+        "overwrite_auto_exports": bool(options.overwrite_auto_exports),
         "lda_settings": lda_payload,
         "tuning_settings": settings_payload(tuning_settings),
         "presentation_settings": settings_payload(presentation_settings),
     }
 
 
-def run_single_day_auto_export(day_root: Path, *, organized_input: bool = False) -> dict:
+def run_single_day_auto_export(
+    day_root: Path,
+    *,
+    organized_input: bool = False,
+    overwrite: bool = False,
+) -> dict:
+    if overwrite:
+        remove_within_day_auto_exports(day_root)
     summary_root, summary_manifest, page_manifest_paths = existing_day_auto_export_paths(day_root)
-    try:
-        page_export, reused_payload = build_reused_export_payload(
-            summary_root=summary_root,
-            summary_manifest=summary_manifest,
-            page_manifest_paths=page_manifest_paths,
-            label=f"within-day {day_root.name}",
-        )
-    except Exception as exc:
-        show_progress(f"No reusable within-day auto export for {day_root.name}: {exc}")
-    else:
-        if organized_input:
-            enrich_organized_export_members(
-                OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
+    if not overwrite:
+        try:
+            page_export, reused_payload = build_reused_export_payload(
+                summary_root=summary_root,
+                summary_manifest=summary_manifest,
+                page_manifest_paths=page_manifest_paths,
+                label=f"within-day {day_root.name}",
             )
-            page_manifest_paths = existing_day_auto_export_paths(day_root)[2]
-            page_export = build_existing_page_export(page_manifest_paths)
-            reused_payload["summary_export"] = export_result_from_manifest(summary_manifest)
-        payload = {
-            "status": "reused",
-            "day_root": str(day_root),
-            "summary_root": str(summary_root),
-            "num_sessions": None,
-            "num_pages_exported": page_export.get("num_pages_exported", 0),
-            "page_export": page_export,
-            **reused_payload,
-        }
-        show_progress(
-            f"Reusing existing within-day auto export: {day_root.name} -> {summary_root}"
-        )
-        return payload
+        except Exception as exc:
+            show_progress(f"No reusable within-day auto export for {day_root.name}: {exc}")
+        else:
+            if organized_input:
+                enrich_organized_export_members(
+                    OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
+                )
+                page_manifest_paths = existing_day_auto_export_paths(day_root)[2]
+                page_export = build_existing_page_export(page_manifest_paths)
+                reused_payload["summary_export"] = export_result_from_manifest(summary_manifest)
+            payload = {
+                "status": "reused",
+                "day_root": str(day_root),
+                "summary_root": str(summary_root),
+                "num_sessions": None,
+                "num_pages_exported": page_export.get("num_pages_exported", 0),
+                "page_export": page_export,
+                **reused_payload,
+            }
+            show_progress(
+                f"Reusing existing within-day auto export: {day_root.name} -> {summary_root}"
+            )
+            return payload
+    else:
+        show_progress(f"Overwrite requested; recomputing within-day auto export for {day_root.name}.")
 
     if organized_input:
         show_progress(f"Preparing within-day auto alignment from organized cache: {day_root}")
@@ -1470,9 +1699,20 @@ def run_presentation_auto_export(
     )
     all_plot_paths: list[Path] = [session_summary_csv, session_summary_json]
     manifest_runs: list[dict] = []
-    quality_df = presentation_review.base_presentations.load_quality_metrics_from_export_summary(
-        export_summary_path
+    cache_index = (
+        build_organized_cache_index(options.input_roots)
+        if looks_like_organized_input(options.input_roots)
+        else {}
     )
+    if cache_index:
+        quality_df = build_quality_metrics_from_organized_export(
+            export_summary_path,
+            cache_index=cache_index,
+        )
+    else:
+        quality_df = presentation_review.base_presentations.load_quality_metrics_from_export_summary(
+            export_summary_path
+        )
 
     for basis in bases:
         output_dir = presentation_review.basis_output_dir(
@@ -1574,12 +1814,6 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
         if looks_like_organized_input(options.input_roots)
         else {}
     )
-    if cache_index and any(str(mode).strip().upper() == "WAVEFORM_ONLY" for mode in config.feature_modes):
-        config.feature_modes = tuple(
-            mode
-            for mode in config.feature_modes
-            if str(mode).strip().upper() != "WAVEFORM_ONLY"
-        ) or ("FR_ONLY",)
     original_load_session_analyzers = lda_review.load_session_analyzers
     original_select_good_unit_groups = lda_review.select_good_unit_groups
     original_build_population_vectors = lda_review.build_population_vectors
@@ -1840,7 +2074,11 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
     with timed_stage("within-day auto alignment exports", timings):
         for day_root in day_roots:
             day_results.append(
-                run_single_day_auto_export(day_root, organized_input=organized_input)
+                run_single_day_auto_export(
+                    day_root,
+                    organized_input=organized_input,
+                    overwrite=options.overwrite_auto_exports,
+                )
             )
 
     selected_days_match_existing_cross_export = selected_day_folders_match(
@@ -1848,7 +2086,18 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
         day_roots,
     )
     all_days_reused = all(result.get("status") == "reused" for result in day_results)
-    allow_cross_day_reuse = bool(all_days_reused and selected_days_match_existing_cross_export)
+    allow_cross_day_reuse = bool(
+        all_days_reused
+        and selected_days_match_existing_cross_export
+        and not options.overwrite_auto_exports
+        and not organized_input
+    )
+    if (
+        (options.overwrite_auto_exports or organized_input)
+        and len(day_roots) > 1
+        and not options.skip_cross_day
+    ):
+        remove_cross_day_auto_exports(common_root, day_summary_folder_name)
     selection_file = write_selected_day_folders(common_root, day_summary_folder_name, day_roots)
     cross_day_result = None
     stats_export_summary_path: Path | None = None
@@ -1965,6 +2214,14 @@ def main() -> None:
     parser.add_argument("--skip-lda", action="store_true", help="Skip LDA.py outputs.")
     parser.add_argument("--skip-tuning", action="store_true", help="Skip Tuning.py outputs.")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop when a downstream stats stage fails.")
+    parser.add_argument(
+        "--overwrite-auto-exports",
+        action="store_true",
+        help=(
+            "Delete and recompute existing within-day and cross-day auto alignment exports "
+            "instead of reusing complete manifests."
+        ),
+    )
     parser.add_argument("--lda-output-base-dir", help="Base folder for LDA auto outputs. Defaults to OUTPUT_BASE_DIR_auto.")
     parser.add_argument("--tuning-output-base-dir", help="Base folder for Tuning auto outputs. Defaults to OUTPUT_BASE_DIR_auto.")
     parser.add_argument(
