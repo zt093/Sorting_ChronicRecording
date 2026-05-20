@@ -47,6 +47,8 @@ import Tuning as tuning_review
 import presentation_multiple as presentation_review
 
 
+_ORIGINAL_DAY_LOAD_MEMBER_SNAPSHOT = day_review.load_member_snapshot
+
 AUTO_DAY_EXPORT_FOLDER_NAME = "units_alignment_summary_auto"
 AUTO_DAY_SUMMARY_SUFFIX = "_auto"
 AUTO_STATS_SUFFIX = "_auto"
@@ -360,6 +362,42 @@ def patch_day_review_for_auto_roots() -> None:
     day_review.discover_day_sorting_roots = (
         lambda input_roots: discover_day_roots_for_mode(input_roots, organized_input=True)
     )
+
+    def load_member_snapshot_from_organized_payload(member_payload: dict, cache: dict[str, dict]) -> dict:
+        required_keys = {
+            "shank_id",
+            "local_channel_on_shank",
+            "sg_channel",
+            "waveform_similarity_vector",
+            "autocorrelogram_similarity_vector",
+        }
+        if not required_keys.issubset(member_payload.keys()):
+            return _ORIGINAL_DAY_LOAD_MEMBER_SNAPSHOT(member_payload, cache)
+        return {
+            "output_folder": str(member_payload.get("output_folder", "") or ""),
+            "analyzer_folder": str(member_payload.get("analyzer_folder", "") or ""),
+            "unit_id": int(member_payload["unit_id"]),
+            "shank_id": int(member_payload["shank_id"]),
+            "local_channel_on_shank": int(member_payload["local_channel_on_shank"]),
+            "sg_channel": int(member_payload["sg_channel"]),
+            "amplitude_median": html_review.safe_float(member_payload.get("amplitude_median")),
+            "firing_rate": html_review.safe_float(member_payload.get("firing_rate")),
+            "isi_violations_ratio": html_review.safe_float(member_payload.get("isi_violations_ratio")),
+            "snr": html_review.safe_float(member_payload.get("snr")),
+            "num_spikes": html_review.safe_int(member_payload.get("num_spikes")),
+            "waveform_similarity_vector": list(
+                member_payload.get("waveform_similarity_vector") or [0.0]
+            ),
+            "autocorrelogram_similarity_vector": list(
+                member_payload.get("autocorrelogram_similarity_vector") or [0.0]
+            ),
+            "trough_to_peak_duration_ms": html_review.safe_float(
+                member_payload.get("trough_to_peak_duration_ms")
+            ),
+            "waveform_image_path": str(member_payload.get("waveform_image_path", "") or ""),
+        }
+
+    day_review.load_member_snapshot = load_member_snapshot_from_organized_payload
 
 
 def parse_csv_text(raw_text: str | None) -> tuple[str, ...]:
@@ -825,6 +863,336 @@ def load_all_sessions_from_organized_caches(
     return sessions, pages_by_shank, cache_folder, load_reports
 
 
+def unit_lookup_keys(unit) -> list[str]:
+    return [
+        f"output::{unit.output_folder}::{int(unit.unit_id)}",
+        f"session::{unit.session_name}::{int(unit.session_index)}::{int(unit.unit_id)}",
+        f"session::{unit.session_name}::{int(unit.unit_id)}",
+    ]
+
+
+def organized_member_payload_from_unit(unit) -> dict:
+    return {
+        "session_name": unit.session_name,
+        "session_index": int(unit.session_index),
+        "unit_id": int(unit.unit_id),
+        "merge_group": unit.merge_group,
+        "align_group": unit.align_group,
+        "output_folder": unit.output_folder,
+        "analyzer_folder": unit.analyzer_folder,
+        "shank_id": int(unit.shank_id),
+        "local_channel_on_shank": int(unit.local_channel_on_shank),
+        "sg_channel": int(unit.sg_channel),
+        "amplitude_median": unit.amplitude_median,
+        "firing_rate": unit.firing_rate,
+        "isi_violations_ratio": unit.isi_violations_ratio,
+        "snr": unit.snr,
+        "num_spikes": unit.num_spikes,
+        "waveform_similarity_vector": list(unit.waveform_similarity_vector or [0.0]),
+        "autocorrelogram_similarity_vector": list(
+            unit.autocorrelogram_similarity_vector or [0.0]
+        ),
+        "trough_to_peak_duration_ms": unit.trough_to_peak_duration_ms,
+        "waveform_image_path": unit.waveform_image_path,
+        "member_source": "Sorting_organize.py",
+    }
+
+
+def enrich_organized_export_members(state: OrganizedAutoAlignmentState) -> None:
+    unit_lookup: dict[str, dict] = {}
+    for unit in state._iter_all_units():
+        payload = organized_member_payload_from_unit(unit)
+        for key in unit_lookup_keys(unit):
+            unit_lookup[key] = payload
+
+    manifest_paths = [state.summary_root / "export_summary.json"]
+    manifest_paths.extend(
+        sorted(Path(state.root_folder).glob(f"sh*/{AUTO_DAY_EXPORT_FOLDER_NAME}/export_summary_sg_*.json"))
+    )
+    for manifest_path in manifest_paths:
+        if not manifest_path.is_file():
+            continue
+        payload = load_json_file(manifest_path)
+        changed = False
+        for group in payload.get("cross_session_alignment_groups", []):
+            enriched_members = []
+            for member in group.get("members", []):
+                member_payload = dict(member)
+                lookup_candidates = [
+                    f"output::{member_payload.get('output_folder', '')}::{html_review.safe_int(member_payload.get('unit_id'))}",
+                    (
+                        f"session::{member_payload.get('session_name', '')}::"
+                        f"{html_review.safe_int(member_payload.get('session_index'))}::"
+                        f"{html_review.safe_int(member_payload.get('unit_id'))}"
+                    ),
+                    f"session::{member_payload.get('session_name', '')}::{html_review.safe_int(member_payload.get('unit_id'))}",
+                ]
+                for key in lookup_candidates:
+                    enriched = unit_lookup.get(key)
+                    if enriched is not None:
+                        member_payload.update(enriched)
+                        changed = True
+                        break
+                enriched_members.append(member_payload)
+            group["members"] = enriched_members
+        if changed:
+            write_json(manifest_path, payload)
+
+
+def build_organized_cache_index(input_roots: list[Path]) -> dict[str, dict]:
+    cache_index: dict[str, dict] = {}
+    cache_folders: list[Path] = []
+    for input_root in input_roots:
+        cache_folders.extend(discover_organized_cache_folders(input_root))
+    for cache_folder in sorted({path.resolve() for path in cache_folders}):
+        payload = load_organized_unit_summary(cache_folder)
+        units_payload = list(payload.get("units") or [])
+        unit_ids: set[int] = set()
+        output_folder = ""
+        analyzer_folder = ""
+        for unit_payload in units_payload:
+            unit_id = html_review.safe_int(unit_payload.get("unit_id"))
+            if unit_id is not None:
+                unit_ids.add(int(unit_id))
+            if not output_folder:
+                output_folder = str(unit_payload.get("output_folder") or payload.get("output_folder") or "")
+            if not analyzer_folder:
+                analyzer_folder = str(unit_payload.get("analyzer_folder") or payload.get("analyzer_folder") or "")
+        if output_folder:
+            cache_index[str(Path(output_folder).resolve())] = {
+                "cache_folder": cache_folder,
+                "unit_ids": unit_ids,
+                "unit_summary": payload,
+                "minute_stats_path": cache_folder / "unit_minute_stats.csv",
+                "metadata_path": cache_folder / "cache_metadata.json",
+                "analyzer_folder": analyzer_folder,
+            }
+    return cache_index
+
+
+def resolve_cache_for_output_folder(cache_index: dict[str, dict], output_folder: str) -> dict | None:
+    if not output_folder:
+        return None
+    candidates = [str(output_folder)]
+    try:
+        candidates.append(str(Path(output_folder).resolve()))
+    except Exception:
+        pass
+    for candidate in candidates:
+        cache_info = cache_index.get(candidate)
+        if cache_info is not None:
+            return cache_info
+    lowered = {str(key).lower(): value for key, value in cache_index.items()}
+    for candidate in candidates:
+        cache_info = lowered.get(str(candidate).lower())
+        if cache_info is not None:
+            return cache_info
+    return None
+
+
+def select_good_unit_groups_from_organized_cache(
+    *,
+    export_payload: dict,
+    config,
+    cache_index: dict[str, dict],
+):
+    pd = lda_review.pd
+    selected_rows: list[dict] = []
+    group_rows = export_payload.get("cross_session_alignment_groups", [])
+    for group_row in group_rows:
+        final_group_key = str(group_row.get("final_group_key", "")).strip()
+        final_unit_id = lda_review.safe_int(group_row.get("final_unit_id"))
+        valid_members: list[dict] = []
+        for member in lda_review.iter_group_members(group_row):
+            output_folder = str(member.get("output_folder", "") or "").strip()
+            session_name = str(member.get("session_name", "") or "").strip()
+            unit_id = lda_review.safe_int(member.get("unit_id"))
+            if not output_folder or not session_name or unit_id is None:
+                continue
+            cache_info = resolve_cache_for_output_folder(cache_index, output_folder)
+            if cache_info is None or int(unit_id) not in cache_info["unit_ids"]:
+                continue
+            valid_members.append(
+                {
+                    "session_key": output_folder,
+                    "final_group_key": final_group_key,
+                    "final_unit_id": final_unit_id,
+                    "session_name": session_name,
+                    "session_index": lda_review.safe_int(member.get("session_index")),
+                    "unit_id": int(unit_id),
+                    "output_folder": output_folder,
+                    "shank_id": lda_review.safe_int(group_row.get("shank_id")),
+                    "local_channel_on_shank": lda_review.safe_int(
+                        group_row.get("local_channel_on_shank")
+                    ),
+                }
+            )
+
+        deduped_members: list[dict] = []
+        seen_session_keys: set[str] = set()
+        for row in valid_members:
+            session_key = str(row["session_key"])
+            if session_key in seen_session_keys:
+                continue
+            seen_session_keys.add(session_key)
+            deduped_members.append(row)
+        if len(deduped_members) < int(config.min_sessions_per_unit):
+            continue
+        for row in deduped_members:
+            row["group_presence_count"] = int(len(deduped_members))
+            row["min_sessions_per_unit"] = int(config.min_sessions_per_unit)
+            row["selection_mode"] = "organized_cache_unique_sessions"
+        selected_rows.extend(deduped_members)
+
+    selected_table = pd.DataFrame(selected_rows)
+    if selected_table.empty:
+        raise RuntimeError(
+            "No aligned unit groups passed the organized-cache selection criteria. "
+            "Try lowering MIN_SESSIONS_PER_UNIT or verify the cache folders match the alignment export."
+        )
+    return selected_table.sort_values(
+        ["final_unit_id", "session_index", "unit_id"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def build_population_vectors_from_organized_cache(
+    *,
+    selected_units,
+    session_table,
+    cache_index: dict[str, dict],
+    config,
+):
+    np = lda_review.np
+    pd = lda_review.pd
+    feature_table = lda_review.build_feature_table(selected_units, waveform_sample_count=0)
+    feature_keys = feature_table["feature_key"].astype(str).tolist()
+    feature_index = {key: index for index, key in enumerate(feature_keys)}
+    members_by_session = {
+        session_key: table.copy()
+        for session_key, table in selected_units.groupby("session_key", sort=False)
+    }
+
+    samples: list[np.ndarray] = []
+    metadata_rows: list[dict] = []
+    total_sessions = len(session_table)
+    metric_column_by_feature_type = {
+        "firing_rate_hz": "firing_rate_hz",
+        "average_amplitude_uv": "amplitude_mean_abs",
+        "cv2": "cv2",
+        "peak_to_trough_ms": "peak_to_trough_ms",
+    }
+
+    for session_position, session_row in enumerate(session_table.itertuples(index=False), start=1):
+        session_key = str(session_row.session_key)
+        session_name = str(session_row.session_name)
+        lda_review.log_status(
+            f"Loading organized minute stats for session {session_position} / "
+            f"{total_sessions}: {session_name}"
+        )
+        cache_info = resolve_cache_for_output_folder(cache_index, session_key)
+        if cache_info is None:
+            lda_review.log_status(f"Skipping {session_name}: no organized cache found.")
+            continue
+        minute_stats_path = Path(cache_info["minute_stats_path"])
+        if not minute_stats_path.is_file():
+            lda_review.log_status(f"Skipping {session_name}: missing {minute_stats_path}")
+            continue
+        minute_stats = pd.read_csv(minute_stats_path)
+        if minute_stats.empty:
+            continue
+        minute_stats["unit_id"] = pd.to_numeric(minute_stats["unit_id"], errors="coerce")
+        minute_stats["minute_index"] = pd.to_numeric(minute_stats["minute_index"], errors="coerce")
+        minute_stats["start_sec"] = pd.to_numeric(minute_stats["start_sec"], errors="coerce")
+        minute_stats["end_sec"] = pd.to_numeric(minute_stats["end_sec"], errors="coerce")
+        minute_stats = minute_stats.dropna(subset=["minute_index", "start_sec", "end_sec"])
+        if minute_stats.empty:
+            continue
+
+        minute_rows = (
+            minute_stats[["minute_index", "start_sec", "end_sec"]]
+            .drop_duplicates()
+            .sort_values("minute_index")
+            .reset_index(drop=True)
+        )
+        session_matrix = np.full((len(minute_rows), len(feature_keys)), np.nan, dtype=float)
+        unit_rows_by_id = {
+            int(unit_id): table.copy()
+            for unit_id, table in minute_stats.groupby("unit_id", sort=False)
+            if lda_review.safe_int(unit_id) is not None
+        }
+        session_units = members_by_session.get(session_key, pd.DataFrame())
+        for member_row in session_units.itertuples(index=False):
+            unit_id = int(member_row.unit_id)
+            unit_table = unit_rows_by_id.get(unit_id)
+            if unit_table is None or unit_table.empty:
+                continue
+            unit_table = unit_table.set_index("minute_index", drop=False)
+            feature_key_prefix = str(member_row.final_group_key)
+            for minute_position, minute_row in enumerate(minute_rows.itertuples(index=False)):
+                source_row = unit_table.loc[minute_row.minute_index] if minute_row.minute_index in unit_table.index else None
+                if source_row is None:
+                    continue
+                if hasattr(source_row, "iloc"):
+                    source_row = source_row.iloc[0]
+                for feature_type, metric_column in metric_column_by_feature_type.items():
+                    full_feature_key = f"{feature_key_prefix}__{feature_type}"
+                    if full_feature_key not in feature_index or metric_column not in unit_table.columns:
+                        continue
+                    session_matrix[minute_position, feature_index[full_feature_key]] = lda_review.safe_float(
+                        source_row.get(metric_column)
+                    )
+
+        session_start_datetime = session_row.session_start_datetime
+        for bin_index, minute_row in enumerate(minute_rows.itertuples(index=False)):
+            bin_start_sec = float(minute_row.start_sec)
+            bin_end_sec = float(minute_row.end_sec)
+            bin_center_s = bin_start_sec + (bin_end_sec - bin_start_sec) / 2.0
+            bin_start_datetime = session_start_datetime + lda_review.timedelta(seconds=bin_start_sec)
+            bin_end_datetime = session_start_datetime + lda_review.timedelta(seconds=bin_end_sec)
+            samples.append(session_matrix[bin_index])
+            metadata_rows.append(
+                {
+                    "session_id": int(session_row.session_id),
+                    "session_key": session_key,
+                    "session_name": session_name,
+                    "session_name_normalized": str(session_row.session_name_normalized),
+                    "session_index": lda_review.safe_int(session_row.session_index),
+                    "session_start_datetime": session_start_datetime.isoformat(sep=" "),
+                    "minute_bin_index": int(minute_row.minute_index),
+                    "minute_start_sec": bin_start_sec,
+                    "minute_end_sec": bin_end_sec,
+                    "minute_center_s": float(bin_center_s),
+                    "session_duration_s": float(max(minute_rows["end_sec"])),
+                    "minute_start_datetime": bin_start_datetime.isoformat(sep=" "),
+                    "minute_end_datetime": bin_end_datetime.isoformat(sep=" "),
+                    "clock_hour_of_day": int(bin_start_datetime.hour),
+                    "clock_minute_of_hour": int(bin_start_datetime.minute),
+                    "calendar_day": bin_start_datetime.date().isoformat(),
+                }
+            )
+
+    if not samples:
+        raise RuntimeError("No organized-cache population vectors were created.")
+    population_matrix = np.vstack(samples)
+    metadata_table = pd.DataFrame(metadata_rows)
+    if getattr(config, "apply_smoothing", False):
+        smoothable_feature_mask = (
+            feature_table["feature_type"].astype(str).to_numpy() == "firing_rate_hz"
+        )
+        lda_review.log_status("Applying smoothing to organized-cache firing-rate features")
+        population_matrix = lda_review.smooth_population_matrix(
+            population_matrix=population_matrix,
+            sigma_bins=float(config.smoothing_sigma_bins),
+            feature_mask=smoothable_feature_mask,
+        )
+    lda_review.log_status(
+        f"Finished organized-cache binning: created {population_matrix.shape[0]} samples "
+        f"x {population_matrix.shape[1]} features"
+    )
+    return population_matrix, metadata_table, feature_table
+
+
 def existing_day_auto_export_paths(day_root: Path) -> tuple[Path, Path, list[Path]]:
     summary_root = Path(day_root) / AUTO_DAY_EXPORT_FOLDER_NAME
     summary_manifest = summary_root / "export_summary.json"
@@ -953,6 +1321,13 @@ def run_single_day_auto_export(day_root: Path, *, organized_input: bool = False)
     except Exception as exc:
         show_progress(f"No reusable within-day auto export for {day_root.name}: {exc}")
     else:
+        if organized_input:
+            enrich_organized_export_members(
+                OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
+            )
+            page_manifest_paths = existing_day_auto_export_paths(day_root)[2]
+            page_export = build_existing_page_export(page_manifest_paths)
+            reused_payload["summary_export"] = export_result_from_manifest(summary_manifest)
         payload = {
             "status": "reused",
             "day_root": str(day_root),
@@ -975,6 +1350,10 @@ def run_single_day_auto_export(day_root: Path, *, organized_input: bool = False)
         state = AutoAlignmentState(day_root, progress_callback=show_progress)
     page_export = state.export_all_pages_decisions()
     summary_export = state.export_summary_bundle()
+    if organized_input:
+        enrich_organized_export_members(state)
+        summary_export = export_result_from_manifest(Path(summary_export["export_manifest_path"]))
+        page_export = build_existing_page_export(existing_day_auto_export_paths(day_root)[2])
     payload = {
         "status": "computed",
         "day_root": str(day_root),
@@ -1190,8 +1569,52 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
     def configured_prompt_for_path_remap():
         return configured_path_remap
 
+    cache_index = (
+        build_organized_cache_index(options.input_roots)
+        if looks_like_organized_input(options.input_roots)
+        else {}
+    )
+    if cache_index and any(str(mode).strip().upper() == "WAVEFORM_ONLY" for mode in config.feature_modes):
+        config.feature_modes = tuple(
+            mode
+            for mode in config.feature_modes
+            if str(mode).strip().upper() != "WAVEFORM_ONLY"
+        ) or ("FR_ONLY",)
+    original_load_session_analyzers = lda_review.load_session_analyzers
+    original_select_good_unit_groups = lda_review.select_good_unit_groups
+    original_build_population_vectors = lda_review.build_population_vectors
+
+    def cache_load_session_analyzers(session_table, config):
+        resolved_output_folders = {
+            str(row.session_key): str(row.output_folder)
+            for row in session_table.itertuples(index=False)
+        }
+        lda_review.log_status(
+            "Using Sorting_organize.py cache input; skipping analyzer loading for LDA."
+        )
+        return {}, resolved_output_folders
+
+    def cache_select_good_unit_groups(export_payload, config, analyzers):
+        return select_good_unit_groups_from_organized_cache(
+            export_payload=export_payload,
+            config=config,
+            cache_index=cache_index,
+        )
+
+    def cache_build_population_vectors(selected_units, session_table, analyzers, config):
+        return build_population_vectors_from_organized_cache(
+            selected_units=selected_units,
+            session_table=session_table,
+            cache_index=cache_index,
+            config=config,
+        )
+
     lda_review.prompt_for_optional_injection_phase_analysis = noninteractive_injection_phase_analysis
     lda_review.prompt_for_path_remap = configured_prompt_for_path_remap
+    if cache_index:
+        lda_review.load_session_analyzers = cache_load_session_analyzers
+        lda_review.select_good_unit_groups = cache_select_good_unit_groups
+        lda_review.build_population_vectors = cache_build_population_vectors
     try:
         output_dirs = lda_review.run_pipeline(config)
     finally:
@@ -1199,6 +1622,9 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
             original_prompt_for_optional_injection_phase_analysis
         )
         lda_review.prompt_for_path_remap = original_prompt_for_path_remap
+        lda_review.load_session_analyzers = original_load_session_analyzers
+        lda_review.select_good_unit_groups = original_select_good_unit_groups
+        lda_review.build_population_vectors = original_build_population_vectors
 
     moved_output_dirs = [move_output_dir_to_auto_suffix(path) for path in output_dirs]
     for output_dir in moved_output_dirs:
@@ -1311,7 +1737,51 @@ def run_tuning_auto_export(export_summary_path: Path, *, options: PipelineOption
     config.normalization_methods = tuple(tuning_settings.tuning_normalization_methods)
     config.variability_mode = str(tuning_settings.tuning_variability_mode)
 
-    output_dirs = [Path(path) for path in tuning_review.run_pipeline(config)]
+    cache_index = (
+        build_organized_cache_index(options.input_roots)
+        if looks_like_organized_input(options.input_roots)
+        else {}
+    )
+    original_load_aligned_minute_data = tuning_review.load_aligned_minute_data
+
+    def cache_load_aligned_minute_data(tuning_config):
+        lda_config = tuning_review.build_lda_config(tuning_config)
+        export_path = lda_review.resolve_export_summary_path(tuning_config.data_path)
+        tuning_review.log_status(f"Loading alignment export: {export_path}")
+        export_payload = lda_review.load_export_summary(export_path)
+        session_table = lda_review.build_session_table(export_payload=export_payload, config=lda_config)
+        session_table = lda_review.filter_session_table_for_lda_mode(session_table, lda_config)
+        selected_units = select_good_unit_groups_from_organized_cache(
+            export_payload=export_payload,
+            config=lda_config,
+            cache_index=cache_index,
+        )
+        minute_matrix, minute_metadata, feature_table = build_population_vectors_from_organized_cache(
+            selected_units=selected_units,
+            session_table=session_table,
+            cache_index=cache_index,
+            config=lda_config,
+        )
+        feature_columns = feature_table["feature_column"].astype(str).tolist()
+        minute_values = lda_review.pd.DataFrame(minute_matrix, columns=feature_columns)
+        minute_wide = lda_review.pd.concat(
+            [minute_metadata.reset_index(drop=True), minute_values.reset_index(drop=True)],
+            axis=1,
+        )
+        minute_wide["time_of_day_hour"] = minute_wide["minute_start_datetime"].map(
+            tuning_review.parse_time_of_day
+        )
+        tuning_review.log_status(
+            "Using Sorting_organize.py cache input; skipping analyzer loading for Tuning."
+        )
+        return minute_wide, feature_table, selected_units, export_path
+
+    if cache_index:
+        tuning_review.load_aligned_minute_data = cache_load_aligned_minute_data
+    try:
+        output_dirs = [Path(path) for path in tuning_review.run_pipeline(config)]
+    finally:
+        tuning_review.load_aligned_minute_data = original_load_aligned_minute_data
     if output_dirs:
         root_dir = immediate_child_under(output_dirs[0], config.output_base_dir)
         moved_root_dir = move_output_dir_to_auto_suffix(root_dir)
