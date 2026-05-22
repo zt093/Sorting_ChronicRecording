@@ -55,6 +55,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import BoundaryNorm
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import spikeinterface.full as si
@@ -113,6 +114,25 @@ CIRCULAR_HOUR_BOUNDARIES = np.arange(-0.5, 24.5, 1.0)
 CIRCULAR_HOUR_NORM = BoundaryNorm(CIRCULAR_HOUR_BOUNDARIES, CIRCULAR_HOUR_CMAP.N)
 CIRCULAR_HOUR_TICKS = list(range(24))
 CIRCULAR_HOUR_LABEL = "Hour"
+INJECTION_PHASE_COLORS = {
+    "baseline": "#7a7a7a",
+    "sham": "#1f77b4",
+    "drug": "#d62728",
+}
+INJECTION_PHASE_MARKERS = {
+    "baseline": "o",
+    "sham": "s",
+    "drug": "^",
+}
+WAVEFORM_FEATURE_MODES = {"FR_WAVEFORM", "WAVEFORM_ONLY", "MULTI_FEATURE"}
+LABEL_FALLBACK_COLORS = (
+    "#2ca02c",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#17becf",
+    "#bcbd22",
+)
 
 
 @dataclass
@@ -1152,6 +1172,22 @@ def prompt_for_data_path(default_path: Path | None) -> Path:
     raise ValueError("A data path is required.")
 
 
+def parse_yes_no(raw_text: str, *, default: bool = False) -> bool:
+    cleaned = str(raw_text or "").strip().lower()
+    if not cleaned:
+        return bool(default)
+    if cleaned in {"y", "yes", "true", "1"}:
+        return True
+    if cleaned in {"n", "no", "false", "0"}:
+        return False
+    raise ValueError(f"Expected yes/no, got: {raw_text!r}")
+
+
+def prompt_yes_no(prompt_text: str, *, default: bool = False) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    return parse_yes_no(input(prompt_text + suffix), default=default)
+
+
 def prompt_for_path_remap() -> tuple[Path, Path] | None:
     response = input(
         "\nA SortingAnalyzer path from the alignment export was not found.\n"
@@ -1558,6 +1594,17 @@ def resolve_injection_phase_labels(metadata_table: pd.DataFrame, config: Config)
     return labels
 
 
+def add_injection_phase_marker_column(metadata_table: pd.DataFrame, config: Config) -> pd.DataFrame:
+    if config.injection_phase_schedule is None:
+        return metadata_table
+    annotated_table = metadata_table.copy()
+    annotated_table["injection_phase"] = resolve_injection_phase_labels(
+        annotated_table,
+        config,
+    ).astype(str)
+    return annotated_table
+
+
 def resolve_label_series(metadata_table: pd.DataFrame, config: Config) -> tuple[pd.Series, str]:
     requested_label_type = str(config.label_type or "").strip().lower()
     label_aliases = {
@@ -1843,7 +1890,7 @@ def prompt_for_optional_injection_phase_analysis(config: Config, session_table: 
         response = "yes"
     else:
         response = input(
-            "\nAdd a second LDA analysis with labels baseline / sham / drug? [y/N]: "
+            "\nAdd sham/drug marker shapes to hour-label LDA figures? [y/N]: "
         ).strip().lower()
         if response not in {"y", "yes"}:
             return config
@@ -1869,7 +1916,7 @@ def prompt_for_optional_injection_phase_analysis(config: Config, session_table: 
     )
     schedule = build_injection_phase_schedule(sham_sessions, drug_sessions)
 
-    print("\nInjection-phase LDA interpretation to confirm:", flush=True)
+    print("\nSham/drug marker interpretation to confirm:", flush=True)
     print(f"  {schedule['interpretation']}", flush=True)
     print("  Sham intervals:", flush=True)
     for interval in schedule["sham_intervals"]:
@@ -1889,8 +1936,6 @@ def prompt_for_optional_injection_phase_analysis(config: Config, session_table: 
     if confirm != "YES":
         raise RuntimeError("Injection-phase LDA setup was not confirmed; stopping before analysis.")
 
-    if "injection_phase" not in normalize_label_types(config):
-        config.extra_label_types = tuple([*tuple(config.extra_label_types or ()), "injection_phase"])
     config.injection_phase_schedule = schedule
     return config
 
@@ -1987,6 +2032,28 @@ def normalize_feature_modes(feature_modes: tuple[str, ...] | list[str] | str) ->
     if not normalized_modes:
         raise ValueError("At least one feature mode must be configured.")
     return normalized_modes
+
+
+def filter_feature_modes_for_waveform(
+    feature_modes: tuple[str, ...] | list[str] | str,
+    *,
+    use_waveform_features: bool,
+) -> tuple[str, ...]:
+    normalized_modes = normalize_feature_modes(feature_modes)
+    if use_waveform_features:
+        return tuple(normalized_modes)
+    filtered_modes = [
+        mode
+        for mode in normalized_modes
+        if mode not in WAVEFORM_FEATURE_MODES
+    ]
+    if filtered_modes:
+        return tuple(filtered_modes)
+    log_status(
+        "Waveform LDA features are disabled, but all configured feature modes used waveform; "
+        "falling back to FR_ONLY."
+    )
+    return ("FR_ONLY",)
 
 
 def subset_features_for_mode(
@@ -3055,9 +3122,207 @@ def evaluate_decoding(
 # -----------------------------------------------------------------------------
 
 
-def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_path: Path) -> None:
+def build_categorical_label_colors(
+    metadata_table: pd.DataFrame,
+    resolved_label_column: str,
+) -> tuple[list[str], list[Line2D], str]:
+    label_values = metadata_table[resolved_label_column].astype(str).fillna("missing")
+    if str(resolved_label_column) == "injection_phase":
+        ordered_labels = [
+            label
+            for label in ("baseline", "sham", "drug")
+            if label in set(label_values)
+        ]
+        ordered_labels.extend(
+            label
+            for label in pd.unique(label_values).tolist()
+            if label not in ordered_labels
+        )
+        color_map = {
+            label: INJECTION_PHASE_COLORS.get(
+                label,
+                LABEL_FALLBACK_COLORS[index % len(LABEL_FALLBACK_COLORS)],
+            )
+            for index, label in enumerate(ordered_labels)
+        }
+    else:
+        ordered_labels = [str(label) for label in pd.unique(label_values).tolist()]
+        color_map = {
+            label: LABEL_FALLBACK_COLORS[index % len(LABEL_FALLBACK_COLORS)]
+            for index, label in enumerate(ordered_labels)
+        }
+
+    colors = [color_map[str(label)] for label in label_values]
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            label=str(label),
+            markerfacecolor=color_map[str(label)],
+            markeredgecolor="black",
+            markeredgewidth=0.35,
+            markersize=8,
+        )
+        for label in ordered_labels
+    ]
+    legend_title = str(resolved_label_column).replace("_", " ")
+    return colors, legend_handles, legend_title
+
+
+def add_label_legend_or_hour_colorbar(
+    fig,
+    ax,
+    scatter,
+    metadata_table: pd.DataFrame,
+    resolved_label_column: str,
+) -> None:
+    if str(resolved_label_column) == "clock_hour_of_day":
+        colorbar = fig.colorbar(
+            scatter,
+            ax=ax,
+            fraction=0.046,
+            pad=0.04,
+            boundaries=CIRCULAR_HOUR_BOUNDARIES,
+            ticks=CIRCULAR_HOUR_TICKS,
+            spacing="proportional",
+            drawedges=True,
+        )
+        colorbar.set_label(CIRCULAR_HOUR_LABEL)
+        return
+
+    _colors, legend_handles, legend_title = build_categorical_label_colors(
+        metadata_table,
+        resolved_label_column,
+    )
+    ax.legend(
+        handles=legend_handles,
+        title=legend_title,
+        frameon=False,
+        loc="best",
+    )
+
+
+def injection_phase_values_for_markers(metadata_table: pd.DataFrame) -> pd.Series | None:
+    if "injection_phase" not in metadata_table.columns:
+        return None
+    phases = metadata_table["injection_phase"].astype(str).fillna("baseline")
+    if set(pd.unique(phases)).issubset({"baseline"}):
+        return None
+    return phases
+
+
+def add_injection_phase_marker_legend(ax, phases: pd.Series | None) -> None:
+    if phases is None:
+        return
+    ordered_phases = [
+        phase
+        for phase in ("baseline", "sham", "drug")
+        if phase in set(phases.astype(str))
+    ]
+    ordered_phases.extend(
+        phase
+        for phase in pd.unique(phases.astype(str)).tolist()
+        if phase not in ordered_phases
+    )
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker=INJECTION_PHASE_MARKERS.get(phase, "o"),
+            color="none",
+            label=phase,
+            markerfacecolor="white",
+            markeredgecolor="black",
+            markeredgewidth=0.8,
+            markersize=8,
+        )
+        for phase in ordered_phases
+    ]
+    existing_legend = ax.get_legend()
+    marker_legend = ax.legend(
+        handles=handles,
+        title="drug marker",
+        frameon=False,
+        loc="best",
+    )
+    if existing_legend is not None:
+        ax.add_artist(existing_legend)
+    ax.add_artist(marker_legend)
+
+
+def scatter_clock_hour_with_phase_markers(
+    ax,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    z_values: np.ndarray | None,
+    metadata_table: pd.DataFrame,
+    *,
+    point_size: float,
+    zorder: int | None = None,
+):
+    phases = injection_phase_values_for_markers(metadata_table)
+    hour_values = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
+    if phases is None:
+        scatter_kwargs = {
+            "c": hour_values,
+            "cmap": CIRCULAR_HOUR_CMAP,
+            "norm": CIRCULAR_HOUR_NORM,
+            "s": point_size,
+            "alpha": 0.92,
+            "edgecolors": "black",
+            "linewidths": 0.35,
+        }
+        if zorder is not None:
+            scatter_kwargs["zorder"] = zorder
+        if z_values is None:
+            return ax.scatter(x_values, y_values, **scatter_kwargs), phases
+        return ax.scatter(x_values, y_values, z_values, **scatter_kwargs), phases
+
+    first_scatter = None
+    plotted_phases: set[str] = set()
+    for phase in ["baseline", "sham", "drug", *pd.unique(phases.astype(str)).tolist()]:
+        phase = str(phase)
+        if phase in plotted_phases:
+            continue
+        plotted_phases.add(phase)
+        phase_mask = phases.astype(str).to_numpy() == phase
+        if not np.any(phase_mask):
+            continue
+        scatter_kwargs = {
+            "c": hour_values[phase_mask],
+            "cmap": CIRCULAR_HOUR_CMAP,
+            "norm": CIRCULAR_HOUR_NORM,
+            "marker": INJECTION_PHASE_MARKERS.get(phase, "o"),
+            "s": point_size,
+            "alpha": 0.92,
+            "edgecolors": "black",
+            "linewidths": 0.35,
+        }
+        if zorder is not None:
+            scatter_kwargs["zorder"] = zorder
+        if z_values is None:
+            scatter = ax.scatter(x_values[phase_mask], y_values[phase_mask], **scatter_kwargs)
+        else:
+            scatter = ax.scatter(
+                x_values[phase_mask],
+                y_values[phase_mask],
+                z_values[phase_mask],
+                **scatter_kwargs,
+            )
+        if first_scatter is None:
+            first_scatter = scatter
+    return first_scatter, phases
+
+
+def plot_lda_2d(
+    projection: np.ndarray,
+    metadata_table: pd.DataFrame,
+    output_path: Path,
+    resolved_label_column: str = "clock_hour_of_day",
+) -> None:
     fig, ax = plt.subplots(figsize=(10, 8))
-    hours = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
     calendar_days = metadata_table["calendar_day"].astype(str).to_numpy()
     unique_calendar_days = pd.unique(calendar_days)
     sort_columns = ["clock_hour_of_day"]
@@ -3085,44 +3350,59 @@ def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
                 zorder=1,
             )
 
-    scatter = ax.scatter(
-        x_values,
-        y_values,
-        c=hours,
-        cmap=CIRCULAR_HOUR_CMAP,
-        norm=CIRCULAR_HOUR_NORM,
-        s=44,
-        alpha=0.92,
-        edgecolors="black",
-        linewidths=0.35,
-        zorder=2,
-    )
+    if str(resolved_label_column) == "clock_hour_of_day":
+        scatter, marker_phases = scatter_clock_hour_with_phase_markers(
+            ax,
+            x_values,
+            y_values,
+            None,
+            metadata_table,
+            point_size=44,
+            zorder=2,
+        )
+    else:
+        marker_phases = None
+        label_colors, _legend_handles, _legend_title = build_categorical_label_colors(
+            metadata_table,
+            resolved_label_column,
+        )
+        scatter = ax.scatter(
+            x_values,
+            y_values,
+            c=label_colors,
+            s=44,
+            alpha=0.92,
+            edgecolors="black",
+            linewidths=0.35,
+            zorder=2,
+        )
 
-    ax.set_title("Population LDA Projection (2D)")
+    ax.set_title(f"Population LDA Projection (2D, {resolved_label_column})")
     ax.set_xlabel("LD1")
     ax.set_ylabel("LD2")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    colorbar = fig.colorbar(
+    add_label_legend_or_hour_colorbar(
+        fig,
+        ax,
         scatter,
-        ax=ax,
-        fraction=0.046,
-        pad=0.04,
-        boundaries=CIRCULAR_HOUR_BOUNDARIES,
-        ticks=CIRCULAR_HOUR_TICKS,
-        spacing="proportional",
-        drawedges=True,
+        metadata_table,
+        resolved_label_column,
     )
-    colorbar.set_label(CIRCULAR_HOUR_LABEL)
+    add_injection_phase_marker_legend(ax, marker_phases)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
-def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_path: Path) -> None:
+def plot_lda_3d(
+    projection: np.ndarray,
+    metadata_table: pd.DataFrame,
+    output_path: Path,
+    resolved_label_column: str = "clock_hour_of_day",
+) -> None:
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
-    hours = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
     calendar_days = metadata_table["calendar_day"].astype(str).to_numpy()
     unique_calendar_days = pd.unique(calendar_days)
     sort_columns = ["clock_hour_of_day"]
@@ -3152,34 +3432,44 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
                 zorder=1,
             )
 
-    scatter = ax.scatter(
-        x_values,
-        y_values,
-        z_values,
-        c=hours,
-        cmap=CIRCULAR_HOUR_CMAP,
-        norm=CIRCULAR_HOUR_NORM,
-        s=36,
-        alpha=0.92,
-        edgecolors="black",
-        linewidths=0.35,
-    )
+    if str(resolved_label_column) == "clock_hour_of_day":
+        scatter, marker_phases = scatter_clock_hour_with_phase_markers(
+            ax,
+            x_values,
+            y_values,
+            z_values,
+            metadata_table,
+            point_size=36,
+        )
+    else:
+        marker_phases = None
+        label_colors, _legend_handles, _legend_title = build_categorical_label_colors(
+            metadata_table,
+            resolved_label_column,
+        )
+        scatter = ax.scatter(
+            x_values,
+            y_values,
+            z_values,
+            c=label_colors,
+            s=36,
+            alpha=0.92,
+            edgecolors="black",
+            linewidths=0.35,
+        )
 
-    ax.set_title("Population LDA Projection (3D)")
+    ax.set_title(f"Population LDA Projection (3D, {resolved_label_column})")
     ax.set_xlabel("LD1")
     ax.set_ylabel("LD2")
     ax.set_zlabel("LD3")
-    colorbar = fig.colorbar(
+    add_label_legend_or_hour_colorbar(
+        fig,
+        ax,
         scatter,
-        ax=ax,
-        fraction=0.046,
-        pad=0.04,
-        boundaries=CIRCULAR_HOUR_BOUNDARIES,
-        ticks=CIRCULAR_HOUR_TICKS,
-        spacing="proportional",
-        drawedges=True,
+        metadata_table,
+        resolved_label_column,
     )
-    colorbar.set_label(CIRCULAR_HOUR_LABEL)
+    add_injection_phase_marker_legend(ax, marker_phases)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
@@ -3374,6 +3664,7 @@ def save_feature_pca_visualization(
     file_prefix: str,
     metadata_table: pd.DataFrame,
     processed_population_matrix: np.ndarray,
+    resolved_label_column: str,
 ) -> None:
     n_samples, n_features = processed_population_matrix.shape
     if n_samples < 2 or n_features < 2:
@@ -3400,35 +3691,44 @@ def save_feature_pca_visualization(
     log_status(f"Saved {file_prefix}_feature_pca_projection.csv")
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    hours = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
     y_values = projection[:, 1] if n_components >= 2 else np.zeros(n_samples)
-    scatter = ax.scatter(
-        projection[:, 0],
-        y_values,
-        c=hours,
-        cmap=CIRCULAR_HOUR_CMAP,
-        norm=CIRCULAR_HOUR_NORM,
-        s=44,
-        alpha=0.92,
-        edgecolors="black",
-        linewidths=0.35,
-    )
-    ax.set_title("Feature Matrix PCA Projection")
+    if str(resolved_label_column) == "clock_hour_of_day":
+        scatter, marker_phases = scatter_clock_hour_with_phase_markers(
+            ax,
+            projection[:, 0],
+            y_values,
+            None,
+            metadata_table,
+            point_size=44,
+        )
+    else:
+        marker_phases = None
+        label_colors, _legend_handles, _legend_title = build_categorical_label_colors(
+            metadata_table,
+            resolved_label_column,
+        )
+        scatter = ax.scatter(
+            projection[:, 0],
+            y_values,
+            c=label_colors,
+            s=44,
+            alpha=0.92,
+            edgecolors="black",
+            linewidths=0.35,
+        )
+    ax.set_title(f"Feature Matrix PCA Projection ({resolved_label_column})")
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    colorbar = fig.colorbar(
+    add_label_legend_or_hour_colorbar(
+        fig,
+        ax,
         scatter,
-        ax=ax,
-        fraction=0.046,
-        pad=0.04,
-        boundaries=CIRCULAR_HOUR_BOUNDARIES,
-        ticks=CIRCULAR_HOUR_TICKS,
-        spacing="proportional",
-        drawedges=True,
+        metadata_table,
+        resolved_label_column,
     )
-    colorbar.set_label(CIRCULAR_HOUR_LABEL)
+    add_injection_phase_marker_legend(ax, marker_phases)
     fig.tight_layout()
     fig.savefig(output_dir / f"{file_prefix}_feature_pca_2d.png", dpi=300)
     plt.close(fig)
@@ -3544,11 +3844,22 @@ def save_outputs(
         file_prefix=file_prefix,
         metadata_table=analysis_metadata_table,
         processed_population_matrix=analysis_population_matrix,
+        resolved_label_column=resolved_label_column,
     )
 
-    plot_lda_2d(projection, analysis_metadata_table, output_dir / f"{file_prefix}_2d.png")
+    plot_lda_2d(
+        projection,
+        analysis_metadata_table,
+        output_dir / f"{file_prefix}_2d.png",
+        resolved_label_column=resolved_label_column,
+    )
     log_status(f"Saved {file_prefix}_2d.png")
-    plot_lda_3d(projection, analysis_metadata_table, output_dir / f"{file_prefix}_3d.png")
+    plot_lda_3d(
+        projection,
+        analysis_metadata_table,
+        output_dir / f"{file_prefix}_3d.png",
+        resolved_label_column=resolved_label_column,
+    )
     log_status(f"Saved {file_prefix}_3d.png")
     for cv_name, decoding_result in decoding_results.items():
         plot_confusion_matrix(
@@ -3818,6 +4129,10 @@ def run_pipeline(config: Config) -> list[Path]:
                 metadata_table=base_analysis_metadata_table,
                 config=label_config,
             )
+        analysis_metadata_table = add_injection_phase_marker_column(
+            analysis_metadata_table,
+            label_config,
+        )
         print_clock_hour_sample_pivot(
             analysis_metadata_table,
             title=(
@@ -3943,6 +4258,16 @@ def main() -> None:
     config = Config()
     try:
         config.data_path = prompt_for_data_path(config.data_path)
+        use_waveform_features = prompt_yes_no(
+            "Use cached waveform as LDA feature?",
+            default=False,
+        )
+        config.feature_modes = filter_feature_modes_for_waveform(
+            config.feature_modes,
+            use_waveform_features=use_waveform_features,
+        )
+        if not use_waveform_features:
+            config.waveform_feature_sample_count = 0
         log_status(
             "LDA supports LDA_MODE='multi_day_hourly' for day x hour samples and "
             "LDA_MODE='single_day_5min' for within-day 5-minute samples. Multi-day "

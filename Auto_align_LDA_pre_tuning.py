@@ -20,7 +20,7 @@ import argparse
 import builtins
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import os
@@ -41,6 +41,7 @@ import Alignment_html as html_review
 import Alignment_days as day_review
 import LDA as lda_review
 import Tuning as tuning_review
+import Tuning_Weinan as tuning_weinan_review
 import presentation_multiple as presentation_review
 
 
@@ -51,24 +52,35 @@ AUTO_DAY_SUMMARY_SUFFIX = "_auto"
 AUTO_STATS_SUFFIX = "_auto"
 ORGANIZED_CACHE_FOLDER_NAME = "unit_feature_cache"
 ORGANIZED_DAY_ROOT_PATTERN = re.compile(r"(?P<day_code>\d{6})_Sorting(?:_org)?$")
+ORGANIZED_ENRICHED_MEMBER_KEYS = {
+    "shank_id",
+    "local_channel_on_shank",
+    "sg_channel",
+    "waveform_similarity_vector",
+    "autocorrelogram_similarity_vector",
+}
 
 # User setting: one shared persistence threshold for both LDA.py and Tuning.py.
 # Change this value here when you want both downstream modules to use a new
 # minimum number of sessions per aligned unit.
 MIN_SESSIONS_PER_UNIT_AUTO = 138
+LDA_N_PERMUTATIONS_AUTO = 20
+LDA_WAVEFORM_FEATURE_MODES = {"FR_WAVEFORM", "WAVEFORM_ONLY", "MULTI_FEATURE"}
 
 
 @dataclass
 class LDASettings:
     lda_output_base_dir: Path = lda_review.OUTPUT_BASE_DIR
+    lda_label_type: str = lda_review.LABEL_TYPE
     lda_mode: str = lda_review.LDA_MODE
     lda_single_day_date: str | None = lda_review.SINGLE_DAY_DATE
     lda_min_firing_rate_hz: float = lda_review.MIN_FIRING_RATE_HZ
     lda_min_sessions_per_unit: int = MIN_SESSIONS_PER_UNIT_AUTO
     lda_min_bins_per_label: int = lda_review.MIN_BINS_PER_LABEL
     lda_cv_n_splits: int = lda_review.CV_N_SPLITS
-    lda_n_permutations: int = lda_review.N_PERMUTATIONS
+    lda_n_permutations: int = LDA_N_PERMUTATIONS_AUTO
     lda_feature_modes: tuple[str, ...] = lda_review.FEATURE_MODES
+    lda_use_waveform_features: bool = False
     lda_extra_label_types: tuple[str, ...] = ()
     lda_use_baseline_sham_drug: bool = False
     lda_sham_session_tokens: str = ""
@@ -94,6 +106,11 @@ class TuningSettings:
 
 
 @dataclass
+class TuningWeinanSettings:
+    tuning_weinan_max_aligned_units: int | None = tuning_weinan_review.MAX_ALIGNED_UNITS
+
+
+@dataclass
 class PresentationSettings:
     presentation_basis: str = presentation_review.DEFAULT_BASIS
     presentation_stable_threshold: int = 2
@@ -104,14 +121,19 @@ class PresentationSettings:
 @dataclass
 class PipelineOptions:
     input_roots: list[Path]
+    resume_export_summary_path: Path | None = None
     skip_cross_day: bool = False
     skip_presentation: bool = False
     skip_lda: bool = False
     skip_tuning: bool = False
+    skip_tuning_weinan: bool = False
+    run_lda_hour_label: bool = True
+    run_lda_drug_label: bool = False
     stop_on_error: bool = False
     overwrite_auto_exports: bool = False
     lda: LDASettings | None = None
     tuning: TuningSettings | None = None
+    tuning_weinan: TuningWeinanSettings | None = None
     presentation: PresentationSettings | None = None
 
 
@@ -290,6 +312,8 @@ def discover_organized_cache_folders(path: Path) -> list[Path]:
         return [path]
     if not path.exists() or not path.is_dir():
         return []
+    if path.name.startswith(day_review.ALIGNMENT_DAYS_SUMMARY_PREFIX) and (path / "export_summary.json").is_file():
+        return []
     return sorted(
         cache_folder
         for cache_folder in path.rglob(ORGANIZED_CACHE_FOLDER_NAME)
@@ -362,15 +386,8 @@ def patch_day_review_for_auto_roots() -> None:
     )
 
     def load_member_snapshot_from_organized_payload(member_payload: dict, cache: dict[str, dict]) -> dict:
-        required_keys = {
-            "shank_id",
-            "local_channel_on_shank",
-            "sg_channel",
-            "waveform_similarity_vector",
-            "autocorrelogram_similarity_vector",
-        }
-        if not required_keys.issubset(member_payload.keys()):
-            missing_keys = sorted(required_keys.difference(member_payload.keys()))
+        if not ORGANIZED_ENRICHED_MEMBER_KEYS.issubset(member_payload.keys()):
+            missing_keys = sorted(ORGANIZED_ENRICHED_MEMBER_KEYS.difference(member_payload.keys()))
             raise RuntimeError(
                 "Organized-cache cross-day alignment requires enriched per-day export members, "
                 f"but this member is missing: {missing_keys}. Rerun with --overwrite-auto-exports "
@@ -447,6 +464,24 @@ def parse_type1_units_text(raw_text: str | None):
     return tuple(values)
 
 
+def filter_lda_feature_modes_for_waveform(feature_modes, *, use_waveform_features: bool) -> tuple[str, ...]:
+    normalized_modes = [str(mode).strip().upper() for mode in feature_modes if str(mode).strip()]
+    if use_waveform_features:
+        return tuple(normalized_modes)
+    filtered_modes = [
+        mode
+        for mode in normalized_modes
+        if mode not in LDA_WAVEFORM_FEATURE_MODES
+    ]
+    if filtered_modes:
+        return tuple(filtered_modes)
+    show_progress(
+        "Waveform LDA features are disabled, but all requested LDA feature modes used waveform; "
+        "falling back to FR_ONLY."
+    )
+    return ("FR_ONLY",)
+
+
 def ensure_auto_folder(path: Path) -> Path:
     path = Path(path)
     if path.name.endswith(AUTO_STATS_SUFFIX):
@@ -483,8 +518,72 @@ def prompt_for_input_roots() -> list[Path]:
     return parse_input_roots_text(raw_text)
 
 
+def clean_path_text(path_text: str | Path) -> str:
+    cleaned = str(path_text).strip()
+    while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def find_export_summary_in_folder(folder: Path) -> Path:
+    direct_path = folder / "export_summary.json"
+    if direct_path.is_file():
+        return direct_path
+    candidates = sorted(folder.glob("**/export_summary.json"))
+    cross_day_candidates = [
+        path
+        for path in candidates
+        if path.parent.name.startswith("alignment_days_summary_")
+    ]
+    candidates_to_check = cross_day_candidates or candidates
+    for candidate in candidates_to_check:
+        try:
+            payload = load_json_file(candidate)
+        except Exception:
+            continue
+        if payload.get("cross_session_alignment_groups"):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find an auto cross-day export_summary.json under folder: "
+        f"{folder}"
+    )
+
+
+def resolve_export_summary_input(path_text: str | Path) -> Path:
+    path = Path(clean_path_text(path_text)).expanduser()
+    if path.is_dir():
+        path = find_export_summary_in_folder(path)
+    return require_existing_file(path, "auto cross-day alignment export_summary.json")
+
+
+def prompt_for_resume_export_summary() -> Path:
+    raw_text = input(
+        "Enter previous auto cross-day alignment export_summary.json path, or its folder: "
+    ).strip()
+    if not raw_text:
+        raise ValueError("No previous alignment export was provided.")
+    return resolve_export_summary_input(raw_text)
+
+
+def infer_resume_input_roots(export_summary_path: Path) -> list[Path]:
+    export_summary_path = Path(export_summary_path).resolve()
+    if export_summary_path.name == "export_summary.json" and export_summary_path.parent.parent.exists():
+        return [export_summary_path.parent.parent]
+    return [export_summary_path.parent]
+
+
 def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
-    if args.input_roots:
+    resume_export_summary_path: Path | None = None
+    resume_mode = bool(args.resume_export_summary)
+    if not args.input_roots and not resume_mode:
+        resume_mode = prompt_yes_no(
+            "Resume analysis from a previous auto cross-day alignment result?",
+            default=False,
+        )
+    if resume_mode:
+        resume_export_summary_path = resolve_export_summary_input(args.resume_export_summary) if args.resume_export_summary else prompt_for_resume_export_summary()
+        selected_roots = parse_input_roots_text(args.input_roots) if args.input_roots else infer_resume_input_roots(resume_export_summary_path)
+    elif args.input_roots:
         selected_roots = parse_input_roots_text(args.input_roots)
     else:
         selected_roots = prompt_for_input_roots()
@@ -497,36 +596,59 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
         parse_csv_text(args.tuning_normalization_methods)
         or tuning_review.NORMALIZATION_METHODS
     )
+    use_waveform_features = False
 
-    if args.skip_lda:
+    if resume_mode:
+        run_lda_hour_label = prompt_yes_no("Run LDA with hour labels?", default=not bool(args.skip_lda))
+        run_lda_drug_label = prompt_yes_no("Add sham/drug marker shapes to hour-label LDA figures?", default=False)
+        if run_lda_drug_label:
+            run_lda_hour_label = True
+        run_tuning = prompt_yes_no("Run Tuning?", default=not bool(args.skip_tuning))
+        run_tuning_weinan = prompt_yes_no("Run Tuning-Weinan?", default=not bool(args.skip_tuning_weinan))
+        run_presentation = prompt_yes_no("Run presentation_multiple analysis?", default=not bool(args.skip_presentation))
+        skip_lda = not (run_lda_hour_label or run_lda_drug_label)
+        skip_tuning = not run_tuning
+        skip_tuning_weinan = not run_tuning_weinan
+        skip_presentation = not run_presentation
+        use_baseline_sham_drug = bool(run_lda_drug_label)
+    elif args.skip_lda:
+        run_lda_hour_label = False
+        run_lda_drug_label = False
+        skip_lda = True
+        skip_tuning = bool(args.skip_tuning)
+        skip_tuning_weinan = bool(args.skip_tuning_weinan)
+        skip_presentation = bool(args.skip_presentation)
         use_baseline_sham_drug = False
     elif args.lda_baseline_sham_drug == "yes":
+        run_lda_hour_label = True
+        run_lda_drug_label = True
+        skip_lda = False
+        skip_tuning = bool(args.skip_tuning)
+        skip_tuning_weinan = bool(args.skip_tuning_weinan)
+        skip_presentation = bool(args.skip_presentation)
         use_baseline_sham_drug = True
     elif args.lda_baseline_sham_drug == "no":
+        run_lda_hour_label = True
+        run_lda_drug_label = False
+        skip_lda = False
+        skip_tuning = bool(args.skip_tuning)
+        skip_tuning_weinan = bool(args.skip_tuning_weinan)
+        skip_presentation = bool(args.skip_presentation)
         use_baseline_sham_drug = False
     else:
         use_baseline_sham_drug = prompt_yes_no(
-            "Add optional LDA labels baseline / sham / drug?",
+            "Add sham/drug marker shapes to hour-label LDA figures?",
             default=False,
         )
-    sham_session_tokens = str(args.lda_sham_sessions or "").strip()
-    drug_session_tokens = str(args.lda_drug_sessions or "").strip()
-    if use_baseline_sham_drug and not sham_session_tokens:
-        sham_session_tokens = input(
-            "Enter sham injection session_id(s) or session name(s), separated by commas: "
-        ).strip()
-    if use_baseline_sham_drug and not drug_session_tokens:
-        drug_session_tokens = input(
-            "Enter drug injection session_id(s) or session name(s), separated by commas: "
-        ).strip()
-    confirm_baseline_sham_drug = bool(args.lda_confirm_baseline_sham_drug)
-    if use_baseline_sham_drug and not confirm_baseline_sham_drug:
-        confirm_baseline_sham_drug = prompt_yes_no(
-            "Auto-confirm the derived baseline/sham/drug intervals after session matching?",
-            default=False,
-        )
-
-    if args.min_sessions_per_unit is None:
+        run_lda_hour_label = True
+        run_lda_drug_label = bool(use_baseline_sham_drug)
+        skip_lda = False
+        skip_tuning = bool(args.skip_tuning)
+        skip_tuning_weinan = bool(args.skip_tuning_weinan)
+        skip_presentation = bool(args.skip_presentation)
+    if skip_lda and skip_tuning and skip_tuning_weinan:
+        min_sessions_per_unit = MIN_SESSIONS_PER_UNIT_AUTO
+    elif args.min_sessions_per_unit is None:
         min_sessions_per_unit = prompt_int(
             "Minimum sessions an aligned unit must appear in for LDA and Tuning",
             default=MIN_SESSIONS_PER_UNIT_AUTO,
@@ -534,16 +656,41 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
     else:
         min_sessions_per_unit = int(args.min_sessions_per_unit)
 
+    if skip_lda:
+        use_waveform_features = False
+    elif args.lda_use_waveform_features == "yes":
+        use_waveform_features = True
+    elif args.lda_use_waveform_features == "no":
+        use_waveform_features = False
+    else:
+        use_waveform_features = prompt_yes_no(
+            "Use cached waveform as LDA feature?",
+            default=False,
+        )
+    lda_feature_modes = filter_lda_feature_modes_for_waveform(
+        lda_feature_modes,
+        use_waveform_features=use_waveform_features,
+    )
+
+    sham_session_tokens = str(args.lda_sham_sessions or "").strip()
+    drug_session_tokens = str(args.lda_drug_sessions or "").strip()
+    confirm_baseline_sham_drug = bool(args.lda_confirm_baseline_sham_drug)
+
     return PipelineOptions(
         input_roots=selected_roots,
+        resume_export_summary_path=resume_export_summary_path,
         skip_cross_day=bool(args.skip_cross_day),
-        skip_presentation=bool(args.skip_presentation),
-        skip_lda=bool(args.skip_lda),
-        skip_tuning=bool(args.skip_tuning),
+        skip_presentation=bool(skip_presentation),
+        skip_lda=bool(skip_lda),
+        skip_tuning=bool(skip_tuning),
+        skip_tuning_weinan=bool(skip_tuning_weinan),
+        run_lda_hour_label=bool(run_lda_hour_label),
+        run_lda_drug_label=bool(run_lda_drug_label),
         stop_on_error=bool(args.stop_on_error),
         overwrite_auto_exports=bool(args.overwrite_auto_exports),
         lda=LDASettings(
             lda_output_base_dir=Path(args.lda_output_base_dir) if args.lda_output_base_dir else lda_review.OUTPUT_BASE_DIR,
+            lda_label_type=str(args.lda_label_type),
             lda_mode=str(args.lda_mode),
             lda_single_day_date=args.lda_single_day_date,
             lda_min_firing_rate_hz=float(args.lda_min_firing_rate_hz),
@@ -552,6 +699,7 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
             lda_cv_n_splits=int(args.lda_cv_n_splits),
             lda_n_permutations=int(args.lda_n_permutations),
             lda_feature_modes=tuple(lda_feature_modes),
+            lda_use_waveform_features=bool(use_waveform_features),
             lda_extra_label_types=tuple(lda_extra_label_types),
             lda_use_baseline_sham_drug=bool(use_baseline_sham_drug),
             lda_sham_session_tokens=sham_session_tokens,
@@ -571,6 +719,13 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
             tuning_type2_day=args.tuning_type2_day,
             tuning_normalization_methods=tuple(tuning_normalization_methods),
             tuning_variability_mode=str(args.tuning_variability_mode),
+        ),
+    tuning_weinan=TuningWeinanSettings(
+            tuning_weinan_max_aligned_units=(
+                None
+                if args.tuning_weinan_max_aligned_units is None
+                else int(args.tuning_weinan_max_aligned_units)
+            ),
         ),
         presentation=PresentationSettings(
             presentation_basis=str(args.presentation_basis),
@@ -977,7 +1132,7 @@ def build_organized_cache_index(input_roots: list[Path]) -> dict[str, dict]:
             if not analyzer_folder:
                 analyzer_folder = str(unit_payload.get("analyzer_folder") or payload.get("analyzer_folder") or "")
         if output_folder:
-            cache_index[str(Path(output_folder).resolve())] = {
+            cache_info = {
                 "cache_folder": cache_folder,
                 "unit_ids": unit_ids,
                 "unit_summary": payload,
@@ -985,6 +1140,11 @@ def build_organized_cache_index(input_roots: list[Path]) -> dict[str, dict]:
                 "metadata_path": cache_folder / "cache_metadata.json",
                 "analyzer_folder": analyzer_folder,
             }
+            cache_index[str(output_folder)] = cache_info
+            try:
+                cache_index[str(Path(output_folder).resolve())] = cache_info
+            except Exception:
+                pass
     return cache_index
 
 
@@ -1481,6 +1641,20 @@ def build_reused_export_payload(
     return page_export, {"summary_export": summary_export, "verification": verification}
 
 
+def export_members_are_organized_enriched(manifest_paths: list[Path]) -> bool:
+    saw_member = False
+    for manifest_path in manifest_paths:
+        if not manifest_path.is_file():
+            continue
+        payload = load_json_file(manifest_path)
+        for group in payload.get("cross_session_alignment_groups", []) or []:
+            for member in group.get("members", []) or []:
+                saw_member = True
+                if not ORGANIZED_ENRICHED_MEMBER_KEYS.issubset(member.keys()):
+                    return False
+    return saw_member
+
+
 def path_or_none(path: Path | None) -> str | None:
     return str(path) if path is not None else None
 
@@ -1495,6 +1669,12 @@ def require_tuning_settings(options: PipelineOptions) -> TuningSettings:
     if options.tuning is None:
         options.tuning = TuningSettings()
     return options.tuning
+
+
+def require_tuning_weinan_settings(options: PipelineOptions) -> TuningWeinanSettings:
+    if options.tuning_weinan is None:
+        options.tuning_weinan = TuningWeinanSettings()
+    return options.tuning_weinan
 
 
 def require_presentation_settings(options: PipelineOptions) -> PresentationSettings:
@@ -1530,6 +1710,97 @@ def select_lda_sessions_from_tokens(session_table, tokens: str, prompt_text: str
         return lda_review.prompt_for_session_selection(session_table, prompt_text)
 
 
+def build_injection_recording_table(session_table):
+    table = session_table.reset_index(drop=False).copy()
+    table["_recording_name"] = table["session_name"].map(lda_review.normalize_session_name)
+    table["_recording_start"] = lda_review.pd.to_datetime(
+        table["session_start_datetime"],
+        errors="coerce",
+    )
+    rows: list[dict] = []
+    grouped = table.groupby(["_recording_name", "_recording_start"], dropna=False, sort=True)
+    for recording_id, ((_recording_name, _recording_start), group) in enumerate(grouped, start=1):
+        sorted_group = group.sort_values("session_id")
+        rows.append(
+            {
+                "recording_id": int(recording_id),
+                "recording_name": str(_recording_name),
+                "session_start_datetime": (
+                    _recording_start.isoformat(sep=" ")
+                    if hasattr(_recording_start, "isoformat") and not lda_review.pd.isna(_recording_start)
+                    else ""
+                ),
+                "num_session_rows": int(len(sorted_group)),
+                "session_ids": ",".join(str(value) for value in sorted_group["session_id"].astype(int).tolist()),
+                "session_names": ",".join(sorted_group["session_name"].astype(str).tolist()),
+                "source_indices": sorted_group["index"].astype(int).tolist(),
+            }
+        )
+    return lda_review.pd.DataFrame(rows)
+
+
+def split_selection_tokens(tokens: str) -> list[str]:
+    return [
+        token
+        for token in (
+            part.strip().strip('"').strip("'")
+            for part in re.split(r"[,;\n]+", str(tokens or ""))
+        )
+        if token
+    ]
+
+
+def select_lda_recordings_from_tokens(session_table, tokens: str, prompt_text: str):
+    raw_tokens = split_selection_tokens(tokens)
+    if not raw_tokens:
+        raw_tokens = split_selection_tokens(input(prompt_text).strip())
+    if not raw_tokens:
+        return session_table.iloc[0:0].copy()
+
+    recording_table = build_injection_recording_table(session_table)
+    selected_source_indices: list[int] = []
+    unmatched_tokens: list[str] = []
+    for token in raw_tokens:
+        matches = lda_review.pd.DataFrame()
+        parsed_id = html_review.safe_int(token)
+        if parsed_id is not None and "recording_id" in recording_table.columns:
+            matches = recording_table[recording_table["recording_id"].astype(int) == int(parsed_id)]
+        if matches.empty:
+            name_values = recording_table["recording_name"].astype(str)
+            matches = recording_table[name_values.str.lower() == token.lower()]
+        if matches.empty:
+            matches = recording_table[
+                recording_table["recording_name"].astype(str).str.contains(
+                    re.escape(token),
+                    case=False,
+                    regex=True,
+                    na=False,
+                )
+            ]
+        if matches.empty:
+            with patched_input_once(token):
+                matched_sessions = lda_review.prompt_for_session_selection(
+                    session_table,
+                    prompt_text,
+                )
+            if matched_sessions.empty:
+                unmatched_tokens.append(token)
+            else:
+                selected_session_ids = set(matched_sessions["session_id"].astype(int).tolist())
+                source_matches = session_table[
+                    session_table["session_id"].astype(int).isin(selected_session_ids)
+                ]
+                selected_source_indices.extend(int(index) for index in source_matches.index.tolist())
+            continue
+        for source_indices in matches["source_indices"].tolist():
+            selected_source_indices.extend(int(index) for index in source_indices)
+
+    if unmatched_tokens:
+        raise ValueError(f"Could not match recording token(s): {unmatched_tokens}")
+    selected_source_indices = sorted(set(selected_source_indices))
+    return session_table.loc[selected_source_indices].sort_values("session_start_datetime").reset_index(drop=True)
+
+
 def pipeline_options_payload(options: PipelineOptions) -> dict:
     lda_settings = require_lda_settings(options)
     tuning_settings = require_tuning_settings(options)
@@ -1539,14 +1810,19 @@ def pipeline_options_payload(options: PipelineOptions) -> dict:
     lda_payload["lda_path_remap_new"] = path_or_none(lda_settings.lda_path_remap_new)
     return {
         "input_roots": [str(path) for path in options.input_roots],
+        "resume_export_summary_path": path_or_none(options.resume_export_summary_path),
         "skip_cross_day": bool(options.skip_cross_day),
         "skip_presentation": bool(options.skip_presentation),
         "skip_lda": bool(options.skip_lda),
         "skip_tuning": bool(options.skip_tuning),
+        "skip_tuning_weinan": bool(options.skip_tuning_weinan),
+        "run_lda_hour_label": bool(options.run_lda_hour_label),
+        "run_lda_drug_label": bool(options.run_lda_drug_label),
         "stop_on_error": bool(options.stop_on_error),
         "overwrite_auto_exports": bool(options.overwrite_auto_exports),
         "lda_settings": lda_payload,
         "tuning_settings": settings_payload(tuning_settings),
+        "tuning_weinan_settings": settings_payload(require_tuning_weinan_settings(options)),
         "presentation_settings": settings_payload(presentation_settings),
     }
 
@@ -1572,12 +1848,21 @@ def run_single_day_auto_export(
             show_progress(f"No reusable within-day auto export for {day_root.name}: {exc}")
         else:
             if organized_input:
-                enrich_organized_export_members(
-                    OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
-                )
-                page_manifest_paths = existing_day_auto_export_paths(day_root)[2]
-                page_export = build_existing_page_export(page_manifest_paths)
-                reused_payload["summary_export"] = export_result_from_manifest(summary_manifest)
+                manifest_paths = [summary_manifest, *page_manifest_paths]
+                if export_members_are_organized_enriched(manifest_paths):
+                    show_progress(
+                        f"Reusable within-day auto export is already cache-enriched: {day_root.name}"
+                    )
+                else:
+                    show_progress(
+                        f"Reusable within-day auto export needs cache enrichment: {day_root.name}"
+                    )
+                    enrich_organized_export_members(
+                        OrganizedAutoAlignmentState(day_root, progress_callback=show_progress)
+                    )
+                    page_manifest_paths = existing_day_auto_export_paths(day_root)[2]
+                    page_export = build_existing_page_export(page_manifest_paths)
+                    reused_payload["summary_export"] = export_result_from_manifest(summary_manifest)
             payload = {
                 "status": "reused",
                 "day_root": str(day_root),
@@ -1804,6 +2089,28 @@ def default_stats_output_base_dir(export_summary_path: Path, name: str) -> Path:
     return Path(export_summary_path).parent / name
 
 
+def build_tagged_lda_output_run_dir(config, date_label: str, label_types: list[str], waveform_tag: str) -> Path:
+    run_id = config.output_run_id or lda_review.build_run_id()
+    config.output_run_id = run_id
+    folder_parts = [
+        f"lda_{lda_review.output_slug(lda_review.concise_date_label(date_label), 48)}",
+        f"minsess{int(config.min_sessions_per_unit)}",
+        waveform_tag,
+    ]
+    threshold_tag = lda_review.build_threshold_tag(config.data_path)
+    if threshold_tag:
+        folder_parts.append(lda_review.output_slug(threshold_tag, 180))
+    if lda_review.input_path_has_auto(config.data_path):
+        folder_parts.append("auto")
+    folder_stem = "__".join(folder_parts)
+    output_dir = lda_review.unique_concise_output_dir(
+        base_dir=config.output_base_dir,
+        folder_stem=folder_stem,
+    )
+    output_dir.mkdir(parents=True, exist_ok=False)
+    return output_dir
+
+
 def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) -> dict:
     lda_settings = require_lda_settings(options)
     config = lda_review.Config()
@@ -1812,6 +2119,7 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
         config.output_base_dir = default_stats_output_base_dir(export_summary_path, "LDA_auto")
     else:
         config.output_base_dir = ensure_auto_folder(Path(lda_settings.lda_output_base_dir))
+    config.label_type = str(lda_settings.lda_label_type)
     config.lda_mode = lda_settings.lda_mode
     config.single_day_date = lda_settings.lda_single_day_date
     config.min_firing_rate_hz = float(lda_settings.lda_min_firing_rate_hz)
@@ -1822,11 +2130,14 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
     config.feature_modes = tuple(lda_settings.lda_feature_modes)
     config.extra_label_types = tuple(lda_settings.lda_extra_label_types)
     config.injection_phase_schedule = lda_settings.lda_injection_phase_schedule
+    if not lda_settings.lda_use_waveform_features:
+        config.waveform_feature_sample_count = 0
 
     original_prompt_for_optional_injection_phase_analysis = (
         lda_review.prompt_for_optional_injection_phase_analysis
     )
     original_prompt_for_path_remap = lda_review.prompt_for_path_remap
+    original_build_output_run_dir = lda_review.build_output_run_dir
     configured_path_remap = (
         (lda_settings.lda_path_remap_old, lda_settings.lda_path_remap_new)
         if lda_settings.lda_path_remap_old is not None and lda_settings.lda_path_remap_new is not None
@@ -1838,6 +2149,16 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
 
     def configured_prompt_for_path_remap():
         return configured_path_remap
+
+    waveform_tag = "waveform" if lda_settings.lda_use_waveform_features else "no_waveform"
+
+    def tagged_build_output_run_dir(*, config, date_label, label_types):
+        return build_tagged_lda_output_run_dir(
+            config,
+            date_label=date_label,
+            label_types=label_types,
+            waveform_tag=waveform_tag,
+        )
 
     cache_index = (
         build_organized_cache_index(options.input_roots)
@@ -1875,6 +2196,7 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
 
     lda_review.prompt_for_optional_injection_phase_analysis = noninteractive_injection_phase_analysis
     lda_review.prompt_for_path_remap = configured_prompt_for_path_remap
+    lda_review.build_output_run_dir = tagged_build_output_run_dir
     if cache_index:
         lda_review.load_session_analyzers = cache_load_session_analyzers
         lda_review.select_good_unit_groups = cache_select_good_unit_groups
@@ -1886,6 +2208,7 @@ def run_lda_auto_export(export_summary_path: Path, *, options: PipelineOptions) 
             original_prompt_for_optional_injection_phase_analysis
         )
         lda_review.prompt_for_path_remap = original_prompt_for_path_remap
+        lda_review.build_output_run_dir = original_build_output_run_dir
         lda_review.load_session_analyzers = original_load_session_analyzers
         lda_review.select_good_unit_groups = original_select_good_unit_groups
         lda_review.build_population_vectors = original_build_population_vectors
@@ -1917,6 +2240,7 @@ def collect_lda_baseline_sham_drug_schedule(
     show_progress("Preparing baseline / sham / drug LDA label setup before stats stages.")
     config = lda_review.Config()
     config.data_path = export_summary_path
+    config.label_type = str(lda_settings.lda_label_type)
     config.lda_mode = lda_settings.lda_mode
     config.single_day_date = lda_settings.lda_single_day_date
     config.min_sessions_per_unit = int(lda_settings.lda_min_sessions_per_unit)
@@ -1938,21 +2262,36 @@ def collect_lda_baseline_sham_drug_schedule(
         "session_datetime_matched_text",
     ]
     available_columns = [column for column in display_columns if column in session_table.columns]
-    print("\nAvailable sessions for baseline / sham / drug LDA labels:", flush=True)
+    print("\nAvailable recordings for baseline / sham / drug LDA labels:", flush=True)
+    recording_table = build_injection_recording_table(session_table)
+    recording_display_columns = [
+        "recording_id",
+        "recording_name",
+        "session_start_datetime",
+        "num_session_rows",
+        "session_ids",
+    ]
+    print(recording_table[recording_display_columns].to_string(index=False), flush=True)
+    print(
+        "\nYou can enter recording_id values or recording_name tokens such as 260223_00; "
+        "all matching shank/session rows will be selected together.",
+        flush=True,
+    )
+    print("\nUnderlying session rows:", flush=True)
     print(session_table[available_columns].to_string(index=False), flush=True)
     print(
         "\nBaseline is assigned automatically to samples outside sham/drug intervals.",
         flush=True,
     )
-    sham_sessions = select_lda_sessions_from_tokens(
+    sham_sessions = select_lda_recordings_from_tokens(
         session_table,
         lda_settings.lda_sham_session_tokens,
-        "Enter sham injection session_id(s) or session name(s), separated by commas: ",
+        "Enter sham injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
     )
-    drug_sessions = select_lda_sessions_from_tokens(
+    drug_sessions = select_lda_recordings_from_tokens(
         session_table,
         lda_settings.lda_drug_session_tokens,
-        "Enter drug injection session_id(s) or session name(s), separated by commas: ",
+        "Enter drug injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
     )
     schedule = lda_review.build_injection_phase_schedule(sham_sessions, drug_sessions)
 
@@ -1980,10 +2319,6 @@ def collect_lda_baseline_sham_drug_schedule(
         raise RuntimeError("Baseline / sham / drug setup was not confirmed; stopping before stats.")
 
     lda_settings.lda_injection_phase_schedule = schedule
-    if "injection_phase" not in lda_settings.lda_extra_label_types:
-        lda_settings.lda_extra_label_types = tuple(
-            [*tuple(lda_settings.lda_extra_label_types or ()), "injection_phase"]
-        )
 
 
 def run_tuning_auto_export(export_summary_path: Path, *, options: PipelineOptions) -> dict:
@@ -2072,6 +2407,102 @@ def run_tuning_auto_export(export_summary_path: Path, *, options: PipelineOption
     }
 
 
+@contextmanager
+def patched_argv(argv: list[str]):
+    original_argv = sys.argv
+    sys.argv = list(argv)
+    try:
+        yield
+    finally:
+        sys.argv = original_argv
+
+
+def run_tuning_weinan_auto_export(export_summary_path: Path, *, options: PipelineOptions) -> dict:
+    tuning_settings = require_tuning_settings(options)
+    weinan_settings = require_tuning_weinan_settings(options)
+    cache_index = (
+        build_organized_cache_index(options.input_roots)
+        if looks_like_organized_input(options.input_roots)
+        else {}
+    )
+
+    original_min_sessions = tuning_weinan_review.MIN_SESSIONS_PER_UNIT
+    original_bin_size = tuning_weinan_review.BIN_SIZE_SECONDS
+    original_load_aligned_minute_data = tuning_weinan_review.load_aligned_minute_data_like_tuning
+
+    def cache_load_aligned_minute_data(data_path: Path):
+        aligned_input_path = tuning_weinan_review.normalize_aligned_input_path(data_path)
+        config = tuning_weinan_review.build_lda_config(aligned_input_path)
+        config.waveform_feature_sample_count = 0
+        export_path = lda_review.resolve_export_summary_path(aligned_input_path)
+        tuning_weinan_review.log_status(f"Loading alignment export: {export_path}")
+        export_payload = lda_review.load_export_summary(export_path)
+        session_table = lda_review.build_session_table(export_payload=export_payload, config=config)
+        session_table = lda_review.filter_session_table_for_lda_mode(session_table, config)
+        selected_units = select_good_unit_groups_from_organized_cache(
+            export_payload=export_payload,
+            config=config,
+            cache_index=cache_index,
+        )
+        minute_matrix, minute_metadata, feature_table = build_population_vectors_from_organized_cache(
+            selected_units=selected_units,
+            session_table=session_table,
+            cache_index=cache_index,
+            config=config,
+        )
+        feature_columns = feature_table["feature_column"].astype(str).tolist()
+        minute_values = lda_review.pd.DataFrame(minute_matrix, columns=feature_columns)
+        minute_wide = lda_review.pd.concat(
+            [minute_metadata.reset_index(drop=True), minute_values.reset_index(drop=True)],
+            axis=1,
+        )
+        tuning_weinan_review.log_status(
+            "Using Sorting_organize.py cache input; skipping analyzer loading for Tuning-Weinan."
+        )
+        return minute_wide, feature_table, selected_units, export_path
+
+    output_root = Path(export_summary_path).parent / "tuning_weinan_aligned_units"
+    argv = [
+        "Tuning_Weinan.py",
+        "--run-root",
+        str(export_summary_path),
+        "--input-mode",
+        "aligned",
+    ]
+    if weinan_settings.tuning_weinan_max_aligned_units is not None:
+        argv.extend(["--max-aligned-units", str(int(weinan_settings.tuning_weinan_max_aligned_units))])
+
+    tuning_weinan_review.MIN_SESSIONS_PER_UNIT = int(tuning_settings.tuning_min_sessions_per_unit)
+    tuning_weinan_review.BIN_SIZE_SECONDS = float(tuning_settings.tuning_bin_size_seconds)
+    if cache_index:
+        tuning_weinan_review.load_aligned_minute_data_like_tuning = cache_load_aligned_minute_data
+    try:
+        with patched_argv(argv):
+            exit_code = tuning_weinan_review.main()
+    finally:
+        tuning_weinan_review.MIN_SESSIONS_PER_UNIT = original_min_sessions
+        tuning_weinan_review.BIN_SIZE_SECONDS = original_bin_size
+        tuning_weinan_review.load_aligned_minute_data_like_tuning = original_load_aligned_minute_data
+
+    output_files = sorted(
+        str(path)
+        for pattern in ("*.png", "*.npz", "*.csv", "*.json")
+        for path in output_root.glob(pattern)
+    )
+    polar_files = sorted(str(path) for path in (output_root / "polar_time_of_day_units").rglob("*") if path.is_file()) if (output_root / "polar_time_of_day_units").is_dir() else []
+    return {
+        "exit_code": int(exit_code),
+        "output_dir": str(require_existing_dir(output_root, "Tuning-Weinan auto output")),
+        "output_files": output_files,
+        "polar_output_files": polar_files,
+        "verification": {
+            "output_dir": str(output_root),
+            "num_output_files": len(output_files),
+            "num_polar_output_files": len(polar_files),
+        },
+    }
+
+
 def failed_stage_payload(stage_name: str, exc: Exception) -> dict:
     return {
         "status": "failed",
@@ -2082,13 +2513,122 @@ def failed_stage_payload(stage_name: str, exc: Exception) -> dict:
     }
 
 
+def options_for_lda_label(options: PipelineOptions, *, label_type: str, use_drug_labels: bool) -> PipelineOptions:
+    current_lda_settings = require_lda_settings(options)
+    extra_label_types = tuple(
+        label_type_text
+        for label_type_text in tuple(current_lda_settings.lda_extra_label_types or ())
+        if str(label_type_text) != "injection_phase"
+    )
+    lda_settings = replace(
+        current_lda_settings,
+        lda_label_type=label_type,
+        lda_extra_label_types=tuple() if use_drug_labels else extra_label_types,
+        lda_use_baseline_sham_drug=bool(use_drug_labels),
+        lda_injection_phase_schedule=current_lda_settings.lda_injection_phase_schedule,
+    )
+    return replace(options, lda=lda_settings)
+
+
+def run_selected_lda_auto_exports(
+    stats_export_summary_path: Path,
+    *,
+    options: PipelineOptions,
+    timings: list[dict],
+) -> dict | None:
+    if options.skip_lda:
+        show_progress("Skipping LDA by request.")
+        return None
+
+    lda_results: dict[str, dict] = {}
+    if options.run_lda_drug_label:
+        try:
+            with timed_stage("LDA sham/drug marker setup", timings):
+                collect_lda_baseline_sham_drug_schedule(
+                    stats_export_summary_path,
+                    options=options,
+                )
+            lda_results["sham_drug_marker_setup"] = {
+                "status": "completed",
+                "used_for": "hour_label_marker_shapes",
+            }
+        except Exception as exc:
+            lda_results["sham_drug_marker_setup"] = failed_stage_payload(
+                "LDA sham/drug marker setup",
+                exc,
+            )
+            show_progress(f"LDA sham/drug marker setup failed; continuing with later stages: {exc}")
+            if options.stop_on_error:
+                raise
+
+    if options.run_lda_hour_label:
+        hour_options = options_for_lda_label(
+            options,
+            label_type="clock_hour_of_day",
+            use_drug_labels=False,
+        )
+        try:
+            with timed_stage("LDA hour-label auto stats", timings):
+                lda_results["hour_label"] = run_lda_auto_export(
+                    stats_export_summary_path,
+                    options=hour_options,
+                )
+        except Exception as exc:
+            lda_results["hour_label"] = failed_stage_payload("LDA hour-label auto stats", exc)
+            show_progress(f"LDA hour-label failed; continuing with later stages: {exc}")
+            if options.stop_on_error:
+                raise
+
+    if options.run_lda_drug_label:
+        show_progress(
+            "Sham/drug selection was used as marker shapes on hour-label LDA plots; "
+            "no separate baseline/sham/drug LDA analysis was run."
+        )
+
+    if not lda_results:
+        show_progress("Skipping LDA because no LDA label analysis was selected.")
+        return None
+    return lda_results
+
+
+def run_presentation_stage(
+    stats_export_summary_path: Path,
+    *,
+    options: PipelineOptions,
+    timings: list[dict],
+    allow_presentation: bool = True,
+    skip_reason: str = "Skipping presentation_multiple stats because no cross-day export was produced.",
+) -> dict | None:
+    if options.skip_presentation:
+        show_progress("Skipping presentation_multiple stats by request.")
+        return None
+    if not allow_presentation:
+        show_progress(skip_reason)
+        return None
+    try:
+        with timed_stage("presentation_multiple auto stats", timings):
+            return run_presentation_auto_export(
+                stats_export_summary_path,
+                options=options,
+            )
+    except Exception as exc:
+        presentation_result = failed_stage_payload("presentation_multiple auto stats", exc)
+        show_progress(f"presentation_multiple failed; continuing with later stages: {exc}")
+        if options.stop_on_error:
+            raise
+        return presentation_result
+
+
 def run_auto_pipeline(options: PipelineOptions) -> dict:
     timings: list[dict] = []
     selected_roots = [path.resolve() for path in options.input_roots]
+    show_progress("Checking whether input roots are Sorting_organize.py cache folders...")
     organized_input = looks_like_organized_input(selected_roots)
     if organized_input:
         patch_day_review_for_auto_roots()
         show_progress("Detected Sorting_organize.py cache input mode.")
+    else:
+        show_progress("Sorting_organize.py cache input mode was not detected.")
     day_roots = discover_day_roots_for_mode(
         selected_roots,
         organized_input=organized_input,
@@ -2159,43 +2699,11 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
         show_progress("Skipping cross-day alignment export by request.")
         stats_export_summary_path = Path(day_results[-1]["summary_export"]["export_manifest_path"])
 
-    if not options.skip_lda:
-        with timed_stage("LDA baseline/sham/drug label setup", timings):
-            collect_lda_baseline_sham_drug_schedule(
-                stats_export_summary_path,
-                options=options,
-            )
-
-    presentation_result = None
-    if not options.skip_presentation and cross_day_result is not None:
-        try:
-            with timed_stage("presentation_multiple auto stats", timings):
-                presentation_result = run_presentation_auto_export(
-                    stats_export_summary_path,
-                    options=options,
-                )
-        except Exception as exc:
-            presentation_result = failed_stage_payload("presentation_multiple auto stats", exc)
-            show_progress(f"presentation_multiple failed; continuing with later stages: {exc}")
-            if options.stop_on_error:
-                raise
-    elif options.skip_presentation:
-        show_progress("Skipping presentation_multiple stats by request.")
-    else:
-        show_progress("Skipping presentation_multiple stats because no cross-day export was produced.")
-
-    lda_result = None
-    if not options.skip_lda:
-        try:
-            with timed_stage("LDA auto stats", timings):
-                lda_result = run_lda_auto_export(stats_export_summary_path, options=options)
-        except Exception as exc:
-            lda_result = failed_stage_payload("LDA auto stats", exc)
-            show_progress(f"LDA failed; continuing with later stages: {exc}")
-            if options.stop_on_error:
-                raise
-    else:
-        show_progress("Skipping LDA by request.")
+    lda_result = run_selected_lda_auto_exports(
+        stats_export_summary_path,
+        options=options,
+        timings=timings,
+    )
 
     tuning_result = None
     if not options.skip_tuning:
@@ -2209,6 +2717,29 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
                 raise
     else:
         show_progress("Skipping Tuning by request.")
+
+    tuning_weinan_result = None
+    if not options.skip_tuning_weinan:
+        try:
+            with timed_stage("Tuning-Weinan auto stats", timings):
+                tuning_weinan_result = run_tuning_weinan_auto_export(
+                    stats_export_summary_path,
+                    options=options,
+                )
+        except Exception as exc:
+            tuning_weinan_result = failed_stage_payload("Tuning-Weinan auto stats", exc)
+            show_progress(f"Tuning-Weinan failed; continuing with later stages: {exc}")
+            if options.stop_on_error:
+                raise
+    else:
+        show_progress("Skipping Tuning-Weinan by request.")
+
+    presentation_result = run_presentation_stage(
+        stats_export_summary_path,
+        options=options,
+        timings=timings,
+        allow_presentation=cross_day_result is not None,
+    )
 
     run_payload = {
         "input_roots": [str(path) for path in selected_roots],
@@ -2230,10 +2761,91 @@ def run_auto_pipeline(options: PipelineOptions) -> dict:
         "presentation_result": presentation_result,
         "lda_result": lda_result,
         "tuning_result": tuning_result,
+        "tuning_weinan_result": tuning_weinan_result,
         "timings": timings,
     }
     write_json(common_root / day_summary_folder_name / "alignment_auto_run_summary.json", run_payload)
     print_runtime_summary(timings)
+    return run_payload
+
+
+def run_resume_analysis_pipeline(options: PipelineOptions) -> dict:
+    timings: list[dict] = []
+    if options.resume_export_summary_path is None:
+        raise ValueError("Resume mode requires a previous auto cross-day export_summary.json.")
+
+    stats_export_summary_path = resolve_export_summary_input(options.resume_export_summary_path)
+    selected_roots = [path.resolve() for path in options.input_roots]
+    show_progress("Checking whether resumed analysis has Sorting_organize.py cache inputs...")
+    organized_input = looks_like_organized_input(selected_roots)
+    if organized_input:
+        patch_day_review_for_auto_roots()
+        show_progress("Detected Sorting_organize.py cache input mode for resumed analysis.")
+    else:
+        show_progress("No Sorting_organize.py cache input was detected for resumed analysis.")
+
+    show_progress("Resuming downstream analysis from previous alignment export.")
+    show_progress(f"Previous alignment export: {stats_export_summary_path}")
+    show_progress(html_review.json.dumps(pipeline_options_payload(options), indent=2))
+
+    lda_result = run_selected_lda_auto_exports(
+        stats_export_summary_path,
+        options=options,
+        timings=timings,
+    )
+
+    tuning_result = None
+    if not options.skip_tuning:
+        try:
+            with timed_stage("Tuning auto stats", timings):
+                tuning_result = run_tuning_auto_export(stats_export_summary_path, options=options)
+        except Exception as exc:
+            tuning_result = failed_stage_payload("Tuning auto stats", exc)
+            show_progress(f"Tuning failed; the alignment outputs remain saved: {exc}")
+            if options.stop_on_error:
+                raise
+    else:
+        show_progress("Skipping Tuning by request.")
+
+    tuning_weinan_result = None
+    if not options.skip_tuning_weinan:
+        try:
+            with timed_stage("Tuning-Weinan auto stats", timings):
+                tuning_weinan_result = run_tuning_weinan_auto_export(
+                    stats_export_summary_path,
+                    options=options,
+                )
+        except Exception as exc:
+            tuning_weinan_result = failed_stage_payload("Tuning-Weinan auto stats", exc)
+            show_progress(f"Tuning-Weinan failed; continuing with later stages: {exc}")
+            if options.stop_on_error:
+                raise
+    else:
+        show_progress("Skipping Tuning-Weinan by request.")
+
+    presentation_result = run_presentation_stage(
+        stats_export_summary_path,
+        options=options,
+        timings=timings,
+        allow_presentation=True,
+    )
+
+    run_payload = {
+        "input_roots": [str(path) for path in selected_roots],
+        "input_mode": "sorting_organize_cache" if organized_input else "sorting_analyzer",
+        "resume_mode": True,
+        "options": pipeline_options_payload(options),
+        "stats_export_summary_path": str(stats_export_summary_path),
+        "presentation_result": presentation_result,
+        "lda_result": lda_result,
+        "tuning_result": tuning_result,
+        "tuning_weinan_result": tuning_weinan_result,
+        "timings": timings,
+    }
+    summary_path = stats_export_summary_path.parent / "resume_analysis_run_summary.json"
+    write_json(summary_path, run_payload)
+    print_runtime_summary(timings)
+    show_progress(f"Resume analysis summary: {summary_path}")
     return run_payload
 
 
@@ -2254,6 +2866,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--resume-export-summary",
+        help=(
+            "Skip alignment and run downstream analysis from a previous auto cross-day "
+            "export_summary.json, or from the folder containing it."
+        ),
+    )
+    parser.add_argument(
         "--skip-cross-day",
         action="store_true",
         help="Only write per-day units_alignment_summary_auto exports.",
@@ -2261,6 +2880,7 @@ def main() -> None:
     parser.add_argument("--skip-presentation", action="store_true", help="Skip presentation_multiple.py outputs.")
     parser.add_argument("--skip-lda", action="store_true", help="Skip LDA.py outputs.")
     parser.add_argument("--skip-tuning", action="store_true", help="Skip Tuning.py outputs.")
+    parser.add_argument("--skip-tuning-weinan", action="store_true", help="Skip Tuning_Weinan.py outputs.")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop when a downstream stats stage fails.")
     parser.add_argument(
         "--overwrite-auto-exports",
@@ -2292,6 +2912,11 @@ def main() -> None:
         choices=["single_day_5min", "multi_day_hourly"],
         default=lda_review.LDA_MODE,
     )
+    parser.add_argument(
+        "--lda-label-type",
+        default=lda_review.LABEL_TYPE,
+        help="Primary LDA label type. Resume prompts can run hour and drug labels separately.",
+    )
     parser.add_argument("--lda-single-day-date", default=lda_review.SINGLE_DAY_DATE)
     parser.add_argument("--lda-min-firing-rate-hz", type=float, default=lda_review.MIN_FIRING_RATE_HZ)
     parser.add_argument(
@@ -2305,24 +2930,41 @@ def main() -> None:
     )
     parser.add_argument("--lda-min-bins-per-label", type=int, default=lda_review.MIN_BINS_PER_LABEL)
     parser.add_argument("--lda-cv-n-splits", type=int, default=lda_review.CV_N_SPLITS)
-    parser.add_argument("--lda-n-permutations", type=int, default=lda_review.N_PERMUTATIONS)
+    parser.add_argument(
+        "--lda-n-permutations",
+        type=int,
+        default=LDA_N_PERMUTATIONS_AUTO,
+        help=(
+            "Number of label-shuffle permutation tests for LDA p-values. "
+            f"Default for this auto pipeline: {LDA_N_PERMUTATIONS_AUTO}."
+        ),
+    )
     parser.add_argument(
         "--lda-feature-modes",
         help="Comma-separated LDA feature modes. Defaults to LDA.py FEATURE_MODES.",
     )
     parser.add_argument(
+        "--lda-use-waveform-features",
+        choices=["ask", "yes", "no"],
+        default="ask",
+        help=(
+            "Whether to include cached waveform features in LDA feature modes. "
+            "If no, FR_WAVEFORM, WAVEFORM_ONLY, and MULTI_FEATURE are removed."
+        ),
+    )
+    parser.add_argument(
         "--lda-extra-label-types",
         default="",
         help=(
-            "Comma-separated extra LDA label types. Use --lda-baseline-sham-drug for "
-            "baseline/sham/drug so that setup happens before stats stages."
+            "Comma-separated extra LDA label types. Sham/drug markers for hour-label "
+            "plots are controlled by --lda-baseline-sham-drug."
         ),
     )
     parser.add_argument(
         "--lda-baseline-sham-drug",
         choices=["ask", "yes", "no"],
         default="ask",
-        help="Whether to add the optional baseline/sham/drug LDA label analysis.",
+        help="Whether to add sham/drug marker shapes to hour-label LDA figures.",
     )
     parser.add_argument(
         "--lda-sham-sessions",
@@ -2367,19 +3009,30 @@ def main() -> None:
         choices=["sem", "iqr"],
         default=tuning_review.VARIABILITY_MODE,
     )
+    parser.add_argument(
+        "--tuning-weinan-max-aligned-units",
+        type=int,
+        default=tuning_weinan_review.MAX_ALIGNED_UNITS,
+        help="Maximum aligned units to plot for Tuning_Weinan.py. Use 0 to plot all units.",
+    )
     args = parser.parse_args()
 
     options = prompt_for_pipeline_options(args)
+    show_progress("Startup prompts are complete; beginning pipeline execution.")
 
     try:
-        result = run_auto_pipeline(options)
+        if options.resume_export_summary_path is not None:
+            result = run_resume_analysis_pipeline(options)
+        else:
+            result = run_auto_pipeline(options)
     except Exception as exc:
         print(f"[error] {exc}", flush=True)
         print(traceback.format_exc(), flush=True)
         raise
 
     show_progress("Automatic alignment pipeline complete.")
-    show_progress(f"Run summary: {Path(result['common_root']) / result['day_summary_folder_name'] / 'alignment_auto_run_summary.json'}")
+    if "common_root" in result:
+        show_progress(f"Run summary: {Path(result['common_root']) / result['day_summary_folder_name'] / 'alignment_auto_run_summary.json'}")
 
 
 if __name__ == "__main__":

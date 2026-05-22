@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
+import importlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,10 @@ HOUR_DURATION_SEC = 3600
 SAVE_PREPROCESSED_RECORDING = True
 OVERWRITE_SORTER_OUTPUT = True
 MAX_PARALLEL_SHANKS = 4
+ORGANIZE_ANALYZER_OUTPUTS = True
+ORGANIZED_CACHE_DIR_NAME = "unit_feature_cache"
+ORGANIZED_BIN_SIZE_SECONDS = 60.0
+ORGANIZED_SAVE_MINUTE_WAVEFORMS = False
 
 MS_BEFORE = 1.0
 MS_AFTER = 2.0
@@ -71,6 +76,11 @@ MS5_SORTER_PARAMS = {
     "n_jobs": 1,
     "chunk_duration": "1s",
     "progress_bar": True,
+}
+
+MS5_OVERFLOW_FALLBACK_PARAMS = {
+    "whiten": True,
+    "skip_alignment": True,
 }
 
 
@@ -189,6 +199,14 @@ def build_batch_output_folder_for_inputs(input_paths: list[Path], data_files: li
 
 def get_overflow_report_path(batch_output_folder: Path, session_description: str) -> Path:
     return batch_output_folder / f"overflow_error_report_{session_description}.json"
+
+
+def get_overflow_skiptemplate_summary_path(batch_output_folder: Path, session_description: str) -> Path:
+    return batch_output_folder / f"overflow_skiptemplate_summary_{session_description}.json"
+
+
+def get_organized_output_root(batch_output_folder: Path) -> Path:
+    return batch_output_folder.parent / f"{batch_output_folder.name}_org"
 
 
 def get_sorting_unit_property(sorting, unit_id, property_name: str):
@@ -845,12 +863,109 @@ def prepare_recording_for_pipeline(recording, window_label: str = "full_recordin
     return rec_preprocessed, preprocessing_metadata, prep_elapsed_sec, step_timings
 
 
+def is_template_alignment_overflow_error(exc: Exception) -> bool:
+    exc_text = f"{type(exc).__name__}: {exc}".lower()
+    return is_overflow_sorting_error(exc) and "align_templates" in exc_text
+
+
+def _build_ms5_scheme2_parameters(sorter_params: dict):
+    import mountainsort5 as ms5
+
+    return ms5.Scheme2SortingParameters(
+        phase1_detect_channel_radius=sorter_params["scheme2_phase1_detect_channel_radius"],
+        detect_channel_radius=sorter_params["scheme2_detect_channel_radius"],
+        phase1_detect_threshold=sorter_params["detect_threshold"],
+        phase1_detect_time_radius_msec=sorter_params.get("detect_time_radius_msec", 0.5),
+        detect_time_radius_msec=sorter_params.get("detect_time_radius_msec", 0.5),
+        phase1_npca_per_channel=sorter_params["npca_per_channel"],
+        phase1_npca_per_subdivision=sorter_params["npca_per_subdivision"],
+        detect_sign=sorter_params["detect_sign"],
+        detect_threshold=sorter_params["detect_threshold"],
+        snippet_T1=sorter_params.get("snippet_T1", 20),
+        snippet_T2=sorter_params.get("snippet_T2", 20),
+        snippet_mask_radius=sorter_params["snippet_mask_radius"],
+        max_num_snippets_per_training_batch=sorter_params["scheme2_max_num_snippets_per_training_batch"],
+        classifier_npca=None,
+        training_duration_sec=sorter_params["scheme2_training_duration_sec"],
+        training_recording_sampling_mode=sorter_params["scheme2_training_recording_sampling_mode"],
+        classification_chunk_sec=sorter_params.get("classification_chunk_sec"),
+    )
+
+
+def _run_mountainsort5_skip_alignment_fallback(recording, sorter_params: dict):
+    import mountainsort5 as ms5
+
+    rec_ms5 = recording
+    if sorter_params.get("whiten", True):
+        rec_ms5 = preproc.whiten(rec_ms5, dtype="float32")
+
+    scheme2_sorting_parameters = _build_ms5_scheme2_parameters(sorter_params)
+    scheme2_module = importlib.import_module("mountainsort5.schemes.sorting_scheme2")
+    original_sorting_scheme1 = scheme2_module.sorting_scheme1
+
+    def sorting_scheme1_skip_alignment(*, recording, sorting_parameters):
+        sorting_parameters.skip_alignment = True
+        return original_sorting_scheme1(recording=recording, sorting_parameters=sorting_parameters)
+
+    scheme2_module.sorting_scheme1 = sorting_scheme1_skip_alignment
+    try:
+        return ms5.sorting_scheme2(
+            recording=rec_ms5,
+            sorting_parameters=scheme2_sorting_parameters,
+        )
+    finally:
+        scheme2_module.sorting_scheme1 = original_sorting_scheme1
+
+
+def _collect_recording_debug_metadata(recording) -> dict:
+    sampling_frequency = None
+    num_frames = None
+    duration_seconds = None
+    num_channels = None
+    channel_ids = []
+    property_keys = []
+
+    try:
+        sampling_frequency = float(recording.get_sampling_frequency())
+    except Exception:
+        pass
+    try:
+        num_frames = int(recording.get_num_frames())
+    except Exception:
+        pass
+    if sampling_frequency and num_frames is not None and sampling_frequency > 0:
+        duration_seconds = float(num_frames / sampling_frequency)
+    try:
+        num_channels = int(recording.get_num_channels())
+    except Exception:
+        pass
+    try:
+        channel_ids = [str(ch) for ch in recording.get_channel_ids()]
+    except Exception:
+        pass
+    try:
+        property_keys = list(recording.get_property_keys())
+    except Exception:
+        pass
+
+    return {
+        "sampling_frequency": sampling_frequency,
+        "num_frames": num_frames,
+        "duration_seconds": duration_seconds,
+        "duration_hours": (duration_seconds / 3600.0) if duration_seconds is not None else None,
+        "num_channels": num_channels,
+        "channel_ids": channel_ids,
+        "recording_property_keys": property_keys,
+    }
+
+
 def run_sorter_pipeline(
     output_folder: Path,
     recording,
     input_sources: list[Path],
     shank_id: str,
     window_label: str = "full_recording",
+    skip_template_alignment: bool = False,
 ):
     sorter_run_folder = output_folder / "sorter_output"
     sorted_sorting_folder = output_folder / "sorted_sorting"
@@ -872,78 +987,67 @@ def run_sorter_pipeline(
         )
 
     sorter_params = dict(MS5_SORTER_PARAMS)
-    print(
-        "Running MountainSort5 with conservative long-recording settings: "
-        f"scheme={sorter_params['scheme']}, "
-        f"training_duration_sec={sorter_params['scheme2_training_duration_sec']}, "
-        f"chunk_duration={sorter_params['chunk_duration']}, "
-        f"n_jobs={sorter_params['n_jobs']}"
-    )
+    fallback_attempted = bool(skip_template_alignment)
+    fallback_succeeded = False
+    if skip_template_alignment:
+        sorter_params.update(MS5_OVERFLOW_FALLBACK_PARAMS)
+        print(
+            "Running MountainSort5 skip-template-alignment retry: "
+            f"scheme={sorter_params['scheme']}, "
+            f"training_duration_sec={sorter_params['scheme2_training_duration_sec']}, "
+            f"chunk_duration={sorter_params['chunk_duration']}, "
+            f"n_jobs={sorter_params['n_jobs']}, "
+            "skip_alignment=True"
+        )
+    else:
+        print(
+            "Running MountainSort5 with conservative long-recording settings: "
+            f"scheme={sorter_params['scheme']}, "
+            f"training_duration_sec={sorter_params['scheme2_training_duration_sec']}, "
+            f"chunk_duration={sorter_params['chunk_duration']}, "
+            f"n_jobs={sorter_params['n_jobs']}"
+        )
 
     try:
-        sorting, sorting_elapsed_sec = time_step(
-            f"shank_{shank_id}_{window_label}_run_sorter",
-            ss.run_sorter,
-            sorter_name="mountainsort5",
-            recording=rec_for_sorting,
-            folder=sorter_run_folder,
-            remove_existing_folder=OVERWRITE_SORTER_OUTPUT,
-            verbose=True,
-            **sorter_params,
-        )
+        if skip_template_alignment:
+            sorting, sorting_elapsed_sec = time_step(
+                f"shank_{shank_id}_{window_label}_run_sorter_skiptemplate",
+                _run_mountainsort5_skip_alignment_fallback,
+                recording=rec_for_sorting,
+                sorter_params=sorter_params,
+            )
+            fallback_succeeded = True
+            step_timings["overflow_skiptemplate_retry_used"] = 1.0
+        else:
+            sorting, sorting_elapsed_sec = time_step(
+                f"shank_{shank_id}_{window_label}_run_sorter",
+                ss.run_sorter,
+                sorter_name="mountainsort5",
+                recording=rec_for_sorting,
+                folder=sorter_run_folder,
+                remove_existing_folder=OVERWRITE_SORTER_OUTPUT,
+                verbose=True,
+                **sorter_params,
+            )
     except Exception as exc:
-        sampling_frequency = None
-        num_frames = None
-        duration_seconds = None
-        num_channels = None
-        channel_ids = []
-        property_keys = []
-
-        try:
-            sampling_frequency = float(rec_for_sorting.get_sampling_frequency())
-        except Exception:
-            pass
-        try:
-            num_frames = int(rec_for_sorting.get_num_frames())
-        except Exception:
-            pass
-        if sampling_frequency and num_frames is not None and sampling_frequency > 0:
-            duration_seconds = float(num_frames / sampling_frequency)
-        try:
-            num_channels = int(rec_for_sorting.get_num_channels())
-        except Exception:
-            pass
-        try:
-            channel_ids = [str(ch) for ch in rec_for_sorting.get_channel_ids()]
-        except Exception:
-            pass
-        try:
-            property_keys = list(rec_for_sorting.get_property_keys())
-        except Exception:
-            pass
-
         failure_summary = {
             "input_sources": [str(path) for path in input_sources],
             "output_folder": str(output_folder),
             "sorter_run_folder": str(sorter_run_folder),
             "shank_id": str(shank_id),
             "window_label": str(window_label),
-            "sorter": "mountainsort5",
+            "sorter": "mountainsort5_skiptemplate" if skip_template_alignment else "mountainsort5",
             "sorter_params": sorter_params,
-            "sampling_frequency": sampling_frequency,
-            "num_frames": num_frames,
-            "duration_seconds": duration_seconds,
-            "duration_hours": (duration_seconds / 3600.0) if duration_seconds is not None else None,
-            "num_channels": num_channels,
-            "channel_ids": channel_ids,
-            "recording_property_keys": property_keys,
             "materialize_shank_recording_as_numpy": bool(MATERIALIZE_SHANK_RECORDING_AS_NUMPY),
             "save_preprocessed_recording": bool(SAVE_PREPROCESSED_RECORDING),
             "max_parallel_shanks": int(MAX_PARALLEL_SHANKS),
+            "fallback_attempted": fallback_attempted,
+            "fallback_succeeded": fallback_succeeded,
             "exception_type": type(exc).__name__,
             "exception_message": str(exc),
             "traceback": traceback.format_exc(),
         }
+        failure_summary.update(_collect_recording_debug_metadata(rec_for_sorting))
         failure_summary_path = output_folder / "sorting_failure_summary.json"
         save_json(failure_summary_path, failure_summary)
         print(f"Saved sorter failure summary to: {failure_summary_path}")
@@ -988,8 +1092,10 @@ def run_sorter_pipeline(
         "sorting_elapsed_sec": float(sorting_elapsed_sec),
         "step_timings": step_timings,
         "channel_ids": [str(ch) for ch in rec_for_sorting.get_channel_ids()],
-        "sorter": "mountainsort5",
+        "sorter": "mountainsort5_skiptemplate" if skip_template_alignment else "mountainsort5",
         "sorter_params": sorter_params,
+        "overflow_skiptemplate_retry_attempted": bool(fallback_attempted),
+        "overflow_skiptemplate_retry_succeeded": bool(fallback_succeeded),
     }
     save_json(output_folder / "sorting_summary.json", summary)
 
@@ -1002,9 +1108,16 @@ def run_sorter_pipeline(
     return sorting, sorting_elapsed_sec, step_timings
 
 
-def create_or_load_analyzer(output_folder: Path, sorting, recording):
+def create_or_load_analyzer(output_folder: Path, sorting, recording, force_rebuild: bool = False):
     analyzer_folder = output_folder / "sorting_analyzer_analysis.zarr"
     step_timings: dict[str, float] = {}
+    if analyzer_folder.exists() and force_rebuild:
+        _, step_timings["remove_existing_sorting_analyzer_elapsed_sec"] = time_step(
+            "remove_existing_sorting_analyzer",
+            shutil.rmtree,
+            analyzer_folder,
+            ignore_errors=True,
+        )
     if analyzer_folder.exists():
         analyzer, step_timings["load_sorting_analyzer_elapsed_sec"] = time_step(
             "load_sorting_analyzer",
@@ -1168,7 +1281,53 @@ def save_unit_waveform_plots(analyzer, output_folder: Path):
     return waveform_folder, int(saved_count)
 
 
-def run_analysis_pipeline(output_folder: Path, sorting, recording):
+def organize_analyzer_output(
+    analyzer,
+    analyzer_folder: Path,
+    batch_output_folder: Path,
+) -> dict:
+    if not ORGANIZE_ANALYZER_OUTPUTS:
+        return {
+            "organized_output_enabled": False,
+            "organized_cache_folder": None,
+        }
+
+    organized_root = get_organized_output_root(batch_output_folder)
+    organizer = importlib.import_module("Sorting_organize")
+    cache_paths = organizer.build_cache_paths(
+        analyzer_folder,
+        ORGANIZED_CACHE_DIR_NAME,
+        cache_root=organized_root,
+        cache_root_is_cache_folder=False,
+    )
+    cache_folder = cache_paths["folder"]
+    if cache_folder.exists():
+        shutil.rmtree(cache_folder, ignore_errors=True)
+        print(f"Removed stale organized cache folder: {cache_folder}")
+    cache_folder = organizer.build_unit_feature_cache(
+        analyzer=analyzer,
+        analyzer_folder=analyzer_folder,
+        cache_dir_name=ORGANIZED_CACHE_DIR_NAME,
+        cache_root=organized_root,
+        cache_root_is_cache_folder=False,
+        bin_size_seconds=ORGANIZED_BIN_SIZE_SECONDS,
+        overwrite=True,
+        save_minute_waveforms=ORGANIZED_SAVE_MINUTE_WAVEFORMS,
+    )
+    return {
+        "organized_output_enabled": True,
+        "organized_output_root": str(organized_root),
+        "organized_cache_folder": str(cache_folder),
+    }
+
+
+def run_analysis_pipeline(
+    output_folder: Path,
+    sorting,
+    recording,
+    batch_output_folder: Path | None = None,
+    force_rebuild_analyzer: bool = False,
+):
     analysis_start = perf_counter()
     if sorting.get_num_units() == 0:
         analysis_elapsed_sec = perf_counter() - analysis_start
@@ -1188,7 +1347,12 @@ def run_analysis_pipeline(output_folder: Path, sorting, recording):
         return analysis_elapsed_sec, {}
 
     analysis_step_timings: dict[str, float] = {}
-    analyzer, analyzer_step_timings = create_or_load_analyzer(output_folder, sorting, recording)
+    analyzer, analyzer_step_timings = create_or_load_analyzer(
+        output_folder,
+        sorting,
+        recording,
+        force_rebuild=force_rebuild_analyzer,
+    )
     analysis_step_timings.update(analyzer_step_timings)
 
     print(f"Output folder: {output_folder}")
@@ -1208,11 +1372,41 @@ def run_analysis_pipeline(output_folder: Path, sorting, recording):
         analyzer,
         output_folder,
     )
+    organized_output = {
+        "organized_output_enabled": False,
+        "organized_cache_folder": None,
+        "organized_output_status": "not_requested",
+    }
+    if batch_output_folder is not None:
+        try:
+            organized_output, analysis_step_timings["organize_analyzer_output_elapsed_sec"] = time_step(
+                "organize_analyzer_output",
+                organize_analyzer_output,
+                analyzer,
+                output_folder / "sorting_analyzer_analysis.zarr",
+                batch_output_folder,
+            )
+            organized_output["organized_output_status"] = "completed"
+        except Exception as exc:
+            organized_output = {
+                "organized_output_enabled": bool(ORGANIZE_ANALYZER_OUTPUTS),
+                "organized_output_status": "failed",
+                "organized_cache_folder": None,
+                "organized_output_exception_type": type(exc).__name__,
+                "organized_output_exception_message": str(exc),
+                "organized_output_traceback": traceback.format_exc(),
+            }
+            print(
+                "Organized analyzer output failed, but sorting/analyzer output was saved. "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     print("\nAnalysis complete.")
     print(f"Saved unit summaries to: {summary_folder}")
     print(f"Saved waveform plots to: {waveform_folder}")
     print(f"Saved unit-channel mapping report to: {channel_mapping_report_path}")
+    if organized_output.get("organized_cache_folder"):
+        print(f"Saved organized analyzer copy to: {organized_output['organized_cache_folder']}")
     analysis_elapsed_sec = perf_counter() - analysis_start
     print_timer("analysis_complete", analysis_elapsed_sec)
     save_json(
@@ -1226,6 +1420,7 @@ def run_analysis_pipeline(output_folder: Path, sorting, recording):
             "unit_channel_mapping_report": str(channel_mapping_report_path),
             "unit_summary_plot_count": int(unit_summary_plot_count),
             "waveform_plot_count": int(waveform_plot_count),
+            **organized_output,
             "analysis_elapsed_sec": float(analysis_elapsed_sec),
             "step_timings": analysis_step_timings,
         },
@@ -1304,7 +1499,12 @@ def run_per_file_batch_for_shank(
         )
         if SAVE_PREPROCESSED_RECORDING:
             cleanup_preprocessed_recording_folder(output_folder)
-        analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(output_folder, sorting, rec_preprocessed)
+        analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(
+            output_folder,
+            sorting,
+            rec_preprocessed,
+            batch_output_folder=batch_output_folder,
+        )
         run_elapsed_sec = perf_counter() - run_start
         print_timer(f"shank_{shank_id}_{recording_label}_total", run_elapsed_sec)
 
@@ -1384,6 +1584,7 @@ def run_single_file_for_shank(
     recording_method: str,
     shank_config: dict,
     first_file_max_duration_s: float | None = None,
+    skip_template_alignment: bool = False,
 ) -> dict:
     run_start = perf_counter()
     shank_id = str(shank_config["shank_id"])
@@ -1402,18 +1603,27 @@ def run_single_file_for_shank(
     print(f"Input file: {data_file}")
     print(f"Recording label: {recording_label}")
     print(f"Result folder: {output_folder}")
+    if skip_template_alignment:
+        print("Sorter mode: overflow skip-template-alignment retry")
     print("#" * 60)
 
     recording = None
     rec_preprocessed = None
     sorting = None
+    sorting_attempted = False
+    sorting_completed = False
+    effective_first_file_max_duration_s = (
+        first_file_max_duration_s
+        if file_index == 1
+        else None
+    )
 
     try:
         recording, resolved_channel_ids, recording_build_elapsed_sec, build_step_timings = create_shank_recording(
             data_files=[data_file],
             recording_method=recording_method,
             electrode_df=shank_config["electrode_df"],
-            first_file_max_duration_s=first_file_max_duration_s,
+            first_file_max_duration_s=effective_first_file_max_duration_s,
         )
         duration_seconds = float(recording.get_num_frames() / recording.get_sampling_frequency())
 
@@ -1430,16 +1640,27 @@ def run_single_file_for_shank(
         }
         save_json(output_folder / "preprocessing_metadata.json", preprocessing_metadata)
 
-        sorting, sorting_elapsed_sec, sorting_step_timings = run_sorter_pipeline(
-            output_folder=output_folder,
-            recording=rec_preprocessed,
-            input_sources=[data_file],
-            shank_id=shank_id,
-            window_label=recording_label,
+        try:
+            sorting_attempted = True
+            sorting, sorting_elapsed_sec, sorting_step_timings = run_sorter_pipeline(
+                output_folder=output_folder,
+                recording=rec_preprocessed,
+                input_sources=[data_file],
+                shank_id=shank_id,
+                window_label=recording_label,
+                skip_template_alignment=skip_template_alignment,
+            )
+            sorting_completed = True
+        finally:
+            if SAVE_PREPROCESSED_RECORDING:
+                cleanup_preprocessed_recording_folder(output_folder)
+        analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(
+            output_folder,
+            sorting,
+            rec_preprocessed,
+            batch_output_folder=batch_output_folder,
+            force_rebuild_analyzer=skip_template_alignment,
         )
-        if SAVE_PREPROCESSED_RECORDING:
-            cleanup_preprocessed_recording_folder(output_folder)
-        analysis_elapsed_sec, analysis_step_timings = run_analysis_pipeline(output_folder, sorting, rec_preprocessed)
 
         run_elapsed_sec = perf_counter() - run_start
         print_timer(f"shank_{shank_id}_{recording_label}_total", run_elapsed_sec)
@@ -1448,6 +1669,17 @@ def run_single_file_for_shank(
             "shank_id": shank_id,
             "recording_label": recording_label,
             "input_file": str(data_file),
+            "file_index": int(file_index),
+            "first_file_max_duration_s": (
+                float(first_file_max_duration_s)
+                if first_file_max_duration_s is not None
+                else None
+            ),
+            "applied_max_duration_s": (
+                float(effective_first_file_max_duration_s)
+                if effective_first_file_max_duration_s is not None
+                else None
+            ),
             "resolved_channel_ids": [str(ch) for ch in resolved_channel_ids],
             "duration_seconds": float(duration_seconds),
             "build_shank_recording_elapsed_sec": float(recording_build_elapsed_sec),
@@ -1456,6 +1688,8 @@ def run_single_file_for_shank(
             "sorting_elapsed_sec": float(sorting_elapsed_sec),
             "analysis_elapsed_sec": float(analysis_elapsed_sec),
             "run_total_elapsed_sec": float(run_elapsed_sec),
+            "status": "success_skiptemplate" if skip_template_alignment else "success",
+            "skip_template_alignment": bool(skip_template_alignment),
             "step_timings": {
                 "preprocessing": {
                     key: float(value) for key, value in preprocessing_step_timings.items()
@@ -1470,7 +1704,11 @@ def run_single_file_for_shank(
             "output_folder": str(output_folder),
         }
     except Exception as exc:
-        if not is_overflow_sorting_error(exc):
+        if not (
+            sorting_attempted
+            and not sorting_completed
+            and is_overflow_sorting_error(exc)
+        ):
             raise
 
         run_elapsed_sec = perf_counter() - run_start
@@ -1485,6 +1723,17 @@ def run_single_file_for_shank(
             "shank_id": shank_id,
             "recording_label": recording_label,
             "input_file": str(data_file),
+            "file_index": int(file_index),
+            "first_file_max_duration_s": (
+                float(first_file_max_duration_s)
+                if first_file_max_duration_s is not None
+                else None
+            ),
+            "applied_max_duration_s": (
+                float(effective_first_file_max_duration_s)
+                if effective_first_file_max_duration_s is not None
+                else None
+            ),
             "resolved_channel_ids": [str(ch) for ch in resolved_channel_ids] if recording is not None else [],
             "duration_seconds": float(duration_seconds) if "duration_seconds" in locals() else None,
             "build_shank_recording_elapsed_sec": float(recording_build_elapsed_sec) if "recording_build_elapsed_sec" in locals() else 0.0,
@@ -1494,6 +1743,7 @@ def run_single_file_for_shank(
             "analysis_elapsed_sec": 0.0,
             "run_total_elapsed_sec": float(run_elapsed_sec),
             "status": "overflow_error",
+            "skip_template_alignment": bool(skip_template_alignment),
             "exception_type": type(exc).__name__,
             "exception_message": str(exc),
             "failure_summary_path": str(failure_summary_path),
@@ -1515,6 +1765,167 @@ def run_single_file_for_shank(
 
 def process_shank_file(config: dict) -> dict:
     return run_single_file_for_shank(**config)
+
+
+def replace_failed_run_with_retry(shank_batches: dict, retry_result: dict) -> None:
+    shank_id = str(retry_result["shank_id"])
+    recording_label = str(retry_result["recording_label"])
+    runs = shank_batches.get(shank_id, {}).get("runs", [])
+    for index, run in enumerate(runs):
+        if (
+            str(run.get("recording_label")) == recording_label
+            and run.get("status") == "overflow_error"
+        ):
+            retry_result["replaces_overflow_run"] = run
+            runs[index] = retry_result
+            return
+    runs.append(retry_result)
+
+
+def preserve_fixed_sorting_failure_summary(output_folder: Path) -> str | None:
+    failure_summary_path = output_folder / "sorting_failure_summary.json"
+    if not failure_summary_path.exists():
+        return None
+
+    fixed_summary_path = output_folder / "fixed_sorting_failuer_smmary.json"
+    if fixed_summary_path.exists():
+        fixed_summary_path.unlink()
+    failure_summary_path.replace(fixed_summary_path)
+    print(f"Renamed fixed sorter failure summary to: {fixed_summary_path}")
+    return str(fixed_summary_path)
+
+
+def run_overflow_skiptemplate_retries(
+    *,
+    overflow_failures: list[dict],
+    shank_config_by_id: dict[str, dict],
+    shank_batches: dict,
+    batch_output_folder: Path,
+    session_description: str,
+    recording_method: str,
+    data_files: list[Path],
+    first_file_only_duration: float | None,
+) -> tuple[list[dict], Path]:
+    retry_start = perf_counter()
+    summary_path = get_overflow_skiptemplate_summary_path(batch_output_folder, session_description)
+    retry_results = []
+
+    if not overflow_failures:
+        summary = {
+            "session_description": session_description,
+            "recording_method": recording_method,
+            "status": "no_overflow_failures_to_retry",
+            "num_retry_tasks": 0,
+            "num_retry_succeeded": 0,
+            "num_retry_failed": 0,
+            "retry_wall_clock_elapsed_sec": 0.0,
+            "tasks": [],
+        }
+        save_json(summary_path, summary)
+        print(f"Saved overflow skip-template summary to: {summary_path}")
+        return retry_results, summary_path
+
+    print("\n" + "=" * 60)
+    print("Overflow skip-template retry stage")
+    print("=" * 60)
+    print(
+        f"Retrying {len(overflow_failures)} overflowed shank/recording run(s) "
+        "with MountainSort5 skip_alignment=True."
+    )
+
+    data_file_index = {str(path): index for index, path in enumerate(data_files, start=1)}
+    for task_index, failure in enumerate(overflow_failures, start=1):
+        shank_id = str(failure["shank_id"])
+        data_file = Path(str(failure["input_file"]))
+        shank_config = shank_config_by_id.get(shank_id)
+        task_start = perf_counter()
+
+        task_record = {
+            "task_index": int(task_index),
+            "shank_id": shank_id,
+            "recording_label": str(failure.get("recording_label", build_recording_label(data_file))),
+            "input_file": str(data_file),
+            "source_overflow_failure": failure,
+            "retry_status": "not_started",
+            "retry_succeeded": False,
+        }
+        if shank_config is None:
+            task_record.update(
+                {
+                    "retry_status": "missing_shank_config",
+                    "exception_message": f"No shank config found for shank {shank_id}",
+                    "wall_clock_elapsed_sec": float(perf_counter() - task_start),
+                }
+            )
+            retry_results.append(task_record)
+            continue
+
+        print("\n" + "-" * 60)
+        print(f"Skip-template retry {task_index} of {len(overflow_failures)}")
+        print(f"Shank: {shank_id}")
+        print(f"Recording label: {task_record['recording_label']}")
+        print(f"Input file: {data_file}")
+        print("-" * 60)
+
+        try:
+            retry_result = run_single_file_for_shank(
+                data_file=data_file,
+                file_index=data_file_index.get(str(data_file), task_index),
+                num_input_files=len(data_files),
+                batch_output_folder=batch_output_folder,
+                session_description=session_description,
+                recording_method=recording_method,
+                shank_config=shank_config,
+                first_file_max_duration_s=first_file_only_duration,
+                skip_template_alignment=True,
+            )
+            task_record.update(
+                {
+                    "retry_status": retry_result.get("status", "success_skiptemplate"),
+                    "retry_succeeded": retry_result.get("status") != "overflow_error",
+                    "result": retry_result,
+                    "output_folder": retry_result.get("output_folder"),
+                    "wall_clock_elapsed_sec": float(perf_counter() - task_start),
+                }
+            )
+            if task_record["retry_succeeded"]:
+                fixed_failure_summary_path = preserve_fixed_sorting_failure_summary(
+                    Path(str(retry_result["output_folder"]))
+                )
+                if fixed_failure_summary_path is not None:
+                    retry_result["fixed_sorting_failure_summary_path"] = fixed_failure_summary_path
+                    task_record["fixed_sorting_failure_summary_path"] = fixed_failure_summary_path
+                replace_failed_run_with_retry(shank_batches, retry_result)
+        except Exception as exc:
+            task_record.update(
+                {
+                    "retry_status": "retry_exception",
+                    "retry_succeeded": False,
+                    "exception_type": type(exc).__name__,
+                    "exception_message": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "wall_clock_elapsed_sec": float(perf_counter() - task_start),
+                }
+            )
+        retry_results.append(task_record)
+        gc.collect()
+
+    retry_elapsed_sec = perf_counter() - retry_start
+    num_retry_succeeded = sum(1 for item in retry_results if item.get("retry_succeeded"))
+    num_retry_failed = len(retry_results) - num_retry_succeeded
+    summary = {
+        "session_description": session_description,
+        "recording_method": recording_method,
+        "status": "all_retries_succeeded" if num_retry_failed == 0 else "retry_incomplete",
+        "num_retry_tasks": int(len(retry_results)),
+        "num_retry_succeeded": int(num_retry_succeeded),
+        "num_retry_failed": int(num_retry_failed),
+        "retry_wall_clock_elapsed_sec": float(retry_elapsed_sec),
+        "tasks": retry_results,
+    }
+    save_json(summary_path, summary)
+    print(f"Saved overflow skip-template summary to: {summary_path}")
+    return retry_results, summary_path
 
 
 def build_shank_configs(
@@ -1657,6 +2068,7 @@ def main() -> None:
     if not shank_configs:
         raise RuntimeError("No shanks selected or available after filtering.")
     preview_elapsed_sec = preview_channel_resolution(data_files, RECORDING_METHOD, shank_configs)
+    shank_config_by_id = {str(cfg["shank_id"]): cfg for cfg in shank_configs}
 
     batch_start_time = perf_counter()
     shank_batches = {}
@@ -1739,6 +2151,17 @@ def main() -> None:
         print_timer(f"recording_{recording_label}_all_shanks_total", file_elapsed_sec)
         gc.collect()
 
+    skiptemplate_retry_results, skiptemplate_summary_path = run_overflow_skiptemplate_retries(
+        overflow_failures=overflow_failures,
+        shank_config_by_id=shank_config_by_id,
+        shank_batches=shank_batches,
+        batch_output_folder=batch_output_folder,
+        session_description=session_description,
+        recording_method=RECORDING_METHOD,
+        data_files=data_files,
+        first_file_only_duration=first_file_only_duration,
+    )
+
     batch_results = []
     for shank_id, batch_summary in shank_batches.items():
         batch_summary["runs"].sort(key=lambda run: run["recording_label"])
@@ -1808,6 +2231,7 @@ def main() -> None:
         ),
         "num_overflow_failures": int(len(overflow_failures)),
         "failures": overflow_failures,
+        "skiptemplate_retry_summary": str(skiptemplate_summary_path),
     }
     save_json(overflow_report_path, overflow_report)
     print(f"Saved overflow error report to: {overflow_report_path}")
@@ -1862,6 +2286,11 @@ def main() -> None:
         "selected_shanks": [result["shank_id"] for result in batch_results],
         "num_overflow_failures": int(len(overflow_failures)),
         "overflow_error_report": str(overflow_report_path),
+        "overflow_skiptemplate_summary": str(skiptemplate_summary_path),
+        "num_skiptemplate_retry_tasks": int(len(skiptemplate_retry_results)),
+        "num_skiptemplate_retry_succeeded": int(
+            sum(1 for item in skiptemplate_retry_results if item.get("retry_succeeded"))
+        ),
         "timing": {
             "collect_user_inputs_elapsed_sec": float(input_elapsed_sec),
             "collect_data_files_elapsed_sec": float(collect_files_elapsed_sec),
