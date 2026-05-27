@@ -59,6 +59,11 @@ ORGANIZED_ENRICHED_MEMBER_KEYS = {
     "waveform_similarity_vector",
     "autocorrelogram_similarity_vector",
 }
+ALIGNMENT_DAYS_SUMMARY_PREFIX = getattr(
+    day_review,
+    "ALIGNMENT_DAYS_SUMMARY_PREFIX",
+    getattr(day_review, "DAY_SUMMARY_FOLDER_NAME", "alignment_days_summary"),
+)
 
 # User setting: one shared persistence threshold for both LDA.py and Tuning.py.
 # Change this value here when you want both downstream modules to use a new
@@ -83,8 +88,13 @@ class LDASettings:
     lda_use_waveform_features: bool = False
     lda_extra_label_types: tuple[str, ...] = ()
     lda_use_baseline_sham_drug: bool = False
+    lda_injection_label_mode: str = "simple"
     lda_sham_session_tokens: str = ""
     lda_drug_session_tokens: str = ""
+    lda_sham_saline_session_tokens: str = ""
+    lda_drug_saline_session_tokens: str = ""
+    lda_sham_caf_session_tokens: str = ""
+    lda_drug_caf_session_tokens: str = ""
     lda_confirm_baseline_sham_drug: bool = False
     lda_injection_phase_schedule: dict | None = None
     lda_path_remap_old: Path | None = None
@@ -306,13 +316,23 @@ def find_organized_day_root_for_cache(cache_folder: Path) -> Path:
     return cache_folder.parent
 
 
+def is_alignment_days_summary_folder(path: Path) -> bool:
+    folder_name = Path(path).name
+    prefixes = {
+        "alignment_days_summary",
+        ALIGNMENT_DAYS_SUMMARY_PREFIX,
+        getattr(day_review, "DAY_SUMMARY_FOLDER_NAME", ""),
+    }
+    return any(folder_name.startswith(prefix) for prefix in prefixes if prefix)
+
+
 def discover_organized_cache_folders(path: Path) -> list[Path]:
     path = Path(path).resolve()
     if is_organized_cache_folder(path):
         return [path]
     if not path.exists() or not path.is_dir():
         return []
-    if path.name.startswith(day_review.ALIGNMENT_DAYS_SUMMARY_PREFIX) and (path / "export_summary.json").is_file():
+    if is_alignment_days_summary_folder(path) and (path / "export_summary.json").is_file():
         return []
     return sorted(
         cache_folder
@@ -672,8 +692,35 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
         use_waveform_features=use_waveform_features,
     )
 
+    injection_label_mode = str(args.lda_injection_label_mode or "simple")
+    if use_baseline_sham_drug and injection_label_mode == "ask":
+        has_split_cli_tokens = any(
+            str(value or "").strip()
+            for value in (
+                args.lda_sham_saline_sessions,
+                args.lda_drug_saline_sessions,
+                args.lda_sham_caf_sessions,
+                args.lda_drug_caf_sessions,
+            )
+        )
+        injection_label_mode = (
+            "saline-caf"
+            if has_split_cli_tokens
+            or prompt_yes_no(
+                "Use separate saline/caf sham/drug marker labels?",
+                default=False,
+            )
+            else "simple"
+        )
+    elif injection_label_mode == "ask":
+        injection_label_mode = "simple"
+
     sham_session_tokens = str(args.lda_sham_sessions or "").strip()
     drug_session_tokens = str(args.lda_drug_sessions or "").strip()
+    sham_saline_session_tokens = str(args.lda_sham_saline_sessions or "").strip()
+    drug_saline_session_tokens = str(args.lda_drug_saline_sessions or "").strip()
+    sham_caf_session_tokens = str(args.lda_sham_caf_sessions or "").strip()
+    drug_caf_session_tokens = str(args.lda_drug_caf_sessions or "").strip()
     confirm_baseline_sham_drug = bool(args.lda_confirm_baseline_sham_drug)
 
     return PipelineOptions(
@@ -702,8 +749,13 @@ def prompt_for_pipeline_options(args: argparse.Namespace) -> PipelineOptions:
             lda_use_waveform_features=bool(use_waveform_features),
             lda_extra_label_types=tuple(lda_extra_label_types),
             lda_use_baseline_sham_drug=bool(use_baseline_sham_drug),
+            lda_injection_label_mode=injection_label_mode,
             lda_sham_session_tokens=sham_session_tokens,
             lda_drug_session_tokens=drug_session_tokens,
+            lda_sham_saline_session_tokens=sham_saline_session_tokens,
+            lda_drug_saline_session_tokens=drug_saline_session_tokens,
+            lda_sham_caf_session_tokens=sham_caf_session_tokens,
+            lda_drug_caf_session_tokens=drug_caf_session_tokens,
             lda_confirm_baseline_sham_drug=bool(confirm_baseline_sham_drug),
             lda_path_remap_old=Path(args.lda_path_remap_old) if args.lda_path_remap_old else None,
             lda_path_remap_new=Path(args.lda_path_remap_new) if args.lda_path_remap_new else None,
@@ -1801,6 +1853,80 @@ def select_lda_recordings_from_tokens(session_table, tokens: str, prompt_text: s
     return session_table.loc[selected_source_indices].sort_values("session_start_datetime").reset_index(drop=True)
 
 
+def combine_injection_phase_schedules(*schedules: dict) -> dict:
+    sham_intervals: list[dict] = []
+    drug_intervals: list[dict] = []
+    sham_sessions: list[dict] = []
+    drug_sessions: list[dict] = []
+    for schedule in schedules:
+        sham_intervals.extend(schedule.get("sham_intervals", []) or [])
+        drug_intervals.extend(schedule.get("drug_intervals", []) or [])
+        sham_sessions.extend(schedule.get("sham_sessions", []) or [])
+        drug_sessions.extend(schedule.get("drug_sessions", []) or [])
+
+    sham_intervals = sorted(sham_intervals, key=lambda interval: str(interval.get("start", "")))
+    drug_intervals = sorted(drug_intervals, key=lambda interval: str(interval.get("start", "")))
+    return {
+        "label_type": "injection_phase",
+        "label_mode": "saline-caf",
+        "baseline_label": "baseline",
+        "phase_labels": [
+            "baseline",
+            "sham_saline",
+            "drug_saline",
+            "sham_caf",
+            "drug_caf",
+        ],
+        "interpretation": (
+            "Samples from each sham saline/caffeine injection session start until the next "
+            "following drug session of the same treatment are labeled sham_saline or "
+            "sham_caf. Samples from each drug saline/caffeine injection session start "
+            "until 24 hours later are labeled drug_saline or drug_caf. Drug intervals "
+            "take priority over sham intervals. All other samples are labeled baseline."
+        ),
+        "sham_sessions": sham_sessions,
+        "drug_sessions": drug_sessions,
+        "sham_intervals": sham_intervals,
+        "drug_intervals": drug_intervals,
+    }
+
+
+def build_saline_caf_injection_phase_schedule(session_table, lda_settings: LDASettings) -> dict:
+    sham_saline_sessions = select_lda_recordings_from_tokens(
+        session_table,
+        lda_settings.lda_sham_saline_session_tokens,
+        "Enter sham saline recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+    )
+    drug_saline_sessions = select_lda_recordings_from_tokens(
+        session_table,
+        lda_settings.lda_drug_saline_session_tokens,
+        "Enter drug saline recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+    )
+    sham_caf_sessions = select_lda_recordings_from_tokens(
+        session_table,
+        lda_settings.lda_sham_caf_session_tokens,
+        "Enter sham caffeine recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+    )
+    drug_caf_sessions = select_lda_recordings_from_tokens(
+        session_table,
+        lda_settings.lda_drug_caf_session_tokens,
+        "Enter drug caffeine recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+    )
+    saline_schedule = lda_review.build_injection_phase_schedule(
+        sham_saline_sessions,
+        drug_saline_sessions,
+        sham_label="sham_saline",
+        drug_label="drug_saline",
+    )
+    caf_schedule = lda_review.build_injection_phase_schedule(
+        sham_caf_sessions,
+        drug_caf_sessions,
+        sham_label="sham_caf",
+        drug_label="drug_caf",
+    )
+    return combine_injection_phase_schedules(saline_schedule, caf_schedule)
+
+
 def pipeline_options_payload(options: PipelineOptions) -> dict:
     lda_settings = require_lda_settings(options)
     tuning_settings = require_tuning_settings(options)
@@ -2262,7 +2388,7 @@ def collect_lda_baseline_sham_drug_schedule(
         "session_datetime_matched_text",
     ]
     available_columns = [column for column in display_columns if column in session_table.columns]
-    print("\nAvailable recordings for baseline / sham / drug LDA labels:", flush=True)
+    print("\nAvailable recordings for baseline / injection marker labels:", flush=True)
     recording_table = build_injection_recording_table(session_table)
     recording_display_columns = [
         "recording_id",
@@ -2279,35 +2405,37 @@ def collect_lda_baseline_sham_drug_schedule(
     )
     print("\nUnderlying session rows:", flush=True)
     print(session_table[available_columns].to_string(index=False), flush=True)
-    print(
-        "\nBaseline is assigned automatically to samples outside sham/drug intervals.",
-        flush=True,
-    )
-    sham_sessions = select_lda_recordings_from_tokens(
-        session_table,
-        lda_settings.lda_sham_session_tokens,
-        "Enter sham injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
-    )
-    drug_sessions = select_lda_recordings_from_tokens(
-        session_table,
-        lda_settings.lda_drug_session_tokens,
-        "Enter drug injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
-    )
-    schedule = lda_review.build_injection_phase_schedule(sham_sessions, drug_sessions)
+    print("\nBaseline is assigned automatically to samples outside injection intervals.", flush=True)
+    if lda_settings.lda_injection_label_mode == "saline-caf":
+        schedule = build_saline_caf_injection_phase_schedule(session_table, lda_settings)
+    else:
+        sham_sessions = select_lda_recordings_from_tokens(
+            session_table,
+            lda_settings.lda_sham_session_tokens,
+            "Enter sham injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+        )
+        drug_sessions = select_lda_recordings_from_tokens(
+            session_table,
+            lda_settings.lda_drug_session_tokens,
+            "Enter drug injection recording_id(s), recording token(s), session_id(s), or session name(s), separated by commas: ",
+        )
+        schedule = lda_review.build_injection_phase_schedule(sham_sessions, drug_sessions)
 
-    print("\nBaseline / sham / drug interpretation to confirm:", flush=True)
+    print("\nBaseline / injection marker interpretation to confirm:", flush=True)
     print(f"  {schedule['interpretation']}", flush=True)
     print("  Sham intervals:", flush=True)
     for interval in schedule["sham_intervals"]:
         print(
-            f"    {interval['session_name']} -> {interval['paired_drug_session_name']}: "
+            f"    {interval.get('label', 'sham')}: "
+            f"{interval['session_name']} -> {interval['paired_drug_session_name']}: "
             f"[{interval['start']}, {interval['end']})",
             flush=True,
         )
     print("  Drug intervals:", flush=True)
     for interval in schedule["drug_intervals"]:
         print(
-            f"    {interval['session_name']}: [{interval['start']}, {interval['end']})",
+            f"    {interval.get('label', 'drug')}: "
+            f"{interval['session_name']}: [{interval['start']}, {interval['end']})",
             flush=True,
         )
     if lda_settings.lda_confirm_baseline_sham_drug:
@@ -2967,12 +3095,37 @@ def main() -> None:
         help="Whether to add sham/drug marker shapes to hour-label LDA figures.",
     )
     parser.add_argument(
+        "--lda-injection-label-mode",
+        choices=["ask", "simple", "saline-caf"],
+        default="ask",
+        help=(
+            "Injection marker labels. simple uses sham/drug; saline-caf uses "
+            "sham_saline, drug_saline, sham_caf, and drug_caf."
+        ),
+    )
+    parser.add_argument(
         "--lda-sham-sessions",
         help="Comma-separated sham injection session_id(s) or session name(s).",
     )
     parser.add_argument(
         "--lda-drug-sessions",
         help="Comma-separated drug injection session_id(s) or session name(s).",
+    )
+    parser.add_argument(
+        "--lda-sham-saline-sessions",
+        help="Comma-separated sham saline recording_id(s), session_id(s), or session name(s).",
+    )
+    parser.add_argument(
+        "--lda-drug-saline-sessions",
+        help="Comma-separated drug saline recording_id(s), session_id(s), or session name(s).",
+    )
+    parser.add_argument(
+        "--lda-sham-caf-sessions",
+        help="Comma-separated sham caffeine recording_id(s), session_id(s), or session name(s).",
+    )
+    parser.add_argument(
+        "--lda-drug-caf-sessions",
+        help="Comma-separated drug caffeine recording_id(s), session_id(s), or session name(s).",
     )
     parser.add_argument(
         "--lda-confirm-baseline-sham-drug",

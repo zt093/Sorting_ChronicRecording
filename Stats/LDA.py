@@ -118,11 +118,28 @@ INJECTION_PHASE_COLORS = {
     "baseline": "#7a7a7a",
     "sham": "#1f77b4",
     "drug": "#d62728",
+    "sham_saline": "#1f77b4",
+    "drug_saline": "#d62728",
+    "sham_caf": "#2ca02c",
+    "drug_caf": "#9467bd",
 }
 INJECTION_PHASE_MARKERS = {
     "baseline": "o",
     "sham": "s",
     "drug": "^",
+    "sham_saline": "s",
+    "drug_saline": "^",
+    "sham_caf": "D",
+    "drug_caf": "X",
+}
+INJECTION_PHASE_DISPLAY_LABELS = {
+    "baseline": "Baseline",
+    "sham": "Sham",
+    "drug": "Drug",
+    "sham_saline": "Sham saline",
+    "drug_saline": "Drug saline",
+    "sham_caf": "Sham caffeine",
+    "drug_caf": "Drug caffeine",
 }
 WAVEFORM_FEATURE_MODES = {"FR_WAVEFORM", "WAVEFORM_ONLY", "MULTI_FEATURE"}
 LABEL_FALLBACK_COLORS = (
@@ -1583,13 +1600,13 @@ def resolve_injection_phase_labels(metadata_table: pd.DataFrame, config: Config)
         start = pd.Timestamp(interval["start"])
         end = pd.Timestamp(interval["end"])
         mask = (sample_times >= start) & (sample_times < end)
-        labels.loc[mask] = "sham"
+        labels.loc[mask] = str(interval.get("label") or schedule.get("sham_label") or "sham")
 
     for interval in drug_intervals:
         start = pd.Timestamp(interval["start"])
         end = pd.Timestamp(interval["end"])
         mask = (sample_times >= start) & (sample_times < end)
-        labels.loc[mask] = "drug"
+        labels.loc[mask] = str(interval.get("label") or schedule.get("drug_label") or "drug")
 
     return labels
 
@@ -1811,6 +1828,9 @@ def collapse_injection_session_rows(session_table: pd.DataFrame) -> pd.DataFrame
 def build_injection_phase_schedule(
     sham_sessions: pd.DataFrame,
     drug_sessions: pd.DataFrame,
+    *,
+    sham_label: str = "sham",
+    drug_label: str = "drug",
 ) -> dict:
     if sham_sessions.empty or drug_sessions.empty:
         raise ValueError("Both sham and drug injection session selections are required.")
@@ -1827,6 +1847,7 @@ def build_injection_phase_schedule(
                 "session_name": str(drug_row.session_name),
                 "start": drug_start.isoformat(sep=" "),
                 "end": (drug_start + timedelta(hours=24)).isoformat(sep=" "),
+                "label": str(drug_label),
             }
         )
 
@@ -1846,14 +1867,15 @@ def build_injection_phase_schedule(
                 "paired_drug_session_name": str(drug_row["session_name"]),
                 "start": sham_start.isoformat(sep=" "),
                 "end": drug_start.isoformat(sep=" "),
+                "label": str(sham_label),
             }
         )
 
     return {
         "label_type": "injection_phase",
         "baseline_label": "baseline",
-        "sham_label": "sham",
-        "drug_label": "drug",
+        "sham_label": str(sham_label),
+        "drug_label": str(drug_label),
         "interpretation": (
             "Samples from each sham injection session start until the next following drug "
             "injection session start are labeled sham. Samples from each drug injection "
@@ -3130,7 +3152,15 @@ def build_categorical_label_colors(
     if str(resolved_label_column) == "injection_phase":
         ordered_labels = [
             label
-            for label in ("baseline", "sham", "drug")
+            for label in (
+                "baseline",
+                "sham",
+                "drug",
+                "sham_saline",
+                "drug_saline",
+                "sham_caf",
+                "drug_caf",
+            )
             if label in set(label_values)
         ]
         ordered_labels.extend(
@@ -3159,7 +3189,7 @@ def build_categorical_label_colors(
             [0],
             marker="o",
             color="none",
-            label=str(label),
+            label=INJECTION_PHASE_DISPLAY_LABELS.get(str(label), str(label)),
             markerfacecolor=color_map[str(label)],
             markeredgecolor="black",
             markeredgewidth=0.35,
@@ -3218,7 +3248,15 @@ def add_injection_phase_marker_legend(ax, phases: pd.Series | None) -> None:
         return
     ordered_phases = [
         phase
-        for phase in ("baseline", "sham", "drug")
+        for phase in (
+            "baseline",
+            "sham",
+            "drug",
+            "sham_saline",
+            "drug_saline",
+            "sham_caf",
+            "drug_caf",
+        )
         if phase in set(phases.astype(str))
     ]
     ordered_phases.extend(
@@ -3232,7 +3270,7 @@ def add_injection_phase_marker_legend(ax, phases: pd.Series | None) -> None:
             [0],
             marker=INJECTION_PHASE_MARKERS.get(phase, "o"),
             color="none",
-            label=phase,
+            label=INJECTION_PHASE_DISPLAY_LABELS.get(phase, phase),
             markerfacecolor="white",
             markeredgecolor="black",
             markeredgewidth=0.8,
@@ -3243,7 +3281,7 @@ def add_injection_phase_marker_legend(ax, phases: pd.Series | None) -> None:
     existing_legend = ax.get_legend()
     marker_legend = ax.legend(
         handles=handles,
-        title="drug marker",
+        title="injection marker",
         frameon=False,
         loc="best",
     )
@@ -3282,7 +3320,16 @@ def scatter_clock_hour_with_phase_markers(
 
     first_scatter = None
     plotted_phases: set[str] = set()
-    for phase in ["baseline", "sham", "drug", *pd.unique(phases.astype(str)).tolist()]:
+    for phase in [
+        "baseline",
+        "sham",
+        "drug",
+        "sham_saline",
+        "drug_saline",
+        "sham_caf",
+        "drug_caf",
+        *pd.unique(phases.astype(str)).tolist(),
+    ]:
         phase = str(phase)
         if phase in plotted_phases:
             continue

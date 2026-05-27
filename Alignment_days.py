@@ -67,6 +67,7 @@ from Units_alignment_UI import (
 DAY_SORTING_ROOT_PATTERN = re.compile(r"(?P<day_code>\d{6})_Sorting$")
 DAY_MANIFEST_NAME = "alignment_days_manifest.json"
 DAY_SUMMARY_FOLDER_NAME = "alignment_days_summary"
+ALIGNMENT_DAYS_SUMMARY_PREFIX = DAY_SUMMARY_FOLDER_NAME
 HTML_TITLE = "Alignment Review Across Days"
 SOURCE_ALIGNMENT_MANIFEST_NAME = "alignment_manifest.json"
 

@@ -122,7 +122,15 @@ CSV_METADATA_COLUMNS = {
     "clock_minute_of_hour",
     "calendar_day",
     "rec_file",
+    "threshold_run_root",
+    "threshold_run_name",
 }
+
+
+def safe_slug(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    return text.strip("_") or "value"
 
 
 CIRCULAR_HOUR_CMAP = plt.get_cmap("twilight_shifted", 24)
@@ -1983,12 +1991,22 @@ def aggregate_minutes_to_hourly_samples(
 
     hourly_vectors: list[np.ndarray] = []
     hourly_rows: list[dict] = []
-    grouping_keys = ["calendar_day", "clock_hour_of_day"]
+    extra_grouping_keys = [
+        column
+        for column in ("threshold_run_name", "threshold_run_root")
+        if column in minute_df.columns and minute_df[column].nunique(dropna=False) > 1
+    ]
+    grouping_keys = extra_grouping_keys + ["calendar_day", "clock_hour_of_day"]
     log_status(f"Hourly aggregation grouping keys: {grouping_keys}")
     grouped = minute_df.groupby(grouping_keys, sort=True, dropna=False)
     total_groups = len(grouped)
 
-    for group_index, ((calendar_day, clock_hour_of_day), group_table) in enumerate(grouped, start=1):
+    for group_index, (group_values, group_table) in enumerate(grouped, start=1):
+        if not isinstance(group_values, tuple):
+            group_values = (group_values,)
+        group_lookup = dict(zip(grouping_keys, group_values))
+        calendar_day = group_lookup["calendar_day"]
+        clock_hour_of_day = group_lookup["clock_hour_of_day"]
         if group_index == 1 or group_index % 100 == 0 or group_index == total_groups:
             log_status(f"Aggregating hourly samples: group {group_index} / {total_groups}")
 
@@ -2026,11 +2044,20 @@ def aggregate_minutes_to_hourly_samples(
         )
         n_unique_clock_minutes_present = len(unique_clock_minutes_present)
         n_missing_clock_minutes = max(0, 60 - n_unique_clock_minutes_present)
-
-        hourly_rows.append(
+        run_key_parts = [
+            safe_slug(group_lookup[column])
+            for column in extra_grouping_keys
+            if str(group_lookup.get(column, "")).strip()
+        ]
+        sample_key_prefix = "__".join(run_key_parts + [str(calendar_day)])
+        hourly_row = {
+            column: group_lookup[column]
+            for column in extra_grouping_keys
+        }
+        hourly_row.update(
             {
                 "final_sample_id": int(group_index),
-                "final_sample_key": f"{calendar_day}__hour_{int(clock_hour_of_day):02d}",
+                "final_sample_key": f"{sample_key_prefix}__hour_{int(clock_hour_of_day):02d}",
                 "calendar_day": str(calendar_day),
                 "clock_hour_of_day": int(clock_hour_of_day),
                 "hour_start_datetime": f"{calendar_day} {int(clock_hour_of_day):02d}:00:00",
@@ -2047,9 +2074,11 @@ def aggregate_minutes_to_hourly_samples(
             }
         )
 
+        hourly_rows.append(hourly_row)
+
     hourly_population_matrix = np.vstack(hourly_vectors)
     hourly_metadata_table = pd.DataFrame(hourly_rows).sort_values(
-        ["calendar_day", "clock_hour_of_day"],
+        grouping_keys,
         na_position="last",
     ).reset_index(drop=True)
     duplicate_sample_keys = hourly_metadata_table["final_sample_key"].duplicated()
@@ -2822,17 +2851,22 @@ def save_outputs(
         )
         log_status(f"Saved {file_prefix}_{cv_name}_permutation_balanced_accuracy.csv")
 
+    hourly_aggregation_grouping_keys = None
+    if config.lda_mode == "multi_day_hourly":
+        hourly_aggregation_grouping_keys = [
+            column
+            for column in ("threshold_run_name", "threshold_run_root")
+            if column in analysis_metadata_table.columns
+            and analysis_metadata_table[column].nunique(dropna=False) > 1
+        ] + ["calendar_day", "clock_hour_of_day"]
+
     summary_payload = {
         "export_summary_path": str(export_summary_path),
         "lda_mode": str(config.lda_mode),
         "feature_mode": str(feature_mode),
         "label_type": resolved_label_column,
         "configured_label_type": str(config.label_type),
-        "hourly_aggregation_grouping_keys": (
-            ["calendar_day", "clock_hour_of_day"]
-            if config.lda_mode == "multi_day_hourly"
-            else None
-        ),
+        "hourly_aggregation_grouping_keys": hourly_aggregation_grouping_keys,
         "bin_size_seconds": float(config.bin_size_seconds),
         "binned_bin_size_seconds": float(config.bin_size_seconds),
         "minute_bin_size_seconds": (

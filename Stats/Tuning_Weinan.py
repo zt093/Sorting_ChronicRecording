@@ -1397,6 +1397,7 @@ def discover_threshold_pair_meta(run_root: Path, recursive: bool = True) -> list
         p
         for p in candidate_dirs
         if p.is_dir() and p.name.startswith("sgch") and "_thr" in p.name
+        and "polar_time_of_day_units" not in set(p.relative_to(run_root).parts)
     )
     pair_meta: list[tuple[PairId, Path]] = []
     for p in pair_dirs:
@@ -1475,6 +1476,12 @@ def main() -> int:
         help="threshold_crossings_run_* folder. If omitted, prompts interactively and can use DATA_PATH.",
     )
     parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Folder for Tuning_Weinan outputs. Defaults to --run-root for standalone behavior.",
+    )
+    parser.add_argument(
         "--input-mode",
         choices=("auto", "threshold", "aligned"),
         default="auto",
@@ -1522,6 +1529,8 @@ def main() -> int:
     if not input_path.exists():
         raise FileNotFoundError(input_path)
     run_root = input_path
+    output_root = run_root if args.output_root is None else Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     print(
         "Master plot x-axis mode: overlay 24h cycles (0–24 hours) and color-code consecutive days.",
@@ -1570,11 +1579,11 @@ def main() -> int:
 
     should_render_polar_all = args.render_polar_all or not args.render_polar_example
     if loaded_from_aligned and should_render_polar_all:
-        render_aligned_polar_all(pair_meta, series_cache, run_root)
+        render_aligned_polar_all(pair_meta, series_cache, output_root)
         if args.only_polar:
             return 0
     elif should_render_polar_all:
-        render_polar_all_pairs(pair_meta, run_root)
+        render_polar_all_pairs(pair_meta, output_root)
         if args.only_polar:
             return 0
 
@@ -1586,7 +1595,7 @@ def main() -> int:
             xs,
             peak,
             fr,
-            run_root / "polar_time_of_day_units" / polar_pid.folder_tag(),
+            output_root / "polar_time_of_day_units" / polar_pid.folder_tag(),
             include_series_name_in_filename=False,
         )
         if args.only_polar:
@@ -1601,7 +1610,7 @@ def main() -> int:
             polar_pair_dir = matches[0]
         render_polar_example_pair(
             polar_pair_dir,
-            out_dir=run_root / "polar_time_of_day_units" / polar_pair_dir.name,
+            out_dir=output_root / "polar_time_of_day_units" / polar_pair_dir.name,
         )
         if args.only_polar:
             return 0
@@ -1638,7 +1647,7 @@ def main() -> int:
         write_threshold_unit_usage_summary(
             pair_meta=pair_meta,
             series_cache=series_cache,
-            run_root=run_root,
+            run_root=output_root,
         )
 
     label_tag = "dailyCycleOverlay"
@@ -1718,10 +1727,10 @@ def main() -> int:
         )
         fig.tight_layout(rect=[0, 0.01, 1, 0.98])
 
-        out_png = run_root / f"master_peak2peak_and_firingRate_{label_tag}_{variant_tag}.png"
+        out_png = output_root / f"master_peak2peak_and_firingRate_{label_tag}_{variant_tag}.png"
         fig.savefig(out_png, dpi=200)
         plt.close(fig)
-        out_npz = run_root / f"master_peak2peak_and_firingRate_{label_tag}_{variant_tag}_plotData.npz"
+        out_npz = output_root / f"master_peak2peak_and_firingRate_{label_tag}_{variant_tag}_plotData.npz"
         np.savez_compressed(
             str(out_npz),
             normalize_each_day=np.asarray([normalize_each_day], dtype=np.bool_),
@@ -1806,11 +1815,11 @@ def main() -> int:
             )
             fig.tight_layout(rect=[0, 0.01, 1, 0.98])
 
-            out_png = run_root / f"master_peak2peak_and_firingRate_{bin_tag}_{norm_tag}.png"
+            out_png = output_root / f"master_peak2peak_and_firingRate_{bin_tag}_{norm_tag}.png"
             fig.savefig(out_png, dpi=200)
             plt.close(fig)
 
-            out_npz = run_root / f"master_peak2peak_and_firingRate_{bin_tag}_{norm_tag}_plotData.npz"
+            out_npz = output_root / f"master_peak2peak_and_firingRate_{bin_tag}_{norm_tag}_plotData.npz"
             np.savez_compressed(
                 str(out_npz),
                 bin_hours=np.asarray([bin_hours], dtype=np.float32),
