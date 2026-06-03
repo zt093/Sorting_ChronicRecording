@@ -18,8 +18,9 @@ Recording selection expects Trodes-style chronic filenames:
 You enter the first and last recording (filename or YYYYMMDD_HHMMSS); all chronic
 files in that inclusive range (by timestamp in the name) are processed.
 
-How outputs are saved (each run gets its own folder):
-  <output_parent>/threshold_crossings_<rec_date>_run_<run_date>/
+How outputs are saved (each recording date gets its own folder; existing folders
+are not overwritten):
+  <output_parent>/threshold_crossings_YYYYMMDD/
     run_config.json
     Per recording (stem = sanitized parent + recording name):
       <stem>_recording_summary.json — total events, list of chunk artifacts
@@ -39,7 +40,6 @@ import csv
 import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import gc
@@ -2510,39 +2510,45 @@ def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
         print("Please enter y or n.")
 
 
-def _recording_date_label(rec_files: list[Path]) -> str:
-    dates = []
+def _recording_date_folder_label(rec_file: Path) -> str:
+    key = chronic_rec_sort_key(rec_file)
+    if key is None:
+        parent, stem = _recording_parent_stem_safe(rec_file)
+        return f"unknown_rec_date_{parent}__{stem}"
+    return str(key)[:8]
+
+
+def group_recording_files_by_date(rec_files: list[Path]) -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
     for rec_file in rec_files:
-        key = chronic_rec_sort_key(rec_file)
-        if key is None:
-            continue
-        dates.append(str(key)[:8])
-    if not dates:
-        return "unknown_rec_date"
-    yymmdd = [date[2:] for date in sorted(set(dates))]
-    if len(yymmdd) == 1:
-        return yymmdd[0]
-    return f"{yymmdd[0]}_{yymmdd[-1]}"
+        date_label = _recording_date_folder_label(rec_file)
+        groups.setdefault(date_label, []).append(rec_file)
+    return groups
 
 
-def make_run_output_dir(output_parent: Path, rec_files: list[Path]) -> Path:
-    """Distinct folder per run: <parent>/threshold_crossings_<rec_date>_run_<run_date>"""
+def make_recording_date_output_plan(
+    output_parent: Path,
+    rec_files: list[Path],
+) -> dict[str, tuple[Path, list[Path]]]:
+    """One output folder per recording date; fail instead of overwriting."""
     output_parent = Path(output_parent)
     output_parent.mkdir(parents=True, exist_ok=True)
-    rec_label = _recording_date_label(rec_files)
-    run_label = datetime.now().strftime("%y%m%d")
-    stem = f"threshold_crossings_{rec_label}_run_{run_label}"
-    run_dir = output_parent / stem
-    if run_dir.exists():
-        suffix = 1
-        while True:
-            candidate = output_parent / f"{stem}_{suffix}"
-            if not candidate.exists():
-                run_dir = candidate
-                break
-            suffix += 1
-    run_dir.mkdir(parents=False)
-    return run_dir
+    groups = group_recording_files_by_date(rec_files)
+    plan: dict[str, tuple[Path, list[Path]]] = {}
+    existing: list[Path] = []
+    for date_label, date_rec_files in groups.items():
+        out_dir = output_parent / f"threshold_crossings_{date_label}"
+        if out_dir.exists():
+            existing.append(out_dir)
+        plan[date_label] = (out_dir, date_rec_files)
+    if existing:
+        formatted = "\n".join(f"  {p}" for p in existing)
+        raise FileExistsError(
+            "Output folder(s) already exist; overwrite is disabled.\n"
+            f"{formatted}\n"
+            "Move or rename the existing folder(s), or use Resume previous interrupted session."
+        )
+    return plan
 
 
 def _add_timing(timing: dict[str, float] | None, key: str, seconds: float) -> None:
@@ -3141,7 +3147,7 @@ def main() -> int:
     resume_prev = prompt_yes_no("Resume previous interrupted session?", default_yes=False)
     if resume_prev:
         run_dir = prompt_path(
-            "Directory of threshold_crossings_* run folder",
+            "Directory of threshold_crossings_* recording-date folder",
             "",
         )
         if not run_dir.exists():
@@ -3249,10 +3255,19 @@ def main() -> int:
         print(f"  ... and {len(rec_files) - 5} more")
 
     output_parent = DEFAULT_OUTPUT_PARENT
-    run_output_dir = make_run_output_dir(output_parent, rec_files)
-    print(f"\nRun output folder: {run_output_dir.resolve()}")
+    try:
+        output_plan = make_recording_date_output_plan(output_parent, rec_files)
+    except FileExistsError as ex:
+        print(str(ex), file=sys.stderr)
+        return 1
+    print("\nOutput folder(s):")
+    for date_label, (run_output_dir, date_rec_files) in output_plan.items():
+        print(
+            f"  {date_label}: {run_output_dir.resolve()} "
+            f"({len(date_rec_files)} recording(s))"
+        )
     print(
-        "Files written per run: run_config.json; per recording a *_recording_summary.json, "
+        "Files written per recording-date folder: run_config.json; per recording a *_recording_summary.json, "
         "minute CSV/JSON/NPZ outputs, hourly CSV/JSON/NPZ outputs, hourly waveform PNGs, "
         "and timing reports.\n"
     )
@@ -3316,88 +3331,99 @@ def main() -> int:
             }
         )
 
-    meta_run = {
-        "run_output_dir": str(run_output_dir.resolve()),
-        "output_parent": str(Path(output_parent).resolve()),
-        "recording_input": recording_input_raw,
-        "recording_inputs": [str(path.resolve()) for path in recording_inputs],
-        "recording_input_types": [
-            "file" if path.is_file() else "folder"
-            for path in recording_inputs
-        ],
-        "i_root": (
-            str(recording_inputs[0].resolve())
-            if len(recording_inputs) == 1 and recording_inputs[0].is_dir()
-            else str(recording_inputs[0].parent.resolve())
-        ),
-        "first_boundary_input": rec_files[0].name,
-        "last_boundary_input": rec_files[-1].name,
-        "first_sort_key": chronic_rec_sort_key(rec_files[0]),
-        "last_sort_key": chronic_rec_sort_key(rec_files[-1]),
-        "n_files": len(rec_files),
-        "recording_files": [str(p.resolve()) for p in rec_files],
-        "channel_threshold_mode": "json_channel_threshold_pairs",
-        "channel_threshold_ranges": None,
-        "channel_threshold_config": str(config_path.resolve()),
-        "channel_threshold_pairs": channel_threshold_pairs,
-        "polarity": polarity,
-        "chunk_sec": chunk_sec,
-        "chunk_samples": chunk_samples,
-        "sampling_rate_hz": fs,
-        "pre_ms": pre_ms,
-        "post_ms": post_ms,
-        "pre_samples": pre_samples,
-        "post_samples": post_samples,
-        "refractory_ms": refractory_ms,
-        "refractory_samples": refractory_samples,
-        "probe_json": str(probe_json.resolve()),
-        "preprocessing": (
-            {
-                "spikeband_bandpass_hz": [bandpass_freq_min, bandpass_freq_max],
-                "dtype": "float32",
-                "note": "Matches SortingLSNET_Feb2026 preproc.bandpass_filter; "
-                "detection and saved waveforms use this filtered trace.",
-            }
-            if apply_spikeband
-            else None
-        ),
-        "save_trace_previews": bool(DEFAULT_SAVE_TRACE_PREVIEWS),
-        "saved_files_note": (
-            "Per recording: minute_npz/<parent>__<stem> contains one aggregate NPZ per "
-            "real recording minute with every channel/range pair. Per channel/range: "
-            "<parent>__<stem>_recording_summary.json lists minute and hourly artifacts. "
-            "Minute outputs include per-pair summary CSV/JSON rows pointing to the "
-            "recording-level minute NPZ files. Hourly outputs include summary CSV/JSON, "
-            "ISI/correlogram NPZ files, and mean-waveform PNGs. "
-            "Cumulative sample/time columns chain sessions (see cumulative_timeline)."
-        ),
-        "cumulative_timeline": {
-            "ordering": "Single file as provided, or folder contents sorted by Chronic_Rec timestamp",
-            "rule": "Offsets advance only after a file is fully processed. Skipped/failed files "
-            "do not consume timeline space (next success abuts previous success).",
-        },
-    }
-    (run_output_dir / "run_config.json").write_text(
-        json.dumps(meta_run, indent=2), encoding="utf-8"
-    )
+    status = 0
+    for date_label, (run_output_dir, date_rec_files) in output_plan.items():
+        run_output_dir.mkdir(parents=False)
+        meta_run = {
+            "run_output_dir": str(run_output_dir.resolve()),
+            "output_parent": str(Path(output_parent).resolve()),
+            "recording_date": date_label,
+            "output_structure": "one_folder_per_recording_date_no_overwrite",
+            "recording_input": recording_input_raw,
+            "recording_inputs": [str(path.resolve()) for path in recording_inputs],
+            "recording_input_types": [
+                "file" if path.is_file() else "folder"
+                for path in recording_inputs
+            ],
+            "i_root": (
+                str(recording_inputs[0].resolve())
+                if len(recording_inputs) == 1 and recording_inputs[0].is_dir()
+                else str(recording_inputs[0].parent.resolve())
+            ),
+            "all_recording_files_requested": [str(p.resolve()) for p in rec_files],
+            "first_boundary_input": date_rec_files[0].name,
+            "last_boundary_input": date_rec_files[-1].name,
+            "first_sort_key": chronic_rec_sort_key(date_rec_files[0]),
+            "last_sort_key": chronic_rec_sort_key(date_rec_files[-1]),
+            "n_files": len(date_rec_files),
+            "recording_files": [str(p.resolve()) for p in date_rec_files],
+            "channel_threshold_mode": "json_channel_threshold_pairs",
+            "channel_threshold_ranges": None,
+            "channel_threshold_config": str(config_path.resolve()),
+            "channel_threshold_pairs": channel_threshold_pairs,
+            "polarity": polarity,
+            "chunk_sec": chunk_sec,
+            "chunk_samples": chunk_samples,
+            "sampling_rate_hz": fs,
+            "pre_ms": pre_ms,
+            "post_ms": post_ms,
+            "pre_samples": pre_samples,
+            "post_samples": post_samples,
+            "refractory_ms": refractory_ms,
+            "refractory_samples": refractory_samples,
+            "probe_json": str(probe_json.resolve()),
+            "preprocessing": (
+                {
+                    "spikeband_bandpass_hz": [bandpass_freq_min, bandpass_freq_max],
+                    "dtype": "float32",
+                    "note": "Matches SortingLSNET_Feb2026 preproc.bandpass_filter; "
+                    "detection and saved waveforms use this filtered trace.",
+                }
+                if apply_spikeband
+                else None
+            ),
+            "save_trace_previews": bool(DEFAULT_SAVE_TRACE_PREVIEWS),
+            "saved_files_note": (
+                "Per recording: minute_npz/<parent>__<stem> contains one aggregate NPZ per "
+                "real recording minute with every channel/range pair. Per channel/range: "
+                "<parent>__<stem>_recording_summary.json lists minute and hourly artifacts. "
+                "Minute outputs include per-pair summary CSV/JSON rows pointing to the "
+                "recording-level minute NPZ files. Hourly outputs include summary CSV/JSON, "
+                "ISI/correlogram NPZ files, and mean-waveform PNGs. "
+                "Cumulative sample/time columns chain sessions within this recording-date folder "
+                "(see cumulative_timeline)."
+            ),
+            "cumulative_timeline": {
+                "ordering": "Recordings in this date folder sorted by Chronic_Rec timestamp",
+                "rule": "Offsets advance only after a file is fully processed. Skipped/failed files "
+                "do not consume timeline space (next success abuts previous success).",
+            },
+        }
+        (run_output_dir / "run_config.json").write_text(
+            json.dumps(meta_run, indent=2), encoding="utf-8"
+        )
 
-    return process_threshold_crossings_run(
-        run_output_dir=run_output_dir,
-        meta_run=meta_run,
-        rec_files=rec_files,
-        fs=fs,
-        probe_json=probe_json,
-        channel_threshold_pairs=channel_threshold_pairs,
-        polarity=polarity,
-        chunk_samples=chunk_samples,
-        refractory_samples=refractory_samples,
-        pre_samples=pre_samples,
-        post_samples=post_samples,
-        apply_spikeband=apply_spikeband,
-        bandpass_freq_min=bandpass_freq_min,
-        bandpass_freq_max=bandpass_freq_max,
-        resume=False,
-    )
+        run_status = process_threshold_crossings_run(
+            run_output_dir=run_output_dir,
+            meta_run=meta_run,
+            rec_files=date_rec_files,
+            fs=fs,
+            probe_json=probe_json,
+            channel_threshold_pairs=channel_threshold_pairs,
+            polarity=polarity,
+            chunk_samples=chunk_samples,
+            refractory_samples=refractory_samples,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            apply_spikeband=apply_spikeband,
+            bandpass_freq_min=bandpass_freq_min,
+            bandpass_freq_max=bandpass_freq_max,
+            resume=False,
+        )
+        if run_status != 0:
+            status = run_status
+
+    return status
 
 
 if __name__ == "__main__":

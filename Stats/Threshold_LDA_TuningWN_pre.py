@@ -53,9 +53,34 @@ _ORIGINAL_TUNING_WEINAN_LOAD_SERIES_FROM_PAIR_DIR = tuning_weinan.load_series_fr
 
 DEFAULT_LDA_FEATURE_MODES = ("FR_ONLY", "FR_AMP", "FR_CV2", "FR_PEAK_TO_TROUGH", "MULTI_FEATURE")
 DEFAULT_OUTPUT_SUBDIR = "threshold_LDA_TuningWN_pre"
-ANALYSIS_MODES = ("baseline", "sham_drug_markers")
-PHASE_MARKERS = {"baseline": "o", "sham": "s", "drug": "^"}
-PHASE_LABELS = {"baseline": "baseline", "sham": "sham", "drug": "drug"}
+ANALYSIS_MODES = ("baseline", "sham_drug_markers", "treatment_markers")
+PHASE_ORDER = (
+    "baseline",
+    "saline_sham",
+    "saline_drug",
+    "caffeine_sham",
+    "caffeine_drug",
+    "sham",
+    "drug",
+)
+PHASE_MARKERS = {
+    "baseline": "o",
+    "sham": "s",
+    "drug": "^",
+    "saline_sham": "s",
+    "saline_drug": "^",
+    "caffeine_sham": "D",
+    "caffeine_drug": "X",
+}
+PHASE_LABELS = {
+    "baseline": "baseline",
+    "sham": "sham",
+    "drug": "drug",
+    "saline_sham": "saline sham",
+    "saline_drug": "saline drug",
+    "caffeine_sham": "caffeine sham",
+    "caffeine_drug": "caffeine drug",
+}
 CIRCULAR_HOUR_CMAP = plt.get_cmap("twilight_shifted", 24)
 CIRCULAR_HOUR_BOUNDARIES = np.arange(-0.5, 24.5, 1.0)
 CIRCULAR_HOUR_NORM = BoundaryNorm(CIRCULAR_HOUR_BOUNDARIES, CIRCULAR_HOUR_CMAP.N)
@@ -65,6 +90,8 @@ CIRCULAR_HOUR_NORM = BoundaryNorm(CIRCULAR_HOUR_BOUNDARIES, CIRCULAR_HOUR_CMAP.N
 class PipelineConfig:
     run_roots: tuple[Path, ...]
     output_dir: Path | None = None
+    output_suffix: str | None = None
+    selected_threshold_unit_keys: tuple[str, ...] = ()
     analysis_mode: str = "baseline"
     lda_feature_modes: tuple[str, ...] = DEFAULT_LDA_FEATURE_MODES
     min_firing_rate_hz: float = 0.0
@@ -80,6 +107,10 @@ class PipelineConfig:
     tuning_weinan_only_polar: bool = True
     sham_sessions: tuple[str, ...] = ()
     drug_sessions: tuple[str, ...] = ()
+    saline_sham_sessions: tuple[str, ...] = ()
+    saline_drug_sessions: tuple[str, ...] = ()
+    caffeine_sham_sessions: tuple[str, ...] = ()
+    caffeine_drug_sessions: tuple[str, ...] = ()
     confirm_sham_drug: bool = False
 
 
@@ -182,6 +213,13 @@ def safe_slug(value: object) -> str:
     return text.strip("_") or "value"
 
 
+def output_suffix_slug(value: object) -> str:
+    text = safe_slug(value)
+    if text in {"value", ""}:
+        return ""
+    return text
+
+
 def safe_float(value) -> float | None:
     try:
         if value is None or pd.isna(value):
@@ -244,6 +282,83 @@ def discover_threshold_pair_meta(run_root: Path) -> list[tuple[tuning_weinan.Pai
     return pair_meta
 
 
+def discover_threshold_unit_options(run_roots: tuple[Path, ...]) -> list[dict]:
+    seen: set[str] = set()
+    rows: list[dict] = []
+    for run_root in run_roots:
+        for pair, pair_dir in discover_threshold_pair_meta(run_root):
+            unit_key = threshold_unit_key_from_dir(pair, pair_dir)
+            if unit_key in seen:
+                continue
+            seen.add(unit_key)
+            rows.append(
+                {
+                    "unit_key": unit_key,
+                    "sg_ch": int(pair.sg_ch),
+                    "threshold_uv": threshold_min_from_unit_key(unit_key, float(pair.threshold_uv)),
+                    "threshold_label": threshold_label_from_unit_key(unit_key, float(pair.threshold_uv)),
+                }
+            )
+    rows.sort(key=lambda row: (int(row["sg_ch"]), float(row["threshold_uv"]), str(row["unit_key"])))
+    return rows
+
+
+def prompt_threshold_units_for_lda(run_roots: tuple[Path, ...]) -> tuple[str, ...]:
+    options = discover_threshold_unit_options(run_roots)
+    if not options:
+        raise RuntimeError(
+            "No sgch*_thr*uV threshold-pair folders were found before LDA setup. "
+            f"Input folders: {[str(path) for path in run_roots]}"
+        )
+
+    by_channel: dict[int, list[dict]] = {}
+    for row in options:
+        by_channel.setdefault(int(row["sg_ch"]), []).append(row)
+
+    print("\nAvailable threshold channels for LDA:", flush=True)
+    for sg_ch in sorted(by_channel):
+        labels = ", ".join(str(row["threshold_label"]) for row in by_channel[sg_ch])
+        print(f"  SG channel {sg_ch}: {labels}", flush=True)
+
+    raw = input(
+        "\nEnter SG channel(s) to include in LDA, separated by commas "
+        "(or press Enter / type all for all channels): "
+    ).strip()
+    if raw == "" or raw.lower() == "all":
+        selected_channels = set(by_channel.keys())
+    else:
+        selected_channels = set()
+        for token in re.split(r"[;,]", raw):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                selected_channels.add(int(token))
+            except ValueError as exc:
+                raise ValueError(f"Channel selection must be SG channel numbers or 'all'; got {token!r}") from exc
+
+    missing = sorted(ch for ch in selected_channels if ch not in by_channel)
+    if missing:
+        raise ValueError(f"Selected channel(s) not found in threshold units: {missing}")
+
+    selected_rows = [row for row in options if int(row["sg_ch"]) in selected_channels]
+    if not selected_rows:
+        raise ValueError("No threshold units selected for LDA.")
+
+    print("\nThreshold units selected for LDA:", flush=True)
+    for idx, row in enumerate(selected_rows, start=1):
+        print(
+            f"  {idx:4d}. {row['unit_key']}  |  SG channel {row['sg_ch']}  |  threshold {row['threshold_label']}",
+            flush=True,
+        )
+    print(f"Total selected threshold units: {len(selected_rows)}", flush=True)
+
+    if not prompt_yes_no("Use these channels/thresholds for LDA?", default=True):
+        raise RuntimeError("Threshold channel selection was not confirmed; stopping before LDA.")
+
+    return tuple(str(row["unit_key"]) for row in selected_rows)
+
+
 def threshold_unit_key_from_dir(pair: tuning_weinan.PairId, pair_dir: Path) -> str:
     # Keep threshold ranges as distinct unit identities when Threshold_channel.py
     # wrote folders such as sgch12_thr200to300uV.
@@ -260,6 +375,17 @@ def threshold_min_from_unit_key(unit_key: str, fallback: float) -> float:
         return float(threshold_min_text)
     except ValueError:
         return float(fallback)
+
+
+def threshold_label_from_unit_key(unit_key: str, fallback: float | None = None) -> str:
+    match = re.search(r"_thr(?P<thr>.+)uV", str(unit_key))
+    if match is None:
+        return f"{float(fallback):g} uV" if fallback is not None else "unknown"
+    threshold_text = match.group("thr").replace("p", ".")
+    if "to" in threshold_text:
+        lo, hi = threshold_text.split("to", 1)
+        return f"{lo} to {hi} uV"
+    return f"{threshold_text} uV"
 
 
 def threshold_feature_columns(unit_key: str) -> dict[str, str]:
@@ -285,8 +411,93 @@ def default_output_dir(run_roots: tuple[Path, ...]) -> Path:
     return common_root / DEFAULT_OUTPUT_SUBDIR
 
 
+def output_dir_with_suffix(base_dir: Path, suffix: str) -> Path:
+    suffix = output_suffix_slug(suffix)
+    if not suffix:
+        raise ValueError("Output folder suffix cannot be empty.")
+    return Path(base_dir).with_name(f"{Path(base_dir).name}_{suffix}")
+
+
+def unique_timestamped_output_dir(base_dir: Path) -> Path:
+    base_dir = Path(base_dir)
+    if not base_dir.exists():
+        return base_dir
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = base_dir.with_name(f"{base_dir.name}_{stamp}")
+    if not candidate.exists():
+        return candidate
+    suffix = 2
+    while True:
+        candidate = base_dir.with_name(f"{base_dir.name}_{stamp}_{suffix:02d}")
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def resolve_existing_output_dir_collision(requested_output_dir: Path, configured_suffix: str | None) -> Path:
+    if not requested_output_dir.exists():
+        return requested_output_dir
+
+    if configured_suffix:
+        candidate = output_dir_with_suffix(requested_output_dir, configured_suffix)
+        if candidate.exists():
+            raise FileExistsError(
+                f"Output folder already exists after applying suffix {configured_suffix!r}: {candidate}"
+            )
+        return candidate
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        print(
+            f"\nOutput folder already exists:\n  {requested_output_dir}\n",
+            flush=True,
+        )
+        while True:
+            raw_suffix = input(
+                "Enter text to add after the folder name for this run "
+                "(example: channels_12_45): "
+            ).strip()
+            suffix = output_suffix_slug(raw_suffix)
+            if not suffix:
+                print("Please enter a non-empty suffix.", flush=True)
+                continue
+            candidate = output_dir_with_suffix(requested_output_dir, suffix)
+            print(f"Proposed output folder:\n  {candidate}", flush=True)
+            if candidate.exists():
+                print("That folder also exists. Please choose a different suffix.", flush=True)
+                continue
+            if prompt_yes_no("Use this output folder?", default=True):
+                return candidate
+
+    # Batch/non-interactive fallback: avoid overwriting and avoid blocking forever.
+    return unique_timestamped_output_dir(requested_output_dir)
+
+
 def resolve_output_dir(config: PipelineConfig) -> Path:
-    output_dir = Path(config.output_dir) if config.output_dir is not None else default_output_dir(config.run_roots)
+    requested_output_dir = Path(config.output_dir) if config.output_dir is not None else default_output_dir(config.run_roots)
+    if requested_output_dir.exists():
+        population_csv = requested_output_dir / "threshold_population_minute_features.csv"
+        manifest_json = requested_output_dir / "threshold_population_manifest.json"
+        reusable, reason = is_population_csv_reusable(
+            population_csv,
+            manifest_json,
+            config.run_roots,
+            selected_unit_keys=config.selected_threshold_unit_keys,
+        )
+        if reusable:
+            log_status(
+                "Existing output folder contains a matching precomputed threshold population CSV; "
+                f"reusing folder: {requested_output_dir}"
+            )
+            return requested_output_dir
+        log_status(
+            "Existing output folder did not contain a reusable threshold population CSV "
+            f"({reason}); resolving output-folder collision."
+        )
+    output_dir = resolve_existing_output_dir_collision(requested_output_dir, config.output_suffix)
+    if output_dir != requested_output_dir:
+        log_status(
+            f"Output folder already exists; writing this run to: {output_dir}"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -316,11 +527,22 @@ def normalize_minute_summary_table(csv_path: Path) -> pd.DataFrame:
     return table
 
 
-def build_threshold_population_csv(run_roots: tuple[Path, ...], output_dir: Path, *, force: bool = False) -> Path:
+def build_threshold_population_csv(
+    run_roots: tuple[Path, ...],
+    output_dir: Path,
+    *,
+    force: bool = False,
+    selected_unit_keys: tuple[str, ...] = (),
+) -> Path:
     population_csv = output_dir / "threshold_population_minute_features.csv"
     manifest_json = output_dir / "threshold_population_manifest.json"
     if population_csv.exists() and not force:
-        reusable, reason = is_population_csv_reusable(population_csv, manifest_json, run_roots)
+        reusable, reason = is_population_csv_reusable(
+            population_csv,
+            manifest_json,
+            run_roots,
+            selected_unit_keys=selected_unit_keys,
+        )
         if reusable:
             log_status(f"Reusing threshold population CSV: {population_csv}")
             return population_csv
@@ -330,17 +552,21 @@ def build_threshold_population_csv(run_roots: tuple[Path, ...], output_dir: Path
         )
 
     all_pair_meta: list[tuple[Path, tuning_weinan.PairId, Path]] = []
+    selected_set = set(selected_unit_keys)
     for run_root in run_roots:
         pair_meta = discover_threshold_pair_meta(run_root)
         if not pair_meta:
             log_status(f"No sgch*_thr*uV threshold-pair folders found under: {run_root}")
             continue
         for pair, pair_dir in pair_meta:
+            unit_key = threshold_unit_key_from_dir(pair, pair_dir)
+            if selected_set and unit_key not in selected_set:
+                continue
             all_pair_meta.append((run_root, pair, pair_dir))
     if not all_pair_meta:
         raise RuntimeError(
             "No sgch*_thr*uV threshold-pair folders were found under any input folder: "
-            f"{[str(path) for path in run_roots]}"
+            f"{[str(path) for path in run_roots]} with selected units: {sorted(selected_set)}"
         )
 
     run_order_lookup = {Path(run_root).resolve(): index for index, run_root in enumerate(run_roots, start=1)}
@@ -506,6 +732,7 @@ def build_threshold_population_csv(run_roots: tuple[Path, ...], output_dir: Path
             {
                 "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
                 "input_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
+                "selected_threshold_unit_keys": list(selected_unit_keys),
                 "population_csv": str(population_csv.resolve()),
                 "n_threshold_units": int(len(unit_table)),
                 "n_minute_samples": int(len(population_df)),
@@ -528,6 +755,8 @@ def is_population_csv_reusable(
     population_csv: Path,
     manifest_json: Path,
     run_roots: tuple[Path, ...],
+    *,
+    selected_unit_keys: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     if not manifest_json.exists():
         return False, "manifest is missing"
@@ -538,8 +767,13 @@ def is_population_csv_reusable(
 
     requested_roots = [str(Path(path).resolve()) for path in run_roots]
     manifest_roots = [str(Path(path).resolve()) for path in manifest.get("input_run_roots", [])]
-    if manifest_roots != requested_roots:
+    portable_root = manifest.get("portable_threshold_run_root", None)
+    portable_roots = [str(Path(portable_root).resolve())] if portable_root else []
+    if manifest_roots != requested_roots and portable_roots != requested_roots:
         return False, "manifest input_run_roots differ from this run"
+    manifest_selected = tuple(str(value) for value in manifest.get("selected_threshold_unit_keys", []))
+    if manifest_selected != tuple(selected_unit_keys):
+        return False, "manifest selected_threshold_unit_keys differ from this run"
     if str(Path(manifest.get("population_csv", "")).resolve()) != str(Path(population_csv).resolve()):
         return False, "manifest points to a different population CSV"
     return True, "manifest matches"
@@ -701,8 +935,20 @@ def run_tuning_weinan(run_root: Path, output_root: Path, *, only_polar: bool = T
     }
 
 
-def write_tuning_weinan_usage_summary_from_threshold_minutes(run_root: Path, output_root: Path) -> None:
+def write_tuning_weinan_usage_summary_from_threshold_minutes(
+    run_root: Path,
+    output_root: Path,
+    *,
+    selected_unit_keys: tuple[str, ...] = (),
+) -> None:
     pair_meta = discover_threshold_pair_meta(run_root)
+    selected_set = set(selected_unit_keys)
+    if selected_set:
+        pair_meta = [
+            (pair, pair_dir)
+            for pair, pair_dir in pair_meta
+            if threshold_unit_key_from_dir(pair, pair_dir) in selected_set
+        ]
     if not pair_meta:
         raise RuntimeError(f"No sgch*_thr*uV threshold-pair folders found under: {run_root}")
     output_root = Path(output_root)
@@ -725,13 +971,20 @@ def write_tuning_weinan_usage_summary_from_threshold_minutes(run_root: Path, out
     )
 
 
-def run_tuning_weinan_combined(run_roots: tuple[Path, ...], output_root: Path, *, only_polar: bool = True) -> dict:
+def run_tuning_weinan_combined(
+    run_roots: tuple[Path, ...],
+    output_root: Path,
+    *,
+    only_polar: bool = True,
+    selected_unit_keys: tuple[str, ...] = (),
+) -> dict:
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     log_status(f"Starting combined Tuning_Weinan analysis for {len(run_roots)} threshold run(s)")
     log_status(f"Combined Tuning_Weinan output folder: {output_root}")
 
     grouped_series: dict[str, dict] = {}
+    selected_set = set(selected_unit_keys)
     total_pair_dirs = 0
     for run_root in run_roots:
         pair_meta = discover_threshold_pair_meta(run_root)
@@ -739,6 +992,8 @@ def run_tuning_weinan_combined(run_roots: tuple[Path, ...], output_root: Path, *
         log_status(f"Combined tuning input {Path(run_root).name}: {len(pair_meta)} threshold unit folder(s)")
         for pair, pair_dir in pair_meta:
             unit_key = threshold_unit_key_from_dir(pair, pair_dir)
+            if selected_set and unit_key not in selected_set:
+                continue
             entry = grouped_series.setdefault(
                 unit_key,
                 {
@@ -825,6 +1080,7 @@ def run_tuning_weinan_combined(run_roots: tuple[Path, ...], output_root: Path, *
         json.dumps(
             {
                 "input_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
+                "selected_threshold_unit_keys": list(selected_unit_keys),
                 "output_root": str(output_root.resolve()),
                 "analysis_scope": "combined_threshold_runs",
                 "n_input_runs": int(len(run_roots)),
@@ -848,6 +1104,7 @@ def run_tuning_weinan_combined(run_roots: tuple[Path, ...], output_root: Path, *
         "status": "completed",
         "exit_code": 0,
         "run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
+        "selected_threshold_unit_keys": list(selected_unit_keys),
         "output_dir": str(output_root.resolve()),
         "analysis_scope": "combined_threshold_runs",
         "output_files": output_files,
@@ -1088,6 +1345,7 @@ def build_injection_phase_schedule(sham_recordings: pd.DataFrame, drug_recording
         "baseline_label": "baseline",
         "sham_label": "sham",
         "drug_label": "drug",
+        "phase_order": ["baseline", "sham", "drug"],
         "interpretation": (
             "LDA labels remain clock_hour_of_day. Marker shapes encode baseline/sham/drug: "
             "sham from each sham recording start until the next drug recording start; drug "
@@ -1100,8 +1358,121 @@ def build_injection_phase_schedule(sham_recordings: pd.DataFrame, drug_recording
     }
 
 
+def _paired_phase_intervals(
+    *,
+    sham_recordings: pd.DataFrame,
+    drug_recordings: pd.DataFrame,
+    sham_phase: str,
+    drug_phase: str,
+) -> tuple[list[dict], list[dict]]:
+    sham_table = sham_recordings.sort_values("session_start_datetime").drop_duplicates(
+        ["session_key", "session_start_datetime"]
+    )
+    drug_table = drug_recordings.sort_values("session_start_datetime").drop_duplicates(
+        ["session_key", "session_start_datetime"]
+    )
+    drug_starts = pd.to_datetime(drug_table["session_start_datetime"], errors="coerce")
+
+    drug_intervals = []
+    for drug_row in drug_table.itertuples(index=False):
+        drug_start = pd.Timestamp(drug_row.session_start_datetime)
+        drug_intervals.append(
+            {
+                "phase": drug_phase,
+                "session_name": str(drug_row.session_name),
+                "session_key": str(drug_row.session_key),
+                "start": drug_start.isoformat(sep=" "),
+                "end": (drug_start + timedelta(hours=24)).isoformat(sep=" "),
+            }
+        )
+
+    sham_intervals = []
+    for sham_row in sham_table.itertuples(index=False):
+        sham_start = pd.Timestamp(sham_row.session_start_datetime)
+        following_drugs = drug_table.loc[drug_starts > sham_start]
+        if following_drugs.empty:
+            raise ValueError(
+                f"{PHASE_LABELS.get(sham_phase, sham_phase)} recording {sham_row.session_name!r} "
+                f"at {sham_start} has no following {PHASE_LABELS.get(drug_phase, drug_phase)} recording."
+            )
+        drug_row = following_drugs.iloc[0]
+        drug_start = pd.Timestamp(drug_row["session_start_datetime"])
+        sham_intervals.append(
+            {
+                "phase": sham_phase,
+                "session_name": str(sham_row.session_name),
+                "session_key": str(sham_row.session_key),
+                "paired_drug_session_name": str(drug_row["session_name"]),
+                "paired_drug_session_key": str(drug_row["session_key"]),
+                "start": sham_start.isoformat(sep=" "),
+                "end": drug_start.isoformat(sep=" "),
+            }
+        )
+    return sham_intervals, drug_intervals
+
+
+def build_treatment_phase_schedule(
+    *,
+    saline_sham_recordings: pd.DataFrame,
+    saline_drug_recordings: pd.DataFrame,
+    caffeine_sham_recordings: pd.DataFrame,
+    caffeine_drug_recordings: pd.DataFrame,
+) -> dict:
+    if (
+        saline_sham_recordings.empty
+        or saline_drug_recordings.empty
+        or caffeine_sham_recordings.empty
+        or caffeine_drug_recordings.empty
+    ):
+        raise ValueError(
+            "Treatment marker mode requires saline sham, saline drug, caffeine sham, "
+            "and caffeine drug recording selections."
+        )
+
+    saline_sham, saline_drug = _paired_phase_intervals(
+        sham_recordings=saline_sham_recordings,
+        drug_recordings=saline_drug_recordings,
+        sham_phase="saline_sham",
+        drug_phase="saline_drug",
+    )
+    caffeine_sham, caffeine_drug = _paired_phase_intervals(
+        sham_recordings=caffeine_sham_recordings,
+        drug_recordings=caffeine_drug_recordings,
+        sham_phase="caffeine_sham",
+        drug_phase="caffeine_drug",
+    )
+    phase_intervals = saline_sham + caffeine_sham + saline_drug + caffeine_drug
+    return {
+        "label_type": "treatment_phase_marker",
+        "baseline_label": "baseline",
+        "phase_order": [
+            "baseline",
+            "saline_sham",
+            "saline_drug",
+            "caffeine_sham",
+            "caffeine_drug",
+        ],
+        "interpretation": (
+            "LDA labels remain clock_hour_of_day. Marker shapes encode baseline, saline sham, "
+            "saline drug, caffeine sham, and caffeine drug. Sham intervals run from each sham "
+            "recording start until the next matching drug recording start. Drug intervals run "
+            "from each drug recording start until 24 hours later. Drug intervals have priority "
+            "if intervals overlap."
+        ),
+        "phase_intervals": phase_intervals,
+        "saline_sham_intervals": saline_sham,
+        "saline_drug_intervals": saline_drug,
+        "caffeine_sham_intervals": caffeine_sham,
+        "caffeine_drug_intervals": caffeine_drug,
+        "saline_sham_recordings": saline_sham_recordings.to_dict(orient="records"),
+        "saline_drug_recordings": saline_drug_recordings.to_dict(orient="records"),
+        "caffeine_sham_recordings": caffeine_sham_recordings.to_dict(orient="records"),
+        "caffeine_drug_recordings": caffeine_drug_recordings.to_dict(orient="records"),
+    }
+
+
 def collect_injection_phase_schedule(population_csv: Path, config: PipelineConfig, output_dir: Path) -> dict | None:
-    if config.analysis_mode != "sham_drug_markers":
+    if config.analysis_mode not in {"sham_drug_markers", "treatment_markers"}:
         return None
 
     recording_table = build_recording_table_from_population_csv(population_csv)
@@ -1113,8 +1484,61 @@ def collect_injection_phase_schedule(population_csv: Path, config: PipelineConfi
         "session_key",
     ]
     available_columns = [column for column in display_columns if column in recording_table.columns]
-    print("\nAvailable threshold recordings for sham/drug marker selection:", flush=True)
+    marker_selection_label = "treatment phase" if config.analysis_mode == "treatment_markers" else "sham/drug"
+    print(f"\nAvailable threshold recordings for {marker_selection_label} marker selection:", flush=True)
     print(recording_table[available_columns].to_string(index=False), flush=True)
+
+    if config.analysis_mode == "treatment_markers":
+        saline_sham_tokens = config.saline_sham_sessions
+        saline_drug_tokens = config.saline_drug_sessions
+        caffeine_sham_tokens = config.caffeine_sham_sessions
+        caffeine_drug_tokens = config.caffeine_drug_sessions
+        if not saline_sham_tokens:
+            saline_sham_tokens = parse_token_list(
+                input("\nEnter saline sham recording_id(s), recording name(s), or tokens, separated by commas: ")
+            )
+        if not saline_drug_tokens:
+            saline_drug_tokens = parse_token_list(
+                input("Enter saline drug recording_id(s), recording name(s), or tokens, separated by commas: ")
+            )
+        if not caffeine_sham_tokens:
+            caffeine_sham_tokens = parse_token_list(
+                input("Enter caffeine sham recording_id(s), recording name(s), or tokens, separated by commas: ")
+            )
+        if not caffeine_drug_tokens:
+            caffeine_drug_tokens = parse_token_list(
+                input("Enter caffeine drug recording_id(s), recording name(s), or tokens, separated by commas: ")
+            )
+        schedule = build_treatment_phase_schedule(
+            saline_sham_recordings=select_recordings_from_tokens(recording_table, saline_sham_tokens),
+            saline_drug_recordings=select_recordings_from_tokens(recording_table, saline_drug_tokens),
+            caffeine_sham_recordings=select_recordings_from_tokens(recording_table, caffeine_sham_tokens),
+            caffeine_drug_recordings=select_recordings_from_tokens(recording_table, caffeine_drug_tokens),
+        )
+        print("\nTreatment marker interpretation:", flush=True)
+        print(f"  {schedule['interpretation']}", flush=True)
+        for phase in schedule["phase_order"]:
+            if phase == "baseline":
+                continue
+            print(f"  {PHASE_LABELS.get(phase, phase)} intervals:", flush=True)
+            for interval in schedule.get(f"{phase}_intervals", []):
+                paired = ""
+                if "paired_drug_session_name" in interval:
+                    paired = f" -> {interval['paired_drug_session_name']}"
+                print(
+                    f"    {interval['session_name']}{paired}: "
+                    f"[{interval['start']}, {interval['end']})",
+                    flush=True,
+                )
+        if not config.confirm_sham_drug:
+            confirm = input("Is this treatment marker setup correct? Type YES to continue: ").strip()
+            if confirm != "YES":
+                raise RuntimeError("Treatment marker setup was not confirmed; stopping before LDA.")
+
+        schedule_path = output_dir / "threshold_treatment_marker_schedule.json"
+        schedule_path.write_text(json.dumps(schedule, indent=2), encoding="utf-8")
+        log_status(f"Saved treatment marker schedule: {schedule_path}")
+        return schedule
 
     sham_tokens = config.sham_sessions
     drug_tokens = config.drug_sessions
@@ -1161,6 +1585,21 @@ def assign_injection_phase_for_times(datetimes: pd.Series, schedule: dict) -> pd
     parsed = pd.to_datetime(datetimes, errors="coerce")
     phases = pd.Series("baseline", index=parsed.index, dtype=object)
 
+    phase_intervals = schedule.get("phase_intervals", None)
+    if phase_intervals is not None:
+        # Apply non-drug phases first, then drug phases so drug wins on overlap.
+        ordered_intervals = sorted(
+            phase_intervals,
+            key=lambda interval: 1 if str(interval.get("phase", "")).endswith("_drug") else 0,
+        )
+        for interval in ordered_intervals:
+            start = pd.Timestamp(interval["start"])
+            end = pd.Timestamp(interval["end"])
+            phase = str(interval.get("phase", "baseline"))
+            mask = parsed.notna() & (parsed >= start) & (parsed < end)
+            phases.loc[mask] = phase
+        return phases
+
     for interval in schedule.get("sham_intervals", []) or []:
         start = pd.Timestamp(interval["start"])
         end = pd.Timestamp(interval["end"])
@@ -1178,6 +1617,17 @@ def assign_injection_phase_for_times(datetimes: pd.Series, schedule: dict) -> pd
 
 def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> list[Path]:
     output_paths: list[Path] = []
+    phase_order = [
+        phase
+        for phase in schedule.get("phase_order", PHASE_ORDER)
+        if str(phase)
+    ]
+    plot_tag = "treatment_markers" if schedule.get("label_type") == "treatment_phase_marker" else "sham_drug_markers"
+    plot_title = (
+        "LDA Projection - clock hour color, treatment marker shape"
+        if plot_tag == "treatment_markers"
+        else "LDA Projection - clock hour color, sham/drug marker shape"
+    )
     for output_dir in lda_dirs:
         projection_csv = Path(output_dir) / "lda_projection.csv"
         if not projection_csv.exists():
@@ -1199,7 +1649,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
 
         fig, ax = plt.subplots(figsize=(10, 8))
         first_scatter = None
-        for phase in ("baseline", "sham", "drug"):
+        for phase in phase_order:
             mask = projection["injection_phase"].astype(str).to_numpy() == phase
             if not np.any(mask):
                 continue
@@ -1220,7 +1670,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
                 first_scatter = scatter
         ax.set_xlabel("LD1")
         ax.set_ylabel("LD2")
-        ax.set_title("LDA Projection - clock hour color, sham/drug marker shape")
+        ax.set_title(plot_title)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         if first_scatter is not None:
@@ -1247,17 +1697,24 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
                 markersize=8,
                 label=PHASE_LABELS.get(phase, phase),
             )
-            for phase in ("baseline", "sham", "drug")
+            for phase in phase_order
             if phase in set(projection["injection_phase"].astype(str))
         ]
         if handles:
-            ax.legend(handles=handles, title="marker", loc="best", frameon=True)
+            ax.legend(
+                handles=handles,
+                title="phase",
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.16),
+                ncol=min(len(handles), 5),
+                frameon=True,
+            )
         fig.tight_layout()
-        out_png = Path(output_dir) / "lda_2d_sham_drug_markers.png"
-        fig.savefig(out_png, dpi=300)
+        out_png = Path(output_dir) / f"lda_2d_{plot_tag}.png"
+        fig.savefig(out_png, dpi=300, bbox_inches="tight")
         plt.close(fig)
         output_paths.append(out_png)
-        log_status(f"Saved sham/drug marker LDA plot: {out_png}")
+        log_status(f"Saved phase marker LDA plot: {out_png}")
 
         z_values = (
             pd.to_numeric(projection["LD3"], errors="coerce").to_numpy(dtype=float)
@@ -1267,7 +1724,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
         fig = plt.figure(figsize=(11, 9))
         ax = fig.add_subplot(111, projection="3d")
         first_scatter = None
-        for phase in ("baseline", "sham", "drug"):
+        for phase in phase_order:
             mask = projection["injection_phase"].astype(str).to_numpy() == phase
             if not np.any(mask):
                 continue
@@ -1290,7 +1747,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
         ax.set_xlabel("LD1")
         ax.set_ylabel("LD2")
         ax.set_zlabel("LD3")
-        ax.set_title("LDA Projection 3D - clock hour color, sham/drug marker shape")
+        ax.set_title(plot_title.replace("LDA Projection", "LDA Projection 3D"))
         if first_scatter is not None:
             colorbar = fig.colorbar(
                 first_scatter,
@@ -1304,13 +1761,20 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             )
             colorbar.set_label("Hour")
         if handles:
-            ax.legend(handles=handles, title="marker", loc="best", frameon=True)
+            ax.legend(
+                handles=handles,
+                title="phase",
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.12),
+                ncol=min(len(handles), 5),
+                frameon=True,
+            )
         fig.tight_layout()
-        out_3d_png = Path(output_dir) / "lda_3d_sham_drug_markers.png"
-        fig.savefig(out_3d_png, dpi=300)
+        out_3d_png = Path(output_dir) / f"lda_3d_{plot_tag}.png"
+        fig.savefig(out_3d_png, dpi=300, bbox_inches="tight")
         plt.close(fig)
         output_paths.append(out_3d_png)
-        log_status(f"Saved sham/drug marker LDA 3D plot: {out_3d_png}")
+        log_status(f"Saved phase marker LDA 3D plot: {out_3d_png}")
     return output_paths
 
 
@@ -1318,6 +1782,26 @@ def parse_feature_modes(raw_value: str | None) -> tuple[str, ...]:
     if not raw_value:
         return DEFAULT_LDA_FEATURE_MODES
     return tuple(part.strip().upper() for part in raw_value.split(",") if part.strip())
+
+
+def select_threshold_units_by_channels(run_roots: tuple[Path, ...], channel_text: str) -> tuple[str, ...]:
+    options = discover_threshold_unit_options(run_roots)
+    by_channel: dict[int, list[dict]] = {}
+    for row in options:
+        by_channel.setdefault(int(row["sg_ch"]), []).append(row)
+    if channel_text.strip().lower() == "all":
+        selected_channels = set(by_channel.keys())
+    else:
+        selected_channels = {
+            int(token.strip())
+            for token in re.split(r"[;,]", channel_text)
+            if token.strip()
+        }
+    missing = sorted(ch for ch in selected_channels if ch not in by_channel)
+    if missing:
+        raise ValueError(f"Selected channel(s) not found in threshold units: {missing}")
+    selected = [row for row in options if int(row["sg_ch"]) in selected_channels]
+    return tuple(str(row["unit_key"]) for row in selected)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1334,7 +1818,20 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="threshold_crossings_* run folder. May be repeated; comma/semicolon-separated values are accepted.",
     )
-    parser.add_argument("--output-dir", help=f"Output folder. Defaults to <run_root>/{DEFAULT_OUTPUT_SUBDIR}, or the common parent for multiple inputs")
+    parser.add_argument(
+        "--output-dir",
+        help=(
+            f"Output folder. Defaults to <run_root>/{DEFAULT_OUTPUT_SUBDIR}, or the common parent "
+            "for multiple inputs. If the folder already exists, interactive runs ask for a suffix."
+        ),
+    )
+    parser.add_argument(
+        "--output-suffix",
+        help=(
+            "Text to append to the output folder name if it already exists. "
+            "Useful for non-interactive runs, e.g. --output-suffix channels_12_45."
+        ),
+    )
     parser.add_argument("--force-rebuild-population-csv", action="store_true")
     parser.add_argument("--skip-lda", action="store_true")
     parser.add_argument("--skip-tuning-weinan", action="store_true")
@@ -1356,7 +1853,10 @@ def parse_args() -> argparse.Namespace:
         "--analysis-mode",
         choices=ANALYSIS_MODES,
         default="baseline",
-        help="baseline runs clock-hour LDA only; sham_drug_markers adds sham/drug marker-shape plots.",
+        help=(
+            "baseline runs clock-hour LDA only; sham_drug_markers adds sham/drug marker-shape plots; "
+            "treatment_markers adds baseline/saline sham/saline drug/caffeine sham/caffeine drug markers."
+        ),
     )
     parser.add_argument("--lda-feature-modes", help="Comma-separated LDA feature modes")
     parser.add_argument("--min-firing-rate-hz", type=float, default=0.0)
@@ -1365,9 +1865,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cv-n-splits", type=int, default=5)
     parser.add_argument("--n-permutations", type=int, default=20)
     parser.add_argument("--no-zscore", action="store_true")
+    parser.add_argument("--lda-channels", help="SG channel selection for LDA, e.g. '12,45,337' or 'all'.")
     parser.add_argument("--sham-sessions", help="Comma/semicolon-separated sham recording IDs, names, or tokens.")
     parser.add_argument("--drug-sessions", help="Comma/semicolon-separated drug recording IDs, names, or tokens.")
-    parser.add_argument("--confirm-sham-drug", action="store_true", help="Skip confirmation prompt for sham/drug marker intervals.")
+    parser.add_argument("--saline-sham-sessions", help="Comma/semicolon-separated saline sham recording IDs, names, or tokens.")
+    parser.add_argument("--saline-drug-sessions", help="Comma/semicolon-separated saline drug recording IDs, names, or tokens.")
+    parser.add_argument("--caffeine-sham-sessions", help="Comma/semicolon-separated caffeine sham recording IDs, names, or tokens.")
+    parser.add_argument("--caffeine-drug-sessions", help="Comma/semicolon-separated caffeine drug recording IDs, names, or tokens.")
+    parser.add_argument(
+        "--confirm-sham-drug",
+        action="store_true",
+        help="Skip confirmation prompt for sham/drug marker intervals.",
+    )
+    parser.add_argument(
+        "--confirm-treatment-markers",
+        dest="confirm_sham_drug",
+        action="store_true",
+        help="Skip confirmation prompt for treatment marker intervals.",
+    )
     return parser.parse_args()
 
 
@@ -1405,9 +1920,30 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         skip_lda = not prompt_yes_no("Run LDA clock-hour analysis?", default=not skip_lda)
         skip_tuning_weinan = not prompt_yes_no("Run Tuning_Weinan?", default=not skip_tuning_weinan)
         skip_presentation = not prompt_yes_no("Run presentation summary?", default=not skip_presentation)
+    if skip_lda:
+        selected_threshold_unit_keys = ()
+        if args.lda_channels:
+            log_status("--lda-channels was provided, but LDA is skipped; using all channels for non-LDA stages.")
+    elif args.lda_channels:
+        selected_threshold_unit_keys = select_threshold_units_by_channels(run_roots, str(args.lda_channels))
+        print("\nThreshold units selected from --lda-channels:", flush=True)
+        selected_set = set(selected_threshold_unit_keys)
+        for row in discover_threshold_unit_options(run_roots):
+            if str(row["unit_key"]) in selected_set:
+                print(
+                    f"  {row['unit_key']}  |  SG channel {row['sg_ch']}  |  threshold {row['threshold_label']}",
+                    flush=True,
+                )
+    elif bool(args.non_interactive):
+        selected_threshold_unit_keys = ()
+        log_status("Non-interactive mode: using all discovered threshold channels for LDA.")
+    else:
+        selected_threshold_unit_keys = prompt_threshold_units_for_lda(run_roots)
     return PipelineConfig(
         run_roots=run_roots,
         output_dir=Path(args.output_dir) if args.output_dir else None,
+        output_suffix=str(args.output_suffix) if args.output_suffix else None,
+        selected_threshold_unit_keys=selected_threshold_unit_keys,
         analysis_mode=str(args.analysis_mode),
         lda_feature_modes=parse_feature_modes(args.lda_feature_modes),
         min_firing_rate_hz=float(args.min_firing_rate_hz),
@@ -1423,6 +1959,10 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         tuning_weinan_only_polar=not bool(args.tuning_weinan_master_plots),
         sham_sessions=parse_token_list(args.sham_sessions),
         drug_sessions=parse_token_list(args.drug_sessions),
+        saline_sham_sessions=parse_token_list(args.saline_sham_sessions),
+        saline_drug_sessions=parse_token_list(args.saline_drug_sessions),
+        caffeine_sham_sessions=parse_token_list(args.caffeine_sham_sessions),
+        caffeine_drug_sessions=parse_token_list(args.caffeine_drug_sessions),
         confirm_sham_drug=bool(args.confirm_sham_drug),
     )
 
@@ -1441,10 +1981,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
             config.run_roots,
             output_dir,
             force=not config.reuse_population_csv,
+            selected_unit_keys=config.selected_threshold_unit_keys,
         )
     injection_schedule = None
+    marker_stage_label = "treatment marker" if config.analysis_mode == "treatment_markers" else "sham/drug marker"
     if not config.skip_lda:
-        with timed_stage("LDA sham/drug marker setup", timings):
+        with timed_stage(f"LDA {marker_stage_label} setup", timings):
             injection_schedule = collect_injection_phase_schedule(population_csv, config, output_dir)
 
     result = {
@@ -1453,6 +1995,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "config": jsonable_config(config),
         "population_csv": str(population_csv.resolve()),
         "lda_output_dirs": [],
+        "phase_marker_plots": [],
         "sham_drug_marker_plots": [],
         "injection_phase_schedule": injection_schedule,
         "tuning_weinan_results": [],
@@ -1467,9 +2010,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
             lda_dirs = run_lda(population_csv, output_dir, config)
         result["lda_output_dirs"] = [str(path.resolve()) for path in lda_dirs]
         if injection_schedule is not None:
-            with timed_stage("LDA sham/drug marker plotting", timings):
+            with timed_stage(f"LDA {marker_stage_label} plotting", timings):
                 marker_plots = add_phase_markers_to_lda_outputs(lda_dirs, injection_schedule)
-            result["sham_drug_marker_plots"] = [str(path.resolve()) for path in marker_plots]
+            marker_plot_paths = [str(path.resolve()) for path in marker_plots]
+            result["phase_marker_plots"] = marker_plot_paths
+            result["sham_drug_marker_plots"] = marker_plot_paths
 
     if config.skip_tuning_weinan:
         log_status("Skipping Tuning_Weinan by request.")
@@ -1483,6 +2028,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         config.run_roots,
                         tuning_output_base,
                         only_polar=bool(config.tuning_weinan_only_polar),
+                        selected_unit_keys=config.selected_threshold_unit_keys,
                     )
                 ]
         except Exception as exc:
