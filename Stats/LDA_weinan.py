@@ -42,6 +42,7 @@ the real underlying analyzer unit ids instead of synthetic day-level ids.
 """
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2139,6 +2140,105 @@ def prepare_single_day_5min_samples(
     return sample_population, sample_metadata
 
 
+def _json_hash(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def hourly_aggregation_cache_payload(
+    *,
+    csv_path: Path,
+    config: Config,
+    feature_table: pd.DataFrame,
+) -> dict:
+    csv_path = Path(csv_path)
+    try:
+        stat = csv_path.stat()
+        csv_size = int(stat.st_size)
+        csv_mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        csv_size = -1
+        csv_mtime_ns = -1
+    feature_payload_columns = [
+        column
+        for column in ("feature_key", "final_group_key", "feature_type", "feature_column", "source_column")
+        if column in feature_table.columns
+    ]
+    feature_payload = feature_table[feature_payload_columns].astype(str).to_dict(orient="records")
+    return {
+        "cache_version": 1,
+        "csv_path": str(csv_path.resolve()),
+        "csv_size": csv_size,
+        "csv_mtime_ns": csv_mtime_ns,
+        "lda_mode": str(config.lda_mode),
+        "min_firing_rate_hz": float(config.min_firing_rate_hz),
+        "hourly_waveform_weighting": str(config.hourly_waveform_weighting),
+        "n_features": int(len(feature_table)),
+        "features": feature_payload,
+    }
+
+
+def hourly_aggregation_cache_paths(config: Config, cache_key: str) -> tuple[Path, Path, Path]:
+    cache_dir = Path(config.output_base_dir) / "_hourly_cache"
+    return (
+        cache_dir / f"hourly_{cache_key}.npz",
+        cache_dir / f"hourly_{cache_key}_metadata.csv",
+        cache_dir / f"hourly_{cache_key}_manifest.json",
+    )
+
+
+def load_hourly_aggregation_cache(
+    *,
+    config: Config,
+    cache_payload: dict,
+) -> tuple[np.ndarray, pd.DataFrame] | None:
+    cache_key = _json_hash(cache_payload)
+    matrix_path, metadata_path, manifest_path = hourly_aggregation_cache_paths(config, cache_key)
+    if not matrix_path.exists() or not metadata_path.exists() or not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("payload") != cache_payload:
+            return None
+        with np.load(str(matrix_path), allow_pickle=False) as payload:
+            matrix = np.asarray(payload["hourly_population_matrix"], dtype=float)
+        metadata = pd.read_csv(metadata_path)
+    except Exception as exc:
+        log_status(f"Ignoring unreadable hourly aggregation cache: {exc}")
+        return None
+    log_status(f"Reused hourly aggregation cache: {matrix_path}")
+    return matrix, metadata
+
+
+def save_hourly_aggregation_cache(
+    *,
+    config: Config,
+    cache_payload: dict,
+    hourly_population_matrix: np.ndarray,
+    hourly_metadata_table: pd.DataFrame,
+) -> None:
+    cache_key = _json_hash(cache_payload)
+    matrix_path, metadata_path, manifest_path = hourly_aggregation_cache_paths(config, cache_key)
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(str(matrix_path), hourly_population_matrix=np.asarray(hourly_population_matrix, dtype=float))
+    hourly_metadata_table.to_csv(metadata_path, index=False)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                "payload": cache_payload,
+                "matrix_path": str(matrix_path.resolve()),
+                "metadata_path": str(metadata_path.resolve()),
+                "n_hourly_samples": int(hourly_population_matrix.shape[0]),
+                "n_features": int(hourly_population_matrix.shape[1]),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    log_status(f"Saved hourly aggregation cache: {matrix_path}")
+
+
 def filter_unit_groups_by_binned_firing_rate(
     population_matrix: np.ndarray,
     selected_units: pd.DataFrame,
@@ -2761,6 +2861,16 @@ def save_outputs(
     log_status(f"Saved {file_prefix}_{sample_output_name}_population_vectors.csv")
     analysis_metadata_table.to_csv(output_dir / f"{file_prefix}_{sample_output_name}_metadata.csv", index=False)
     log_status(f"Saved {file_prefix}_{sample_output_name}_metadata.csv")
+    raw_sample_population_df = pd.DataFrame(raw_analysis_population_matrix, columns=population_columns)
+    raw_sample_population_with_metadata = pd.concat(
+        [analysis_metadata_table.reset_index(drop=True), raw_sample_population_df],
+        axis=1,
+    )
+    raw_sample_population_with_metadata.to_csv(
+        output_dir / f"{file_prefix}_{sample_output_name}_raw_population_vectors.csv",
+        index=False,
+    )
+    log_status(f"Saved {file_prefix}_{sample_output_name}_raw_population_vectors.csv")
 
     selected_units.to_csv(output_dir / f"{file_prefix}_selected_units.csv", index=False)
     log_status(f"Saved {file_prefix}_selected_units.csv")
@@ -3109,12 +3219,30 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
     )
 
     if config.lda_mode == "multi_day_hourly":
-        analysis_population_matrix, analysis_metadata_table = aggregate_minutes_to_hourly_samples(
-            minute_population_matrix=binned_population_matrix,
-            minute_metadata_table=binned_metadata_table,
+        cache_payload = hourly_aggregation_cache_payload(
+            csv_path=csv_path,
+            config=config,
             feature_table=feature_table,
-            waveform_weighting=config.hourly_waveform_weighting,
         )
+        cached_hourly = load_hourly_aggregation_cache(
+            config=config,
+            cache_payload=cache_payload,
+        )
+        if cached_hourly is None:
+            analysis_population_matrix, analysis_metadata_table = aggregate_minutes_to_hourly_samples(
+                minute_population_matrix=binned_population_matrix,
+                minute_metadata_table=binned_metadata_table,
+                feature_table=feature_table,
+                waveform_weighting=config.hourly_waveform_weighting,
+            )
+            save_hourly_aggregation_cache(
+                config=config,
+                cache_payload=cache_payload,
+                hourly_population_matrix=analysis_population_matrix,
+                hourly_metadata_table=analysis_metadata_table,
+            )
+        else:
+            analysis_population_matrix, analysis_metadata_table = cached_hourly
         print_and_build_clock_hour_verification(analysis_metadata_table)
         print_clock_hour_sample_pivot(
             analysis_metadata_table,

@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 DEFAULT_OUTPUT_SUBDIR = "threshold_csvs"
@@ -37,6 +38,12 @@ DEFAULT_OUTPUT_NAME = "threshold_population_minute_features.csv"
 MANIFEST_NAME = "threshold_population_manifest.json"
 UNITS_SUMMARY_NAME = "threshold_units_used_summary.csv"
 PORTABLE_RUN_CONFIG_NAME = "run_config.json"
+ANALYSIS_OUTPUT_DIR_NAMES = {
+    "LDA_threshold",
+    "Tuning_Weinan",
+    "threshold_LDA_TuningWN_pre",
+    "threshold_presentation",
+}
 CHRONIC_REC_RE = re.compile(r"Chronic_Rec_(?P<ymd>\d{8})_(?P<hms>\d{6})", re.IGNORECASE)
 PAIR_FOLDER_RE = re.compile(r"^sgch(?P<sg>\d+)_thr(?P<thr>.+)uV$", re.IGNORECASE)
 FEATURE_TYPES = (
@@ -177,7 +184,11 @@ def discover_pair_folders(run_root: Path) -> list[PairFolder]:
         if not path.is_dir() or not path.name.startswith("sgch") or "_thr" not in path.name:
             continue
         relative_parts = set(path.relative_to(run_root).parts) if path != run_root else set()
-        if "polar_time_of_day_units" in relative_parts:
+        if (
+            "polar_time_of_day_units" in relative_parts
+            or any(part.startswith(DEFAULT_OUTPUT_SUBDIR) for part in relative_parts)
+            or any(part in ANALYSIS_OUTPUT_DIR_NAMES for part in relative_parts)
+        ):
             continue
         pair = parse_pair_folder(path)
         if pair is not None:
@@ -190,7 +201,7 @@ def read_run_config(run_root: Path) -> dict:
     config_path = Path(run_root) / "run_config.json"
     if not config_path.exists():
         return {}
-    return json.loads(config_path.read_text(encoding="utf-8"))
+    return json.loads(config_path.read_text(encoding="utf-8-sig"))
 
 
 def minute_summary_paths_for_pair(pair_dir: Path) -> list[Path]:
@@ -202,16 +213,6 @@ def minute_summary_paths_for_pair(pair_dir: Path) -> list[Path]:
     return paths
 
 
-def read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
-    with Path(csv_path).open("r", newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        required = {"recording_name", "minute_index", "time_start_sec", "duration_sec"}
-        missing = sorted(required - set(reader.fieldnames or []))
-        if missing:
-            raise KeyError(f"{csv_path} is missing minute summary columns: {missing}")
-        return [dict(row) for row in reader]
-
-
 def threshold_feature_columns(unit_key: str) -> dict[str, str]:
     return {
         "firing_rate_hz": f"{unit_key}__firing_rate_hz",
@@ -219,6 +220,52 @@ def threshold_feature_columns(unit_key: str) -> dict[str, str]:
         "cv2": f"{unit_key}__cv2",
         "peak_to_trough_ms": f"{unit_key}__peak_to_trough_ms",
     }
+
+
+def waveform_feature_columns(unit_key: str, waveform_len: int) -> list[str]:
+    return [
+        f"{unit_key}__mean_waveform_uv_s{sample_index:03d}"
+        for sample_index in range(int(waveform_len))
+    ]
+
+
+def parse_mean_waveform_json(value: object) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+    values: list[float] = []
+    for item in payload:
+        parsed = safe_float(item)
+        values.append(np.nan if parsed is None else float(parsed))
+    return values
+
+
+def extract_recording_start_datetimes(recording_names: pd.Series) -> pd.Series:
+    extracted = recording_names.astype(str).str.extract(CHRONIC_REC_RE)
+    combined = extracted["ymd"].fillna("") + extracted["hms"].fillna("")
+    return pd.to_datetime(combined, format="%Y%m%d%H%M%S", errors="coerce")
+
+
+def numeric_column(table: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
+    if column in table.columns:
+        return pd.to_numeric(table[column], errors="coerce")
+    return pd.Series(default, index=table.index, dtype=float)
+
+
+def object_column(table: pd.DataFrame, column: str, default: object = "") -> pd.Series:
+    if column in table.columns:
+        return table[column]
+    return pd.Series(default, index=table.index, dtype=object)
 
 
 def default_output_dir(run_roots: tuple[Path, ...]) -> Path:
@@ -424,20 +471,26 @@ def parse_token_list(raw_value: str | None) -> tuple[str, ...]:
 
 
 def select_unit_keys_by_channels(run_roots: tuple[Path, ...], channel_text: str) -> tuple[str, ...]:
-    selected_channels = {
-        int(token.strip())
-        for token in re.split(r"[;,]", channel_text)
-        if token.strip()
-    }
-    if not selected_channels:
-        return ()
-
     selected_keys: list[str] = []
     seen: set[str] = set()
     available_channels: set[int] = set()
     for run_root in run_roots:
         for pair in discover_pair_folders(run_root):
             available_channels.add(pair.sg_ch)
+
+    if channel_text.strip().lower() == "all":
+        selected_channels = set(available_channels)
+    else:
+        selected_channels = {
+            int(token.strip())
+            for token in re.split(r"[;,]", channel_text)
+            if token.strip()
+        }
+    if not selected_channels:
+        return ()
+
+    for run_root in run_roots:
+        for pair in discover_pair_folders(run_root):
             if pair.sg_ch in selected_channels and pair.unit_key not in seen:
                 seen.add(pair.unit_key)
                 selected_keys.append(pair.unit_key)
@@ -463,13 +516,14 @@ def is_population_csv_reusable(
     run_roots: tuple[Path, ...],
     *,
     selected_unit_keys: tuple[str, ...] = (),
+    include_waveform_features: bool = False,
 ) -> tuple[bool, str]:
     if not population_csv.exists():
         return False, "population CSV is missing"
     if not manifest_json.exists():
         return False, "manifest is missing"
     try:
-        manifest = json.loads(manifest_json.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_json.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return False, f"manifest could not be read: {exc}"
     requested_roots = [str(Path(path).resolve()) for path in run_roots]
@@ -481,6 +535,8 @@ def is_population_csv_reusable(
     manifest_selected = tuple(str(value) for value in manifest.get("selected_threshold_unit_keys", []))
     if manifest_selected != tuple(selected_unit_keys):
         return False, "manifest selected_threshold_unit_keys differ from this run"
+    if bool(manifest.get("include_waveform_features", False)) != bool(include_waveform_features):
+        return False, "manifest include_waveform_features differs from this run"
     if str(Path(manifest.get("population_csv", "")).resolve()) != str(population_csv.resolve()):
         return False, "manifest points to a different population CSV"
     return True, "manifest matches"
@@ -492,6 +548,7 @@ def convert_threshold_channel_outputs(
     *,
     output_name: str = DEFAULT_OUTPUT_NAME,
     selected_unit_keys: tuple[str, ...] = (),
+    include_waveform_features: bool = False,
     force: bool = False,
 ) -> Path:
     output_dir = Path(output_dir)
@@ -514,6 +571,7 @@ def convert_threshold_channel_outputs(
             manifest_json,
             run_roots,
             selected_unit_keys=selected_unit_keys,
+            include_waveform_features=include_waveform_features,
         )
         if reusable:
             log(f"Reusing existing population CSV: {population_csv}")
@@ -561,9 +619,10 @@ def convert_threshold_channel_outputs(
             unit_keys.append(pair.unit_key)
     unit_id_lookup = {unit_key: index for index, unit_key in enumerate(unit_keys, start=1)}
 
-    sample_rows: dict[str, dict] = {}
+    sample_frames: list[pd.DataFrame] = []
     unit_rows_by_key: dict[str, dict] = {}
     portable_minute_rows_by_unit: dict[str, list[dict]] = {}
+    waveform_lengths_by_unit: dict[str, int] = {}
     skipped_rows_without_datetime = 0
     processed_minute_rows = 0
     total_pair_dirs = len(all_pair_meta)
@@ -598,107 +657,156 @@ def convert_threshold_channel_outputs(
             continue
         log(
             f"Pair {pair_position}/{total_pair_dirs}: {pair.unit_key} "
-            f"({len(summary_paths)} minute summary file(s)); samples so far={len(sample_rows)}"
+            f"({len(summary_paths)} minute summary file(s)); sample blocks so far={len(sample_frames)}"
         )
 
         pair_minute_rows = 0
         for summary_index, summary_path in enumerate(summary_paths, start=1):
             t_summary0 = time.perf_counter()
-            summary_rows = read_csv_rows(summary_path)
+            table = pd.read_csv(summary_path)
+            required = {"recording_name", "minute_index", "time_start_sec", "duration_sec"}
+            missing = sorted(required - set(table.columns))
+            if missing:
+                raise KeyError(f"{summary_path} is missing minute summary columns: {missing}")
             log(
                 f"  summary {summary_index}/{len(summary_paths)}: {summary_path.name} "
-                f"({len(summary_rows)} row(s))"
+                f"({len(table)} row(s))"
             )
-            for row in summary_rows:
-                recording_name = str(row.get("recording_name", ""))
-                start_dt = parse_recording_start_datetime(recording_name)
-                if start_dt is None:
-                    skipped_rows_without_datetime += 1
-                    continue
+            if table.empty:
+                log(
+                    f"  finished summary {summary_index}/{len(summary_paths)} in "
+                    f"{format_duration(time.perf_counter() - t_summary0)}; "
+                    "empty table"
+                )
+                continue
 
-                minute_index = int(float(row["minute_index"]))
-                minute_start_sec = float(row["time_start_sec"])
-                duration_sec = float(row["duration_sec"])
-                minute_end_sec = minute_start_sec + duration_sec
-                minute_start_dt = start_dt + timedelta(seconds=minute_start_sec)
-                minute_end_dt = start_dt + timedelta(seconds=minute_end_sec)
-                row_session_ordinal = safe_float(row.get("session_ordinal"))
-                local_session_ordinal = (
-                    int(row_session_ordinal)
-                    if row_session_ordinal is not None
-                    else int(session_ordinal_lookup.get(recording_name, 1))
+            table = table.copy()
+            table["recording_name"] = table["recording_name"].astype(str)
+            start_dt = extract_recording_start_datetimes(table["recording_name"])
+            valid_mask = start_dt.notna()
+            skipped_rows_without_datetime += int((~valid_mask).sum())
+            if not bool(valid_mask.any()):
+                log(
+                    f"  finished summary {summary_index}/{len(summary_paths)} in "
+                    f"{format_duration(time.perf_counter() - t_summary0)}; "
+                    "no rows had parseable Chronic_Rec timestamps"
                 )
-                session_ordinal = (run_order - 1) * 100000 + local_session_ordinal
-                session_key = f"{run_tag}::{recording_name}"
-                sample_key = f"{run_tag}__{safe_slug(recording_name)}__minute_{minute_index:06d}"
+                continue
 
-                sample = sample_rows.setdefault(
-                    sample_key,
-                    {
-                        "final_sample_id": len(sample_rows) + 1,
-                        "final_sample_key": sample_key,
-                        "session_id": session_ordinal,
-                        "session_key": session_key,
-                        "session_name": recording_name,
-                        "session_name_normalized": safe_slug(session_key),
-                        "session_index": session_ordinal,
-                        "session_start_datetime": start_dt.isoformat(sep=" "),
-                        "minute_bin_index": minute_index,
-                        "minute_start_sec": minute_start_sec,
-                        "minute_end_sec": minute_end_sec,
-                        "minute_center_s": minute_start_sec + duration_sec / 2.0,
-                        "session_duration_s": np.nan,
-                        "minute_start_datetime": minute_start_dt.isoformat(sep=" "),
-                        "minute_end_datetime": minute_end_dt.isoformat(sep=" "),
-                        "clock_hour_of_day": int(minute_start_dt.hour),
-                        "clock_minute_of_hour": int(minute_start_dt.minute),
-                        "calendar_day": minute_start_dt.date().isoformat(),
-                        "rec_file": recording_name,
-                        "threshold_run_root": str(run_root_resolved),
-                        "threshold_run_name": Path(run_root).name,
-                    },
-                )
-                firing_rate_hz = safe_float(row.get("firing_rate_hz"))
-                amplitude_ptp_uv = safe_float(row.get("amplitude_ptp_uv"))
-                cv2 = safe_float(row.get("cv2"))
-                peak_to_trough_ms = safe_float(row.get("peak_to_trough_ms"))
-                sample[feature_columns["firing_rate_hz"]] = 0.0 if firing_rate_hz is None else firing_rate_hz
-                sample[feature_columns["average_amplitude_uv"]] = amplitude_ptp_uv
-                sample[feature_columns["cv2"]] = cv2
-                sample[feature_columns["peak_to_trough_ms"]] = peak_to_trough_ms
-                portable_minute_rows_by_unit.setdefault(pair.unit_key, []).append(
-                    {
-                        "recording_name": recording_name,
-                        "minute_index": minute_index,
-                        "time_start_sec": minute_start_sec,
-                        "time_end_sec": minute_end_sec,
-                        "duration_sec": duration_sec,
-                        "session_ordinal": session_ordinal,
-                        "pair_id": pair.unit_key,
-                        "sg_ch": int(pair.sg_ch),
-                        "threshold_min_uv": float(pair.threshold_uv),
-                        "threshold_label": pair.threshold_label,
-                        "n_spikes": row.get("n_spikes", ""),
-                        "firing_rate_hz": 0.0 if firing_rate_hz is None else firing_rate_hz,
-                        "amplitude_ptp_uv": amplitude_ptp_uv,
-                        "mean_abs_waveform_uv": safe_float(row.get("mean_abs_waveform_uv")),
-                        "cv2": cv2,
-                        "peak_to_trough_ms": peak_to_trough_ms,
-                        "minute_start_datetime": minute_start_dt.isoformat(sep=" "),
-                        "minute_end_datetime": minute_end_dt.isoformat(sep=" "),
-                        "calendar_day": minute_start_dt.date().isoformat(),
-                        "clock_hour_of_day": int(minute_start_dt.hour),
-                        "clock_minute_of_hour": int(minute_start_dt.minute),
-                        "source_run_root": str(run_root_resolved),
-                        "source_pair_dir": str(pair.path.resolve()),
-                    }
-                )
-                processed_minute_rows += 1
-                pair_minute_rows += 1
+            table = table.loc[valid_mask].reset_index(drop=True)
+            start_dt = start_dt.loc[valid_mask].reset_index(drop=True)
+            minute_index = pd.to_numeric(table["minute_index"], errors="coerce").fillna(0).astype(int)
+            minute_start_sec = pd.to_numeric(table["time_start_sec"], errors="coerce").fillna(0.0)
+            duration_sec = pd.to_numeric(table["duration_sec"], errors="coerce").fillna(0.0)
+            minute_end_sec = minute_start_sec + duration_sec
+            minute_start_dt = start_dt + pd.to_timedelta(minute_start_sec, unit="s")
+            minute_end_dt = start_dt + pd.to_timedelta(minute_end_sec, unit="s")
+            local_session_ordinal = (
+                pd.to_numeric(table["session_ordinal"], errors="coerce")
+                if "session_ordinal" in table.columns
+                else pd.Series(np.nan, index=table.index)
+            )
+            fallback_session_ordinal = table["recording_name"].map(session_ordinal_lookup).fillna(1)
+            local_session_ordinal = local_session_ordinal.fillna(fallback_session_ordinal).astype(int)
+            session_ordinal = (run_order - 1) * 100000 + local_session_ordinal
+            session_key = run_tag + "::" + table["recording_name"].astype(str)
+            sample_key = [
+                f"{run_tag}__{safe_slug(recording_name)}__minute_{int(minute):06d}"
+                for recording_name, minute in zip(table["recording_name"].tolist(), minute_index.tolist())
+            ]
+
+            block = pd.DataFrame(
+                {
+                    "final_sample_id": 0,
+                    "final_sample_key": sample_key,
+                    "session_id": session_ordinal.to_numpy(dtype=int),
+                    "session_key": session_key,
+                    "session_name": table["recording_name"],
+                    "session_name_normalized": [safe_slug(value) for value in session_key.tolist()],
+                    "session_index": session_ordinal.to_numpy(dtype=int),
+                    "session_start_datetime": start_dt.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "minute_bin_index": minute_index.to_numpy(dtype=int),
+                    "minute_start_sec": minute_start_sec.to_numpy(dtype=float),
+                    "minute_end_sec": minute_end_sec.to_numpy(dtype=float),
+                    "minute_center_s": (minute_start_sec + duration_sec / 2.0).to_numpy(dtype=float),
+                    "session_duration_s": np.nan,
+                    "minute_start_datetime": minute_start_dt.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "minute_end_datetime": minute_end_dt.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "clock_hour_of_day": minute_start_dt.dt.hour.to_numpy(dtype=int),
+                    "clock_minute_of_hour": minute_start_dt.dt.minute.to_numpy(dtype=int),
+                    "calendar_day": minute_start_dt.dt.strftime("%Y-%m-%d"),
+                    "rec_file": table["recording_name"],
+                    "threshold_run_root": str(run_root_resolved),
+                    "threshold_run_name": Path(run_root).name,
+                }
+            )
+            firing_rate_hz = numeric_column(table, "firing_rate_hz", 0.0).fillna(0.0)
+            block[feature_columns["firing_rate_hz"]] = firing_rate_hz.to_numpy(dtype=float)
+            amplitude_ptp_uv = numeric_column(table, "amplitude_ptp_uv")
+            cv2 = numeric_column(table, "cv2")
+            peak_to_trough_ms = numeric_column(table, "peak_to_trough_ms")
+            mean_abs_waveform_uv = numeric_column(table, "mean_abs_waveform_uv")
+            mean_waveform_uv = object_column(table, "mean_waveform_uv")
+            n_spikes = object_column(table, "n_spikes")
+            block[feature_columns["average_amplitude_uv"]] = amplitude_ptp_uv.to_numpy(dtype=float)
+            block[feature_columns["cv2"]] = cv2.to_numpy(dtype=float)
+            block[feature_columns["peak_to_trough_ms"]] = peak_to_trough_ms.to_numpy(dtype=float)
+
+            if include_waveform_features and "mean_waveform_uv" in table.columns:
+                waveforms = mean_waveform_uv.map(parse_mean_waveform_json).tolist()
+                waveform_len = max((len(values) for values in waveforms if values), default=0)
+                if waveform_len > 0:
+                    waveform_lengths_by_unit[pair.unit_key] = max(
+                        int(waveform_lengths_by_unit.get(pair.unit_key, 0)),
+                        int(waveform_len),
+                    )
+                    waveform_values = np.full((len(table), waveform_len), np.nan, dtype=float)
+                    for row_index, values in enumerate(waveforms):
+                        if not values:
+                            continue
+                        n_values = min(len(values), waveform_len)
+                        waveform_values[row_index, :n_values] = np.asarray(values[:n_values], dtype=float)
+                    for sample_index, column in enumerate(waveform_feature_columns(pair.unit_key, waveform_len)):
+                        block[column] = waveform_values[:, sample_index]
+
+            sample_frames.append(block)
+            portable_block = pd.DataFrame(
+                {
+                    "recording_name": table["recording_name"],
+                    "minute_index": minute_index.to_numpy(dtype=int),
+                    "time_start_sec": minute_start_sec.to_numpy(dtype=float),
+                    "time_end_sec": minute_end_sec.to_numpy(dtype=float),
+                    "duration_sec": duration_sec.to_numpy(dtype=float),
+                    "session_ordinal": session_ordinal.to_numpy(dtype=int),
+                    "pair_id": pair.unit_key,
+                    "sg_ch": int(pair.sg_ch),
+                    "threshold_min_uv": float(pair.threshold_uv),
+                    "threshold_label": pair.threshold_label,
+                    "n_spikes": n_spikes,
+                    "firing_rate_hz": firing_rate_hz.to_numpy(dtype=float),
+                    "amplitude_ptp_uv": amplitude_ptp_uv,
+                    "mean_abs_waveform_uv": mean_abs_waveform_uv,
+                    "mean_waveform_uv": mean_waveform_uv,
+                    "cv2": cv2,
+                    "peak_to_trough_ms": peak_to_trough_ms,
+                    "minute_start_datetime": minute_start_dt.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "minute_end_datetime": minute_end_dt.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "calendar_day": minute_start_dt.dt.strftime("%Y-%m-%d"),
+                    "clock_hour_of_day": minute_start_dt.dt.hour.to_numpy(dtype=int),
+                    "clock_minute_of_hour": minute_start_dt.dt.minute.to_numpy(dtype=int),
+                    "source_run_root": str(run_root_resolved),
+                    "source_pair_dir": str(pair.path.resolve()),
+                }
+            )
+            portable_minute_rows_by_unit.setdefault(pair.unit_key, []).extend(
+                portable_block.to_dict(orient="records")
+            )
+            processed_minute_rows += int(len(table))
+            pair_minute_rows += int(len(table))
             log(
                 f"  finished summary {summary_index}/{len(summary_paths)} in "
                 f"{format_duration(time.perf_counter() - t_summary0)}; "
-                f"total samples={len(sample_rows)}"
+                f"sample blocks={len(sample_frames)}"
             )
         log(
             f"Finished pair {pair_position}/{total_pair_dirs}: {pair.unit_key}; "
@@ -706,7 +814,7 @@ def convert_threshold_channel_outputs(
             f"{format_duration(time.perf_counter() - t_pair0)}"
         )
 
-    if not sample_rows:
+    if not sample_frames:
         raise RuntimeError(
             "No threshold minute samples were materialized. Check that Threshold_channel.py "
             "wrote per-pair *_minute_summary.csv files with Chronic_Rec_YYYYMMDD_HHMMSS names."
@@ -715,22 +823,30 @@ def convert_threshold_channel_outputs(
     feature_order: list[str] = []
     for unit_key in unit_keys:
         feature_order.extend(threshold_feature_columns(unit_key).values())
+        if include_waveform_features:
+            feature_order.extend(waveform_feature_columns(unit_key, waveform_lengths_by_unit.get(unit_key, 0)))
 
-    sorted_sample_rows = sorted(
-        sample_rows.values(),
-        key=lambda row: (
-            str(row["minute_start_datetime"]),
-            int(row["session_index"]),
-            int(row["minute_bin_index"]),
-        ),
+    t_merge0 = time.perf_counter()
+    population_df = pd.concat(sample_frames, ignore_index=True, sort=False)
+    for column in METADATA_COLUMNS + feature_order:
+        if column not in population_df.columns:
+            population_df[column] = np.nan
+    population_df = (
+        population_df[METADATA_COLUMNS + feature_order]
+        .groupby("final_sample_key", as_index=False, sort=False)
+        .first()
     )
-    for sample_index, row in enumerate(sorted_sample_rows, start=1):
-        row["final_sample_id"] = sample_index
-        for column in feature_order:
-            row.setdefault(column, "")
+    population_df = population_df.sort_values(
+        ["minute_start_datetime", "session_index", "minute_bin_index"],
+        na_position="last",
+    ).reset_index(drop=True)
+    population_df["final_sample_id"] = np.arange(1, len(population_df) + 1, dtype=int)
+    population_df = population_df[METADATA_COLUMNS + feature_order]
+    log(f"Merged population blocks in {format_duration(time.perf_counter() - t_merge0)}")
 
     t_write0 = time.perf_counter()
-    write_csv(population_csv, sorted_sample_rows, METADATA_COLUMNS + feature_order)
+    population_csv.parent.mkdir(parents=True, exist_ok=True)
+    population_df.to_csv(population_csv, index=False)
     log(f"Wrote population CSV in {format_duration(time.perf_counter() - t_write0)}")
 
     unit_rows = []
@@ -774,6 +890,7 @@ def convert_threshold_channel_outputs(
         "firing_rate_hz",
         "amplitude_ptp_uv",
         "mean_abs_waveform_uv",
+        "mean_waveform_uv",
         "cv2",
         "peak_to_trough_ms",
         "minute_start_datetime",
@@ -808,10 +925,11 @@ def convert_threshold_channel_outputs(
                 "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
                 "input_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
                 "selected_threshold_unit_keys": list(selected_unit_keys),
+                "include_waveform_features": bool(include_waveform_features),
                 "population_csv": str(population_csv.resolve()),
                 "n_threshold_units": int(len(unit_rows)),
-                "n_minute_samples": int(len(sorted_sample_rows)),
-                "n_recordings": int(len({row["session_key"] for row in sorted_sample_rows})),
+                "n_minute_samples": int(len(population_df)),
+                "n_recordings": int(population_df["session_key"].nunique()),
                 "processed_pair_minute_rows": int(processed_minute_rows),
                 "skipped_rows_without_recording_datetime": int(skipped_rows_without_datetime),
                 "portable_threshold_run_root": str(output_dir.resolve()),
@@ -829,11 +947,12 @@ def convert_threshold_channel_outputs(
         "output_structure": "portable_threshold_csv_run_root",
         "source_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
         "run_output_dir": str(output_dir.resolve()),
-        "recording_files": sorted({str(row["rec_file"]) for row in sorted_sample_rows}),
+        "recording_files": sorted(str(value) for value in population_df["rec_file"].dropna().unique().tolist()),
         "selected_threshold_unit_keys": list(selected_unit_keys),
+        "include_waveform_features": bool(include_waveform_features),
         "population_csv": str(population_csv.resolve()),
         "n_threshold_units": int(len(unit_rows)),
-        "n_minute_samples": int(len(sorted_sample_rows)),
+        "n_minute_samples": int(len(population_df)),
         "note": (
             "This folder was generated by Threshold_convert_csv.py. It contains a precomputed "
             "LDA population CSV plus lightweight sgch*_thr*uV/*_minute_summary.csv folders "
@@ -848,7 +967,7 @@ def convert_threshold_channel_outputs(
 
     elapsed_s = time.perf_counter() - start_time
     log(
-        f"Wrote {len(sorted_sample_rows)} minute samples x {len(feature_order)} feature columns "
+        f"Wrote {len(population_df)} minute samples x {len(feature_order)} feature columns "
         f"for {len(unit_rows)} threshold units to {population_csv}"
     )
     log(f"Finished in {elapsed_s:.1f}s")
@@ -889,6 +1008,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lda-channels",
         help="SG channel selection to include, e.g. '12,45,337'. Omit for all discovered units.",
+    )
+    parser.add_argument(
+        "--include-waveform-features",
+        action="store_true",
+        help=(
+            "Expand per-minute mean_waveform_uv JSON into LDA CSV columns named "
+            "<unit>__mean_waveform_uv_s000, s001, ... . Leave off to preserve current "
+            "scalar-only MULTI_FEATURE behavior and smaller CSV files."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -933,6 +1061,7 @@ def main() -> None:
             output_dir,
             output_name=str(args.output_name),
             selected_unit_keys=selected_unit_keys,
+            include_waveform_features=bool(args.include_waveform_features),
             force=bool(args.force),
         )
 
