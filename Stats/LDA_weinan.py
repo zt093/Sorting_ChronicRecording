@@ -153,6 +153,7 @@ class Config:
     apply_smoothing: bool = APPLY_SMOOTHING
     smoothing_sigma_bins: float = SMOOTHING_SIGMA_BINS
     hourly_waveform_weighting: str = HOURLY_WAVEFORM_WEIGHTING
+    separate_hourly_samples_by_run_root: bool = True
     min_sessions_per_unit: int = MIN_SESSIONS_PER_UNIT
     min_bins_per_label: int = MIN_BINS_PER_LABEL
     cv_n_splits: int = CV_N_SPLITS
@@ -1206,20 +1207,36 @@ def smooth_population_matrix(
 
 
 def zscore_population_matrix(population_matrix: np.ndarray) -> np.ndarray:
-    means = np.nanmean(population_matrix, axis=0)
-    means[~np.isfinite(means)] = 0.0
-    stds = np.nanstd(population_matrix, axis=0)
+    population_matrix = np.asarray(population_matrix, dtype=float)
+    finite = np.isfinite(population_matrix)
+    finite_counts = finite.sum(axis=0)
+    finite_sums = np.where(finite, population_matrix, 0.0).sum(axis=0)
+    means = np.divide(
+        finite_sums,
+        finite_counts,
+        out=np.zeros(population_matrix.shape[1], dtype=float),
+        where=finite_counts > 0,
+    )
+    filled = np.where(finite, population_matrix, means)
+    stds = np.std(filled, axis=0)
     stds[~np.isfinite(stds)] = 1.0
     stds[stds == 0] = 1.0
-    zscored = (population_matrix - means) / stds
+    zscored = (filled - means) / stds
     zscored[~np.isfinite(zscored)] = 0.0
     return zscored
 
 
 def fill_missing_feature_values(population_matrix: np.ndarray) -> np.ndarray:
     filled = np.asarray(population_matrix, dtype=float).copy()
-    column_means = np.nanmean(filled, axis=0)
-    column_means[~np.isfinite(column_means)] = 0.0
+    finite = np.isfinite(filled)
+    finite_counts = finite.sum(axis=0)
+    finite_sums = np.where(finite, filled, 0.0).sum(axis=0)
+    column_means = np.divide(
+        finite_sums,
+        finite_counts,
+        out=np.zeros(filled.shape[1], dtype=float),
+        where=finite_counts > 0,
+    )
     missing_mask = ~np.isfinite(filled)
     if np.any(missing_mask):
         row_indices, column_indices = np.where(missing_mask)
@@ -1303,6 +1320,11 @@ def subset_features_for_mode(
 
     filtered_population = population_matrix[:, keep_mask]
     filtered_feature_table = feature_table.loc[keep_mask].reset_index(drop=True).copy()
+    if filtered_population.shape[1] == 0:
+        raise RuntimeError(
+            f"Feature mode {normalized_mode} selected no available feature columns. "
+            "Check that the input CSV contains the required waveform or summary features."
+        )
     filtered_feature_table["feature_column"] = [
         f"feature_{feature_index:04d}"
         for feature_index in range(1, len(filtered_feature_table) + 1)
@@ -1341,16 +1363,37 @@ def predict_with_cv(
     labels: np.ndarray,
     cv_splitter,
     groups: np.ndarray | None = None,
+    *,
+    apply_zscore: bool = True,
 ) -> np.ndarray:
+    population_matrix = np.asarray(population_matrix, dtype=float)
     labels = np.asarray(labels)
     predicted_labels = np.empty(labels.shape[0], dtype=labels.dtype)
     prediction_mask = np.zeros(labels.shape[0], dtype=bool)
 
     split_iter = cv_splitter.split(population_matrix, labels, groups)
     for train_indices, test_indices in split_iter:
+        train_matrix = population_matrix[train_indices].copy()
+        test_matrix = population_matrix[test_indices].copy()
+        finite_train = np.isfinite(train_matrix)
+        finite_counts = finite_train.sum(axis=0)
+        finite_sums = np.where(finite_train, train_matrix, 0.0).sum(axis=0)
+        train_means = np.divide(
+            finite_sums,
+            finite_counts,
+            out=np.zeros(train_matrix.shape[1], dtype=float),
+            where=finite_counts > 0,
+        )
+        train_matrix = np.where(np.isfinite(train_matrix), train_matrix, train_means)
+        test_matrix = np.where(np.isfinite(test_matrix), test_matrix, train_means)
+        if apply_zscore:
+            train_stds = np.std(train_matrix, axis=0)
+            train_stds[~np.isfinite(train_stds) | (train_stds == 0)] = 1.0
+            train_matrix = (train_matrix - train_means) / train_stds
+            test_matrix = (test_matrix - train_means) / train_stds
         estimator = LinearDiscriminantAnalysis()
-        estimator.fit(population_matrix[train_indices], labels[train_indices])
-        predicted_labels[test_indices] = estimator.predict(population_matrix[test_indices])
+        estimator.fit(train_matrix, labels[train_indices])
+        predicted_labels[test_indices] = estimator.predict(test_matrix)
         prediction_mask[test_indices] = True
 
     if not np.all(prediction_mask):
@@ -1360,6 +1403,7 @@ def predict_with_cv(
 
 def compute_empirical_p_value(observed_value: float, null_distribution: np.ndarray) -> float:
     null_distribution = np.asarray(null_distribution, dtype=float)
+    null_distribution = null_distribution[np.isfinite(null_distribution)]
     if null_distribution.size == 0:
         return np.nan
     return float((1 + np.sum(null_distribution >= observed_value)) / (null_distribution.size + 1))
@@ -1412,16 +1456,20 @@ def run_permutation_test(
     shuffled_scores = np.full(int(config.n_permutations), np.nan, dtype=float)
     for permutation_index in range(int(config.n_permutations)):
         shuffled_labels = rng.permutation(labels)
-        shuffled_predictions = predict_with_cv(
-            population_matrix=population_matrix,
-            labels=shuffled_labels,
-            cv_splitter=cv_splitter,
-            groups=groups,
-        )
-        shuffled_scores[permutation_index] = balanced_accuracy_score(
-            shuffled_labels,
-            shuffled_predictions,
-        )
+        try:
+            shuffled_predictions = predict_with_cv(
+                population_matrix=population_matrix,
+                labels=shuffled_labels,
+                cv_splitter=cv_splitter,
+                groups=groups,
+                apply_zscore=config.apply_zscore,
+            )
+            shuffled_scores[permutation_index] = balanced_accuracy_score(
+                shuffled_labels,
+                shuffled_predictions,
+            )
+        except (ValueError, RuntimeError):
+            shuffled_scores[permutation_index] = np.nan
     return {
         "n_permutations": int(config.n_permutations),
         "balanced_accuracy_distribution": shuffled_scores,
@@ -1442,6 +1490,7 @@ def evaluate_cv_scheme(
         labels=labels,
         cv_splitter=cv_splitter,
         groups=groups,
+        apply_zscore=config.apply_zscore,
     )
     unique_labels = sorted(pd.unique(labels).tolist())
     confusion = confusion_matrix(labels, predicted_labels, labels=unique_labels)
@@ -1479,8 +1528,16 @@ def evaluate_cv_scheme(
         "groups_used": groups is not None,
         "n_permutations": int(permutation_result["n_permutations"]),
         "permutation_balanced_accuracy_distribution": shuffled_distribution,
-        "permutation_balanced_accuracy_mean": float(np.mean(shuffled_distribution)),
-        "permutation_balanced_accuracy_std": float(np.std(shuffled_distribution)),
+        "permutation_balanced_accuracy_mean": (
+            float(np.mean(shuffled_distribution[np.isfinite(shuffled_distribution)]))
+            if np.isfinite(shuffled_distribution).any()
+            else float("nan")
+        ),
+        "permutation_balanced_accuracy_std": (
+            float(np.std(shuffled_distribution[np.isfinite(shuffled_distribution)]))
+            if np.isfinite(shuffled_distribution).any()
+            else float("nan")
+        ),
         "permutation_p_value": compute_empirical_p_value(balanced_accuracy, shuffled_distribution),
     }
 
@@ -1944,6 +2001,7 @@ def aggregate_minutes_to_hourly_samples(
     minute_metadata_table: pd.DataFrame,
     feature_table: pd.DataFrame | None = None,
     waveform_weighting: str = "minute",
+    separate_by_run_root: bool = True,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     if minute_population_matrix.shape[0] != len(minute_metadata_table):
         raise ValueError("Minute population matrix row count does not match the minute metadata length.")
@@ -1992,11 +2050,13 @@ def aggregate_minutes_to_hourly_samples(
 
     hourly_vectors: list[np.ndarray] = []
     hourly_rows: list[dict] = []
-    extra_grouping_keys = [
-        column
-        for column in ("threshold_run_name", "threshold_run_root")
-        if column in minute_df.columns and minute_df[column].nunique(dropna=False) > 1
-    ]
+    extra_grouping_keys = []
+    if separate_by_run_root:
+        extra_grouping_keys = [
+            column
+            for column in ("threshold_run_name", "threshold_run_root")
+            if column in minute_df.columns and minute_df[column].nunique(dropna=False) > 1
+        ]
     grouping_keys = extra_grouping_keys + ["calendar_day", "clock_hour_of_day"]
     log_status(f"Hourly aggregation grouping keys: {grouping_keys}")
     grouped = minute_df.groupby(grouping_keys, sort=True, dropna=False)
@@ -2038,6 +2098,16 @@ def aggregate_minutes_to_hourly_samples(
         )
         unique_session_ids = sorted(pd.unique(sorted_group["session_id"]).tolist())
         unique_session_names = [str(value) for value in pd.unique(sorted_group["session_name"]).tolist()]
+        contributing_run_names = (
+            [str(value) for value in pd.unique(sorted_group["threshold_run_name"]).tolist()]
+            if "threshold_run_name" in sorted_group.columns
+            else []
+        )
+        contributing_run_roots = (
+            [str(value) for value in pd.unique(sorted_group["threshold_run_root"]).tolist()]
+            if "threshold_run_root" in sorted_group.columns
+            else []
+        )
         unique_clock_minutes_present = sorted(
             int(value)
             for value in pd.unique(sorted_group["clock_minute_of_hour"]).tolist()
@@ -2062,7 +2132,8 @@ def aggregate_minutes_to_hourly_samples(
                 "calendar_day": str(calendar_day),
                 "clock_hour_of_day": int(clock_hour_of_day),
                 "hour_start_datetime": f"{calendar_day} {int(clock_hour_of_day):02d}:00:00",
-                "n_available_minutes_used": int(len(sorted_group)),
+                "n_available_minutes_used": int(n_unique_clock_minutes_present),
+                "n_minute_rows_used": int(len(sorted_group)),
                 "n_unique_clock_minutes_present": int(n_unique_clock_minutes_present),
                 "n_missing_clock_minutes": int(n_missing_clock_minutes),
                 "any_minutes_missing": bool(n_missing_clock_minutes > 0),
@@ -2071,6 +2142,9 @@ def aggregate_minutes_to_hourly_samples(
                 "n_sessions_contributing": int(len(unique_session_ids)),
                 "first_session_id": int(unique_session_ids[0]) if unique_session_ids else np.nan,
                 "first_session_name": unique_session_names[0] if unique_session_names else "",
+                "threshold_run_name": " | ".join(contributing_run_names),
+                "threshold_run_root": " | ".join(contributing_run_roots),
+                "n_threshold_runs_contributing": int(len(contributing_run_roots or contributing_run_names)),
                 "waveform_hourly_weighting": normalized_weighting,
             }
         )
@@ -2166,13 +2240,14 @@ def hourly_aggregation_cache_payload(
     ]
     feature_payload = feature_table[feature_payload_columns].astype(str).to_dict(orient="records")
     return {
-        "cache_version": 1,
+        "cache_version": 2,
         "csv_path": str(csv_path.resolve()),
         "csv_size": csv_size,
         "csv_mtime_ns": csv_mtime_ns,
         "lda_mode": str(config.lda_mode),
         "min_firing_rate_hz": float(config.min_firing_rate_hz),
         "hourly_waveform_weighting": str(config.hourly_waveform_weighting),
+        "separate_hourly_samples_by_run_root": bool(config.separate_hourly_samples_by_run_root),
         "n_features": int(len(feature_table)),
         "features": feature_payload,
     }
@@ -2349,6 +2424,18 @@ def evaluate_decoding(
     resolved_label_column: str,
     config: Config,
 ) -> dict[str, dict]:
+    def cv_training_folds_support_lda(cv_splitter, groups_value: np.ndarray | None) -> bool:
+        for train_indices, _test_indices in cv_splitter.split(
+            population_matrix,
+            labels,
+            groups_value,
+        ):
+            n_train_samples = int(len(train_indices))
+            n_train_classes = int(len(np.unique(labels[train_indices])))
+            if n_train_classes < 2 or n_train_samples <= n_train_classes:
+                return False
+        return True
+
     class_counts = pd.Series(labels).value_counts()
     smallest_class = int(class_counts.min())
     n_splits = max(2, min(config.cv_n_splits, smallest_class))
@@ -2363,14 +2450,20 @@ def evaluate_decoding(
         shuffle=True,
         random_state=config.random_seed,
     )
-    results["stratified"] = evaluate_cv_scheme(
-        population_matrix=population_matrix,
-        labels=labels,
-        config=config,
-        cv_name="stratified",
-        cv_splitter=stratified_cv,
-        groups=None,
-    )
+    if cv_training_folds_support_lda(stratified_cv, None):
+        results["stratified"] = evaluate_cv_scheme(
+            population_matrix=population_matrix,
+            labels=labels,
+            config=config,
+            cv_name="stratified",
+            cv_splitter=stratified_cv,
+            groups=None,
+        )
+    else:
+        log_status(
+            "Skipping stratified CV because at least one training fold does not contain "
+            "more samples than clock-hour classes."
+        )
 
     grouped_allowed = str(resolved_label_column) == "clock_hour_of_day"
     if grouped_allowed:
@@ -2379,14 +2472,21 @@ def evaluate_decoding(
         if n_unique_days >= 2:
             grouped_splits = max(2, min(config.cv_n_splits, n_unique_days))
             grouped_cv = GroupKFold(n_splits=grouped_splits)
-            results["grouped_by_day"] = evaluate_cv_scheme(
-                population_matrix=population_matrix,
-                labels=labels,
-                config=config,
-                cv_name="grouped_by_day",
-                cv_splitter=grouped_cv,
-                groups=day_groups,
-            )
+            grouped_fold_valid = cv_training_folds_support_lda(grouped_cv, day_groups)
+            if grouped_fold_valid:
+                results["grouped_by_day"] = evaluate_cv_scheme(
+                    population_matrix=population_matrix,
+                    labels=labels,
+                    config=config,
+                    cv_name="grouped_by_day",
+                    cv_splitter=grouped_cv,
+                    groups=day_groups,
+                )
+            else:
+                log_status(
+                    "Skipping grouped-by-day CV because at least one training fold does not "
+                    "contain more samples than clock-hour classes."
+                )
         else:
             log_status(
                 "Skipping grouped-by-day CV because fewer than two calendar days remain "
@@ -2696,15 +2796,23 @@ def save_lda_model_diagnostics(
     classes = np.asarray(getattr(lda_model, "classes_", []))
     if coef.ndim == 2 and coef.shape[1] == len(labels):
         coef_df = labels.copy()
-        for class_index, class_label in enumerate(classes):
-            coef_df[f"class_{class_label}_coef"] = coef[class_index]
+        if coef.shape[0] == len(classes):
+            for class_index, class_label in enumerate(classes):
+                coef_df[f"class_{class_label}_coef"] = coef[class_index]
+        elif coef.shape[0] == 1 and len(classes) == 2:
+            coef_df[
+                f"binary_class_{classes[1]}_vs_{classes[0]}_coef"
+            ] = coef[0]
+        else:
+            for coefficient_index in range(coef.shape[0]):
+                coef_df[f"coefficient_row_{coefficient_index + 1}"] = coef[coefficient_index]
         coef_df.to_csv(output_dir / f"{file_prefix}_lda_class_coefficients.csv", index=False)
         log_status(f"Saved {file_prefix}_lda_class_coefficients.csv")
 
     means = np.asarray(getattr(lda_model, "means_", np.empty((0, len(labels)))), dtype=float)
     if means.ndim == 2 and means.shape[1] == len(labels):
         mean_rows = []
-        for class_index, class_label in enumerate(classes):
+        for class_index, class_label in enumerate(classes[: means.shape[0]]):
             for feature_index, feature_row in labels.iterrows():
                 row = feature_row.to_dict()
                 row["class_label"] = class_label
@@ -2963,12 +3071,14 @@ def save_outputs(
 
     hourly_aggregation_grouping_keys = None
     if config.lda_mode == "multi_day_hourly":
-        hourly_aggregation_grouping_keys = [
-            column
-            for column in ("threshold_run_name", "threshold_run_root")
-            if column in analysis_metadata_table.columns
-            and analysis_metadata_table[column].nunique(dropna=False) > 1
-        ] + ["calendar_day", "clock_hour_of_day"]
+        hourly_aggregation_grouping_keys = ["calendar_day", "clock_hour_of_day"]
+        if config.separate_hourly_samples_by_run_root:
+            hourly_aggregation_grouping_keys = [
+                column
+                for column in ("threshold_run_name", "threshold_run_root")
+                if column in analysis_metadata_table.columns
+                and analysis_metadata_table[column].nunique(dropna=False) > 1
+            ] + hourly_aggregation_grouping_keys
 
     summary_payload = {
         "export_summary_path": str(export_summary_path),
@@ -2987,6 +3097,10 @@ def save_outputs(
         "min_firing_rate_hz": float(config.min_firing_rate_hz),
         "min_minutes_per_hour": int(config.min_minutes_per_hour),
         "apply_zscore": bool(config.apply_zscore),
+        "cross_validation_preprocessing": (
+            "Within each CV fold, missing-value means and optional z-scoring parameters "
+            "are fit on the training rows only and then applied to the held-out rows."
+        ),
         "apply_smoothing": bool(config.apply_smoothing),
         "smoothing_sigma_bins": float(config.smoothing_sigma_bins),
         "hourly_waveform_weighting": str(config.hourly_waveform_weighting),
@@ -3234,6 +3348,7 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
                 minute_metadata_table=binned_metadata_table,
                 feature_table=feature_table,
                 waveform_weighting=config.hourly_waveform_weighting,
+                separate_by_run_root=config.separate_hourly_samples_by_run_root,
             )
             save_hourly_aggregation_cache(
                 config=config,
@@ -3322,7 +3437,7 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
 
         log_status(f"Running cross-validated decoding for mode {feature_mode}")
         decoding_results = evaluate_decoding(
-            population_matrix=mode_analysis_population_matrix,
+            population_matrix=raw_mode_analysis_population_matrix,
             labels=labels,
             metadata_table=analysis_metadata_table,
             resolved_label_column=resolved_label_column,
@@ -3431,6 +3546,7 @@ def run_pipeline(config: Config) -> list[Path]:
             minute_metadata_table=binned_metadata_table,
             feature_table=feature_table,
             waveform_weighting=config.hourly_waveform_weighting,
+            separate_by_run_root=config.separate_hourly_samples_by_run_root,
         )
         print_and_build_clock_hour_verification(analysis_metadata_table)
         print_clock_hour_sample_pivot(
@@ -3523,7 +3639,7 @@ def run_pipeline(config: Config) -> list[Path]:
 
         log_status(f"Running cross-validated decoding for mode {feature_mode}")
         decoding_results = evaluate_decoding(
-            population_matrix=mode_analysis_population_matrix,
+            population_matrix=raw_mode_analysis_population_matrix,
             labels=labels,
             metadata_table=analysis_metadata_table,
             resolved_label_column=resolved_label_column,

@@ -38,7 +38,9 @@ import json
 import os
 import csv
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -93,6 +95,64 @@ import spikeinterface.full as si
 import spikeinterface.preprocessing as spre
 from probeinterface import read_probeinterface
 from spikeinterface.core import BaseRecording
+
+
+def _array_payload_nbytes(values: dict[str, object]) -> int:
+    total = 0
+    for value in values.values():
+        try:
+            total += int(np.asarray(value).nbytes)
+        except Exception:
+            continue
+    return total
+
+
+def _savez_compressed_with_network_fallback(path: Path, **values: object) -> None:
+    """
+    Save an NPZ directly, then retry through a local staging file if a mapped
+    drive rejects ZipFile's streaming writes.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        np.savez_compressed(str(path), **values)
+        return
+    except OSError as direct_error:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    local_path: Path | None = None
+    destination_partial = path.with_name(f"{path.name}.partial")
+    try:
+        destination_partial.unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix="threshold_minute_",
+            suffix=".npz",
+            delete=False,
+        ) as local_handle:
+            local_path = Path(local_handle.name)
+        np.savez_compressed(str(local_path), **values)
+        shutil.copyfile(local_path, destination_partial)
+        os.replace(destination_partial, path)
+    except OSError as staged_error:
+        payload_gib = _array_payload_nbytes(values) / (1024.0 ** 3)
+        raise OSError(
+            f"Could not write NPZ to {path} after direct and local-staging attempts. "
+            f"Uncompressed array payload is approximately {payload_gib:.3f} GiB. "
+            "Check free space and the mapped/network drive connection."
+        ) from staged_error
+    finally:
+        if local_path is not None:
+            try:
+                local_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            destination_partial.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 COMPUTE_HOURLY_CORRELOGRAMS = False
 DEFAULT_PROBE_JSON = Path(r"E:\Curtis\spikeinterface\LSNET_probe.json")
@@ -1156,8 +1216,8 @@ def _write_recording_minute_npz_outputs(
             else np.zeros(0, dtype=np.int32)
         )
         t_write0 = time.perf_counter()
-        np.savez_compressed(
-            str(minute_npz),
+        _savez_compressed_with_network_fallback(
+            minute_npz,
             pair_ids=pair_ids,
             sg_ch=sg_ch,
             threshold_min_uv=threshold_min_uv,

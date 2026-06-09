@@ -102,6 +102,25 @@ PHASE_LABELS = {
     "caffeine_sham": "caffeine sham",
     "caffeine_drug": "caffeine drug",
 }
+DRUG_PHASES = frozenset({"drug", "drug_saline", "drug_caf", "saline_drug", "caffeine_drug"})
+INJECTION_SESSION_EDGE_COLORS = {
+    "sham": "#b45309",
+    "drug": "#b91c1c",
+    "sham_saline": "#1d4ed8",
+    "drug_saline": "#1e3a8a",
+    "sham_caf": "#7e22ce",
+    "drug_caf": "#4c1d95",
+}
+TRAJECTORY_PHASE_COLORS = {
+    "baseline": "#f3b6c4",
+    "sham": "#9fd3e8",
+    "drug": "#a8ddb5",
+}
+TRAJECTORY_PHASE_LABELS = {
+    "baseline": "baseline trajectory",
+    "sham": "sham trajectory",
+    "drug": "drug trajectory",
+}
 CIRCULAR_HOUR_CMAP = plt.get_cmap("twilight_shifted", 24)
 CIRCULAR_HOUR_BOUNDARIES = np.arange(-0.5, 24.5, 1.0)
 CIRCULAR_HOUR_NORM = BoundaryNorm(CIRCULAR_HOUR_BOUNDARIES, CIRCULAR_HOUR_CMAP.N)
@@ -254,10 +273,9 @@ def safe_slug(value: object) -> str:
 
 
 def output_suffix_slug(value: object) -> str:
-    text = safe_slug(value)
-    if text in {"value", ""}:
-        return ""
-    return text
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    return text.strip("_")
 
 
 def safe_float(value) -> float | None:
@@ -441,6 +459,29 @@ def threshold_feature_columns(unit_key: str) -> dict[str, str]:
     }
 
 
+def threshold_waveform_feature_columns(unit_key: str, waveform_len: int) -> list[str]:
+    return [
+        f"{unit_key}__mean_waveform_uv_s{sample_index:03d}"
+        for sample_index in range(int(waveform_len))
+    ]
+
+
+def parse_mean_waveform_json(value: object) -> list[float] | None:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    waveform = []
+    for item in parsed:
+        parsed_value = safe_float(item)
+        waveform.append(float("nan") if parsed_value is None else float(parsed_value))
+    return waveform
+
+
 def default_output_dir(run_roots: tuple[Path, ...]) -> Path:
     if len(run_roots) == 1:
         run_root = Path(run_roots[0])
@@ -463,126 +504,70 @@ def output_dir_with_suffix(base_dir: Path, suffix: str) -> Path:
     return Path(base_dir).with_name(f"{Path(base_dir).name}_{suffix}")
 
 
-def unique_timestamped_output_dir(base_dir: Path) -> Path:
-    base_dir = Path(base_dir)
-    if not base_dir.exists():
-        return base_dir
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    candidate = base_dir.with_name(f"{base_dir.name}_{stamp}")
-    if not candidate.exists():
-        return candidate
-    suffix = 2
-    while True:
-        candidate = base_dir.with_name(f"{base_dir.name}_{stamp}_{suffix:02d}")
-        if not candidate.exists():
-            return candidate
-        suffix += 1
+def selected_stage_label(config: PipelineConfig) -> str:
+    stage_names = []
+    if not config.skip_lda:
+        stage_names.append("LDA")
+    if not config.skip_tuning_weinan:
+        stage_names.append("tuning")
+    if not config.skip_presentation:
+        stage_names.append("presentation")
+    return " + ".join(stage_names) if stage_names else "no analysis stages"
 
 
-def resolve_existing_output_dir_collision(
-    requested_output_dir: Path,
-    configured_suffix: str | None,
-    *,
-    allow_prompt: bool = True,
-) -> Path:
-    if not requested_output_dir.exists():
-        return requested_output_dir
-
-    if configured_suffix:
-        candidate = output_dir_with_suffix(requested_output_dir, configured_suffix)
-        if candidate.exists():
-            raise FileExistsError(
-                f"Output folder already exists after applying suffix {configured_suffix!r}: {candidate}"
-            )
-        return candidate
-
-    if allow_prompt and sys.stdin is not None and sys.stdin.isatty():
-        print(
-            f"\nOutput folder already exists:\n  {requested_output_dir}\n",
-            flush=True,
+def resolve_unique_run_output_dir(config: PipelineConfig, base_dir: Path) -> Path:
+    configured_suffix = output_suffix_slug(config.output_suffix) if config.output_suffix else ""
+    if config.non_interactive and not configured_suffix:
+        raise ValueError(
+            "Every run requires a unique output suffix. In non-interactive mode, provide "
+            "--output-suffix with a new name."
         )
-        while True:
-            raw_suffix = input(
-                "Enter text to add after the folder name for this run "
-                "(example: channels_12_45): "
-            ).strip()
-            suffix = output_suffix_slug(raw_suffix)
-            if not suffix:
+
+    pending_suffix = configured_suffix
+    while True:
+        if not pending_suffix:
+            print(
+                f"\nChoose an output suffix for this {selected_stage_label(config)} run.",
+                flush=True,
+            )
+            print(f"Base output folder:\n  {base_dir}", flush=True)
+            pending_suffix = output_suffix_slug(
+                input(
+                    "Enter text to add after the output folder name "
+                    "(example: channels_12_45): "
+                )
+            )
+            if not pending_suffix:
                 print("Please enter a non-empty suffix.", flush=True)
                 continue
-            candidate = output_dir_with_suffix(requested_output_dir, suffix)
-            print(f"Proposed output folder:\n  {candidate}", flush=True)
-            if candidate.exists():
-                print("That folder also exists. Please choose a different suffix.", flush=True)
-                continue
-            if prompt_yes_no("Use this output folder?", default=True):
-                return candidate
 
-    # Batch/non-interactive fallback: avoid overwriting and avoid blocking forever.
-    return unique_timestamped_output_dir(requested_output_dir)
+        candidate = output_dir_with_suffix(base_dir, pending_suffix)
+        if candidate.exists():
+            message = (
+                f"Output folder already exists for suffix {pending_suffix!r}:\n"
+                f"  {candidate}"
+            )
+            if config.non_interactive:
+                raise FileExistsError(
+                    f"{message}\nProvide a different --output-suffix; existing results will not be overwritten."
+                )
+            print(f"\n{message}", flush=True)
+            print("Please choose a different suffix.", flush=True)
+            pending_suffix = ""
+            continue
 
-
-def output_dir_has_lda_results(output_dir: Path) -> bool:
-    lda_root = Path(output_dir) / "LDA_threshold"
-    if not lda_root.is_dir():
-        return False
-    return any(lda_root.iterdir())
+        print(f"New output folder:\n  {candidate}", flush=True)
+        if config.non_interactive or prompt_yes_no("Use this output folder?", default=True):
+            config.output_suffix = pending_suffix
+            return candidate
+        pending_suffix = ""
 
 
 def resolve_output_dir(config: PipelineConfig) -> Path:
     requested_output_dir = Path(config.output_dir) if config.output_dir is not None else default_output_dir(config.run_roots)
-    if requested_output_dir.exists():
-        if config.output_suffix:
-            output_dir = resolve_existing_output_dir_collision(
-                requested_output_dir,
-                config.output_suffix,
-                allow_prompt=not config.non_interactive,
-            )
-            output_dir.mkdir(parents=True, exist_ok=True)
-            log_status(f"Output folder suffix requested; writing this run to: {output_dir}")
-            return output_dir
-        population_csv = requested_output_dir / "threshold_population_minute_features.csv"
-        manifest_json = requested_output_dir / "threshold_population_manifest.json"
-        reusable, reason = is_population_csv_reusable(
-            population_csv,
-            manifest_json,
-            config.run_roots,
-            selected_unit_keys=config.selected_threshold_unit_keys,
-        )
-        if reusable:
-            if not config.skip_lda and output_dir_has_lda_results(requested_output_dir):
-                log_status(
-                    "Existing output folder already contains LDA results; resolving output-folder "
-                    "collision to avoid overwriting them."
-                )
-                output_dir = resolve_existing_output_dir_collision(
-                    requested_output_dir,
-                    config.output_suffix,
-                    allow_prompt=not config.non_interactive,
-                )
-                if output_dir != requested_output_dir:
-                    log_status(f"Writing this LDA run to: {output_dir}")
-                output_dir.mkdir(parents=True, exist_ok=True)
-                return output_dir
-            log_status(
-                "Existing output folder contains a matching precomputed threshold population CSV; "
-                f"reusing folder: {requested_output_dir}"
-            )
-            return requested_output_dir
-        log_status(
-            "Existing output folder did not contain a reusable threshold population CSV "
-            f"({reason}); resolving output-folder collision."
-        )
-    output_dir = resolve_existing_output_dir_collision(
-        requested_output_dir,
-        config.output_suffix,
-        allow_prompt=not config.non_interactive,
-    )
-    if output_dir != requested_output_dir:
-        log_status(
-            f"Output folder already exists; writing this run to: {output_dir}"
-        )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = resolve_unique_run_output_dir(config, requested_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+    log_status(f"Created unique output folder for this run: {output_dir}")
     return output_dir
 
 
@@ -617,6 +602,7 @@ def build_threshold_population_csv(
     *,
     force: bool = False,
     selected_unit_keys: tuple[str, ...] = (),
+    include_waveform_features: bool = False,
 ) -> Path:
     population_csv = output_dir / "threshold_population_minute_features.csv"
     manifest_json = output_dir / "threshold_population_manifest.json"
@@ -626,6 +612,7 @@ def build_threshold_population_csv(
             manifest_json,
             run_roots,
             selected_unit_keys=selected_unit_keys,
+            include_waveform_features=include_waveform_features,
         )
         if reusable:
             log_status(f"Reusing threshold population CSV: {population_csv}")
@@ -643,6 +630,7 @@ def build_threshold_population_csv(
                 source_manifest_json,
                 run_roots,
                 selected_unit_keys=selected_unit_keys,
+                include_waveform_features=include_waveform_features,
             )
             if reusable:
                 log_status(
@@ -685,6 +673,7 @@ def build_threshold_population_csv(
 
     sample_rows: dict[str, dict] = {}
     unit_rows_by_key: dict[str, dict] = {}
+    waveform_lengths_by_unit: dict[str, int] = {}
     skipped_rows = 0
 
     unit_keys = []
@@ -751,9 +740,8 @@ def build_threshold_population_csv(
                 session_key = f"{run_tag}::{recording_name}"
                 sample_key = f"{run_tag}__{safe_slug(recording_name)}__minute_{minute_index:06d}"
 
-                sample = sample_rows.setdefault(
-                    sample_key,
-                    {
+                if sample_key not in sample_rows:
+                    sample_rows[sample_key] = {
                         "final_sample_id": len(sample_rows) + 1,
                         "final_sample_key": sample_key,
                         "session_id": session_ordinal,
@@ -775,13 +763,65 @@ def build_threshold_population_csv(
                         "rec_file": recording_name,
                         "threshold_run_root": str(run_root_resolved),
                         "threshold_run_name": Path(run_root).name,
-                    },
-                )
+                    }
+                sample = sample_rows[sample_key]
+                metadata_checks = {
+                    "minute_start_sec": minute_start_sec,
+                    "minute_end_sec": minute_end_sec,
+                    "minute_start_datetime": minute_start_dt.isoformat(sep=" "),
+                    "minute_end_datetime": minute_end_dt.isoformat(sep=" "),
+                }
+                for metadata_column, new_value in metadata_checks.items():
+                    existing_value = sample.get(metadata_column)
+                    if str(existing_value) != str(new_value):
+                        raise ValueError(
+                            "Conflicting duplicate minute-summary rows were found for "
+                            f"{sample_key}: {metadata_column} is {existing_value!r} in an earlier "
+                            f"file but {new_value!r} in {summary_path}."
+                        )
                 firing_rate_hz = safe_float(row_dict.get("firing_rate_hz"))
-                sample[feature_columns["firing_rate_hz"]] = 0.0 if firing_rate_hz is None else firing_rate_hz
-                sample[feature_columns["average_amplitude_uv"]] = safe_float(row_dict.get("amplitude_ptp_uv"))
-                sample[feature_columns["cv2"]] = safe_float(row_dict.get("cv2"))
-                sample[feature_columns["peak_to_trough_ms"]] = safe_float(row_dict.get("peak_to_trough_ms"))
+                new_feature_values = {
+                    feature_columns["firing_rate_hz"]: 0.0 if firing_rate_hz is None else firing_rate_hz,
+                    feature_columns["average_amplitude_uv"]: safe_float(row_dict.get("amplitude_ptp_uv")),
+                    feature_columns["cv2"]: safe_float(row_dict.get("cv2")),
+                    feature_columns["peak_to_trough_ms"]: safe_float(row_dict.get("peak_to_trough_ms")),
+                }
+                if include_waveform_features:
+                    waveform = parse_mean_waveform_json(row_dict.get("mean_waveform_uv"))
+                    if waveform is not None:
+                        previous_length = waveform_lengths_by_unit.get(unit_key)
+                        if previous_length is not None and previous_length != len(waveform):
+                            raise ValueError(
+                                f"Inconsistent mean_waveform_uv length for {unit_key}: "
+                                f"{previous_length} previously, {len(waveform)} in {summary_path}."
+                            )
+                        waveform_lengths_by_unit[unit_key] = len(waveform)
+                        new_feature_values.update(
+                            dict(
+                                zip(
+                                    threshold_waveform_feature_columns(unit_key, len(waveform)),
+                                    waveform,
+                                )
+                            )
+                        )
+                for feature_column, new_value in new_feature_values.items():
+                    if feature_column in sample:
+                        existing_value = sample[feature_column]
+                        values_match = (
+                            existing_value is None and new_value is None
+                        ) or (
+                            existing_value is not None
+                            and new_value is not None
+                            and np.isclose(float(existing_value), float(new_value), equal_nan=True)
+                        )
+                        if not values_match:
+                            raise ValueError(
+                                "Conflicting duplicate feature values were found for "
+                                f"{sample_key}, {feature_column}: {existing_value!r} in an earlier "
+                                f"file but {new_value!r} in {summary_path}."
+                            )
+                    else:
+                        sample[feature_column] = new_value
 
     if not sample_rows:
         raise RuntimeError(
@@ -794,6 +834,13 @@ def build_threshold_population_csv(
         feature_order.extend(
             threshold_feature_columns(unit_key).values()
         )
+        if include_waveform_features:
+            feature_order.extend(
+                threshold_waveform_feature_columns(
+                    unit_key,
+                    waveform_lengths_by_unit.get(unit_key, 0),
+                )
+            )
     metadata_order = [
         "final_sample_id",
         "final_sample_key",
@@ -840,6 +887,7 @@ def build_threshold_population_csv(
                 "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
                 "input_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
                 "selected_threshold_unit_keys": list(selected_unit_keys),
+                "include_waveform_features": bool(include_waveform_features),
                 "population_csv": str(population_csv.resolve()),
                 "n_threshold_units": int(len(unit_table)),
                 "n_minute_samples": int(len(population_df)),
@@ -864,6 +912,7 @@ def is_population_csv_reusable(
     run_roots: tuple[Path, ...],
     *,
     selected_unit_keys: tuple[str, ...] = (),
+    include_waveform_features: bool = False,
 ) -> tuple[bool, str]:
     if not population_csv.exists():
         return False, "population CSV is missing"
@@ -883,6 +932,8 @@ def is_population_csv_reusable(
     manifest_selected = tuple(str(value) for value in manifest.get("selected_threshold_unit_keys", []))
     if manifest_selected != tuple(selected_unit_keys):
         return False, "manifest selected_threshold_unit_keys differ from this run"
+    if bool(manifest.get("include_waveform_features", False)) != bool(include_waveform_features):
+        return False, "manifest include_waveform_features differs from this run"
     if str(Path(manifest.get("population_csv", "")).resolve()) != str(Path(population_csv).resolve()):
         return False, "manifest points to a different population CSV"
     return True, "manifest matches"
@@ -903,9 +954,11 @@ def run_lda(population_csv: Path, output_dir: Path, config: PipelineConfig) -> l
     lda_config.n_permutations = int(config.n_permutations)
     lda_config.apply_zscore = bool(config.apply_zscore)
     lda_config.apply_smoothing = False
+    lda_config.separate_hourly_samples_by_run_root = False
     log_status(
         "Starting threshold LDA from precomputed 1-minute population CSV; "
-        "samples are aggregated to real clock-hour bins by calendar_day x clock_hour_of_day."
+        "samples are aggregated across all input run roots into real clock-hour bins by "
+        "calendar_day x clock_hour_of_day."
     )
     return [Path(path) for path in lda_threshold.run_pipeline(lda_config)]
 
@@ -1692,6 +1745,8 @@ def build_injection_phase_schedule(sham_recordings: pd.DataFrame, drug_recording
             {
                 "session_name": str(drug_row.session_name),
                 "session_key": str(drug_row.session_key),
+                "threshold_run_root": str(getattr(drug_row, "threshold_run_root", "")),
+                "threshold_run_name": str(getattr(drug_row, "threshold_run_name", "")),
                 "start": drug_start.isoformat(sep=" "),
                 "end": (drug_start + timedelta(hours=24)).isoformat(sep=" "),
             }
@@ -1704,6 +1759,8 @@ def build_injection_phase_schedule(sham_recordings: pd.DataFrame, drug_recording
         interval = {
             "session_name": str(sham_row.session_name),
             "session_key": str(sham_row.session_key),
+            "threshold_run_root": str(getattr(sham_row, "threshold_run_root", "")),
+            "threshold_run_name": str(getattr(sham_row, "threshold_run_name", "")),
             "start": sham_start.isoformat(sep=" "),
         }
         if following_drugs.empty:
@@ -1784,6 +1841,8 @@ def _paired_phase_intervals(
                 "phase": drug_phase,
                 "session_name": str(drug_row.session_name),
                 "session_key": str(drug_row.session_key),
+                "threshold_run_root": str(getattr(drug_row, "threshold_run_root", "")),
+                "threshold_run_name": str(getattr(drug_row, "threshold_run_name", "")),
                 "start": drug_start.isoformat(sep=" "),
                 "end": (drug_start + timedelta(hours=24)).isoformat(sep=" "),
             }
@@ -1797,6 +1856,8 @@ def _paired_phase_intervals(
             "phase": sham_phase,
             "session_name": str(sham_row.session_name),
             "session_key": str(sham_row.session_key),
+            "threshold_run_root": str(getattr(sham_row, "threshold_run_root", "")),
+            "threshold_run_name": str(getattr(sham_row, "threshold_run_name", "")),
             "start": sham_start.isoformat(sep=" "),
         }
         if following_drugs.empty:
@@ -1843,40 +1904,50 @@ def build_treatment_phase_schedule(
     caffeine_sham_recordings: pd.DataFrame,
     caffeine_drug_recordings: pd.DataFrame,
 ) -> dict:
-    if (
-        saline_sham_recordings.empty
-        or saline_drug_recordings.empty
-        or caffeine_sham_recordings.empty
-        or caffeine_drug_recordings.empty
-    ):
+    saline_pair_complete = not saline_sham_recordings.empty and not saline_drug_recordings.empty
+    caffeine_pair_complete = not caffeine_sham_recordings.empty and not caffeine_drug_recordings.empty
+    if saline_sham_recordings.empty != saline_drug_recordings.empty:
         raise ValueError(
-            "Treatment marker mode requires saline sham, saline drug, caffeine sham, "
-            "and caffeine drug recording selections."
+            "Saline treatment markers require both saline sham and saline drug recordings, "
+            "or neither if saline should be skipped."
+        )
+    if caffeine_sham_recordings.empty != caffeine_drug_recordings.empty:
+        raise ValueError(
+            "Caffeine treatment markers require both caffeine sham and caffeine drug recordings, "
+            "or neither if caffeine should be skipped."
+        )
+    if not saline_pair_complete and not caffeine_pair_complete:
+        raise ValueError(
+            "Treatment marker mode requires at least one complete sham/drug pair: "
+            "saline, caffeine, or both."
         )
 
-    saline_sham, saline_drug = _paired_phase_intervals(
-        sham_recordings=saline_sham_recordings,
-        drug_recordings=saline_drug_recordings,
-        sham_phase="sham_saline",
-        drug_phase="drug_saline",
-    )
-    caffeine_sham, caffeine_drug = _paired_phase_intervals(
-        sham_recordings=caffeine_sham_recordings,
-        drug_recordings=caffeine_drug_recordings,
-        sham_phase="sham_caf",
-        drug_phase="drug_caf",
-    )
+    saline_sham, saline_drug = ([], [])
+    if saline_pair_complete:
+        saline_sham, saline_drug = _paired_phase_intervals(
+            sham_recordings=saline_sham_recordings,
+            drug_recordings=saline_drug_recordings,
+            sham_phase="sham_saline",
+            drug_phase="drug_saline",
+        )
+    caffeine_sham, caffeine_drug = ([], [])
+    if caffeine_pair_complete:
+        caffeine_sham, caffeine_drug = _paired_phase_intervals(
+            sham_recordings=caffeine_sham_recordings,
+            drug_recordings=caffeine_drug_recordings,
+            sham_phase="sham_caf",
+            drug_phase="drug_caf",
+        )
     phase_intervals = saline_sham + caffeine_sham + saline_drug + caffeine_drug
+    phase_order = ["baseline"]
+    if saline_pair_complete:
+        phase_order.extend(["sham_saline", "drug_saline"])
+    if caffeine_pair_complete:
+        phase_order.extend(["sham_caf", "drug_caf"])
     return {
         "label_type": "treatment_phase_marker",
         "baseline_label": "baseline",
-        "phase_order": [
-            "baseline",
-            "sham_saline",
-            "drug_saline",
-            "sham_caf",
-            "drug_caf",
-        ],
+        "phase_order": phase_order,
         "interpretation": (
             "LDA labels remain clock_hour_of_day. Marker shapes encode baseline, sham saline, "
             "drug saline, sham caffeine, and drug caffeine. Sham intervals run from each sham "
@@ -1923,30 +1994,45 @@ def collect_injection_phase_schedule(population_csv: Path, config: PipelineConfi
         saline_drug_tokens = config.saline_drug_sessions
         caffeine_sham_tokens = config.caffeine_sham_sessions
         caffeine_drug_tokens = config.caffeine_drug_sessions
-        if not saline_sham_tokens:
-            if config.non_interactive:
-                raise ValueError("Non-interactive treatment marker mode requires --saline-sham-sessions.")
-            saline_sham_tokens = parse_token_list(
-                input("\nEnter saline sham recording_id(s), recording name(s), or tokens, separated by commas: ")
-            )
-        if not saline_drug_tokens:
-            if config.non_interactive:
-                raise ValueError("Non-interactive treatment marker mode requires --saline-drug-sessions.")
-            saline_drug_tokens = parse_token_list(
-                input("Enter saline drug recording_id(s), recording name(s), or tokens, separated by commas: ")
-            )
-        if not caffeine_sham_tokens:
-            if config.non_interactive:
-                raise ValueError("Non-interactive treatment marker mode requires --caffeine-sham-sessions.")
-            caffeine_sham_tokens = parse_token_list(
-                input("Enter caffeine sham recording_id(s), recording name(s), or tokens, separated by commas: ")
-            )
-        if not caffeine_drug_tokens:
-            if config.non_interactive:
-                raise ValueError("Non-interactive treatment marker mode requires --caffeine-drug-sessions.")
-            caffeine_drug_tokens = parse_token_list(
-                input("Enter caffeine drug recording_id(s), recording name(s), or tokens, separated by commas: ")
-            )
+        if not config.non_interactive:
+            if not saline_sham_tokens and not saline_drug_tokens:
+                saline_sham_tokens = parse_token_list(
+                    input(
+                        "\nEnter saline sham recording_id(s), names, or tokens "
+                        "(press Enter to skip saline): "
+                    )
+                )
+                if saline_sham_tokens:
+                    saline_drug_tokens = parse_token_list(
+                        input("Enter saline drug recording_id(s), names, or tokens: ")
+                    )
+            elif not saline_sham_tokens:
+                saline_sham_tokens = parse_token_list(
+                    input("Enter saline sham recording_id(s), names, or tokens: ")
+                )
+            elif not saline_drug_tokens:
+                saline_drug_tokens = parse_token_list(
+                    input("Enter saline drug recording_id(s), names, or tokens: ")
+                )
+            if not caffeine_sham_tokens and not caffeine_drug_tokens:
+                caffeine_sham_tokens = parse_token_list(
+                    input(
+                        "Enter caffeine sham recording_id(s), names, or tokens "
+                        "(press Enter to skip caffeine): "
+                    )
+                )
+                if caffeine_sham_tokens:
+                    caffeine_drug_tokens = parse_token_list(
+                        input("Enter caffeine drug recording_id(s), names, or tokens: ")
+                    )
+            elif not caffeine_sham_tokens:
+                caffeine_sham_tokens = parse_token_list(
+                    input("Enter caffeine sham recording_id(s), names, or tokens: ")
+                )
+            elif not caffeine_drug_tokens:
+                caffeine_drug_tokens = parse_token_list(
+                    input("Enter caffeine drug recording_id(s), names, or tokens: ")
+                )
         schedule = build_treatment_phase_schedule(
             saline_sham_recordings=select_recordings_from_tokens(recording_table, saline_sham_tokens),
             saline_drug_recordings=select_recordings_from_tokens(recording_table, saline_drug_tokens),
@@ -2082,6 +2168,328 @@ def assign_injection_phase_for_times(
     return phases
 
 
+def injection_session_identities_by_phase(schedule: dict) -> dict[str, list[dict[str, str]]]:
+    intervals_by_phase: dict[str, list[dict]] = {}
+    if schedule.get("phase_intervals") is not None:
+        for interval in schedule.get("phase_intervals", []) or []:
+            phase = str(interval.get("phase", "")).strip()
+            if phase:
+                intervals_by_phase.setdefault(phase, []).append(interval)
+    else:
+        intervals_by_phase = {
+            "sham": list(schedule.get("sham_intervals", []) or []),
+            "drug": list(schedule.get("drug_intervals", []) or []),
+        }
+
+    identities_by_phase: dict[str, list[dict[str, str]]] = {}
+    for phase, intervals in intervals_by_phase.items():
+        identities = [
+            {
+                "session_name": str(row.get("session_name", "")).strip(),
+                "threshold_run_root": str(row.get("threshold_run_root", "")).strip(),
+                "threshold_run_name": str(row.get("threshold_run_name", "")).strip(),
+                "start": str(row.get("start", "")).strip(),
+            }
+            for row in intervals
+            if str(row.get("session_name", "")).strip() and str(row.get("start", "")).strip()
+        ]
+        if identities:
+            identities_by_phase[phase] = identities
+    return identities_by_phase
+
+
+def annotate_injection_sessions(projection: pd.DataFrame, schedule: dict) -> pd.DataFrame:
+    table = projection.copy()
+    identities_by_phase = injection_session_identities_by_phase(schedule)
+    time_column = (
+        "hour_start_datetime"
+        if "hour_start_datetime" in table.columns
+        else "sample_start_datetime"
+        if "sample_start_datetime" in table.columns
+        else None
+    )
+
+    def row_session_names(row: pd.Series) -> set[str]:
+        names: set[str] = set()
+        for column in ("session_names", "session_name", "first_session_name"):
+            if column not in row.index:
+                continue
+            raw_value = str(row.get(column, "")).strip()
+            if not raw_value or raw_value.lower() == "nan":
+                continue
+            names.update(part.strip() for part in raw_value.split("|") if part.strip())
+        return names
+
+    def identity_matches_row(identity: dict[str, str], row: pd.Series, row_names: set[str]) -> bool:
+        if identity["session_name"] not in row_names:
+            return False
+        selected_root = identity["threshold_run_root"]
+        row_root = str(row.get("threshold_run_root", "")).strip()
+        if selected_root and row_root:
+            row_roots = [part.strip() for part in row_root.split("|") if part.strip()]
+            for candidate_root in row_roots:
+                try:
+                    if Path(selected_root).resolve() == Path(candidate_root).resolve():
+                        return True
+                except Exception:
+                    if selected_root == candidate_root:
+                        return True
+            return False
+        selected_run_name = identity["threshold_run_name"]
+        row_run_name = str(row.get("threshold_run_name", "")).strip()
+        if selected_run_name and row_run_name:
+            return selected_run_name in {
+                part.strip()
+                for part in row_run_name.split("|")
+                if part.strip()
+            }
+        return True
+
+    injection_roles: list[str] = []
+    injection_names: list[str] = []
+    injection_starts: list[str] = []
+    for _, row in table.iterrows():
+        row_names = row_session_names(row)
+        row_start = pd.to_datetime(row.get(time_column), errors="coerce") if time_column else pd.NaT
+        if time_column == "hour_start_datetime":
+            row_end = row_start + pd.Timedelta(hours=1)
+        elif "sample_end_datetime" in row.index:
+            row_end = pd.to_datetime(row.get("sample_end_datetime"), errors="coerce")
+        else:
+            row_end = row_start
+
+        matched: list[tuple[str, dict[str, str]]] = []
+        for phase, identities in identities_by_phase.items():
+            for identity in identities:
+                injection_start = pd.to_datetime(identity["start"], errors="coerce")
+                if pd.isna(row_start) or pd.isna(injection_start):
+                    continue
+                if time_column == "hour_start_datetime":
+                    contains_start = row_start <= injection_start < row_end
+                elif pd.notna(row_end) and row_end > row_start:
+                    contains_start = row_start <= injection_start < row_end
+                else:
+                    contains_start = row_start == injection_start
+                if contains_start and identity_matches_row(identity, row, row_names):
+                    matched.append((phase, identity))
+
+        matched_phases = list(dict.fromkeys(phase for phase, _identity in matched))
+        injection_roles.append("|".join(matched_phases))
+        injection_names.append(
+            "|".join(dict.fromkeys(identity["session_name"] for _phase, identity in matched))
+        )
+        injection_starts.append(
+            "|".join(dict.fromkeys(identity["start"] for _phase, identity in matched))
+        )
+    table["injection_session_role"] = injection_roles
+    table["injection_session_names"] = injection_names
+    table["injection_session_start_times"] = injection_starts
+    table["is_selected_injection_session"] = table["injection_session_role"].astype(str).str.len() > 0
+    return table
+
+
+def injection_session_legend_handles(projection: pd.DataFrame) -> list[Line2D]:
+    if "injection_session_role" not in projection.columns:
+        return []
+    present_roles = {
+        role
+        for value in projection["injection_session_role"].astype(str)
+        for role in value.split("|")
+        if role
+    }
+    roles = [role for role in INJECTION_SESSION_EDGE_COLORS if role in present_roles]
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker=PHASE_MARKERS.get(role, "o"),
+            linestyle="None",
+            markerfacecolor="none",
+            markeredgecolor=INJECTION_SESSION_EDGE_COLORS.get(role, "black"),
+            markeredgewidth=2.4,
+            markersize=10,
+            label=f"{PHASE_LABELS.get(role, role)} injection-start hour",
+        )
+        for role in roles
+    ]
+
+
+def draw_injection_session_outlines(
+    ax,
+    projection: pd.DataFrame,
+    *,
+    dimensions: int,
+) -> None:
+    if "injection_session_role" not in projection.columns:
+        return
+    for role in INJECTION_SESSION_EDGE_COLORS:
+        role_mask = projection["injection_session_role"].astype(str).str.split("|", regex=False).map(
+            lambda values: role in values
+        )
+        if not role_mask.any():
+            continue
+        common_kwargs = {
+            "marker": PHASE_MARKERS.get(role, "o"),
+            "s": 112 if dimensions == 2 else 100,
+            "facecolors": "none",
+            "edgecolors": INJECTION_SESSION_EDGE_COLORS.get(role, "black"),
+            "linewidths": 2.2,
+            "alpha": 1.0,
+            "zorder": 5,
+        }
+        if dimensions == 3:
+            ax.scatter(
+                projection.loc[role_mask, "LD1"],
+                projection.loc[role_mask, "LD2"],
+                projection.loc[role_mask, "LD3"],
+                **common_kwargs,
+            )
+        else:
+            ax.scatter(
+                projection.loc[role_mask, "LD1"],
+                projection.loc[role_mask, "LD2"],
+                **common_kwargs,
+            )
+
+
+def draw_calendar_day_trajectories(
+    ax,
+    projection: pd.DataFrame,
+    *,
+    dimensions: int,
+) -> None:
+    if "calendar_day" not in projection.columns:
+        return
+    table = projection.copy()
+    for column in ("LD1", "LD2", "LD3"):
+        if column in table.columns:
+            table[column] = pd.to_numeric(table[column], errors="coerce")
+    time_column = next(
+        (
+            column
+            for column in ("hour_start_datetime", "sample_start_datetime", "minute_start_datetime")
+            if column in table.columns
+        ),
+        None,
+    )
+    if time_column is not None:
+        table["_trajectory_time"] = pd.to_datetime(table[time_column], errors="coerce")
+    else:
+        table["_trajectory_time"] = pd.to_numeric(table.get("clock_hour_of_day"), errors="coerce")
+
+    def trajectory_phase(value: object) -> str:
+        phase = str(value or "").strip()
+        if phase in DRUG_PHASES or phase.startswith("drug_") or phase.endswith("_drug"):
+            return "drug"
+        if phase != "baseline" and (
+            phase == "sham" or phase.startswith("sham_") or phase.endswith("_sham")
+        ):
+            return "sham"
+        return "baseline"
+
+    if "injection_phase" in table.columns:
+        table["_trajectory_phase"] = table["injection_phase"].map(trajectory_phase)
+    else:
+        table["_trajectory_phase"] = "baseline"
+
+    trajectory_group_columns = [
+        column
+        for column in ("threshold_run_root", "threshold_run_name", "calendar_day")
+        if column in table.columns
+    ]
+    if "calendar_day" not in trajectory_group_columns:
+        return
+    for _group_key, group in table.groupby(trajectory_group_columns, dropna=False):
+        group = group.sort_values("_trajectory_time")
+        required_columns = ["LD1", "LD2"] + (["LD3"] if dimensions == 3 else [])
+        group = group.dropna(subset=required_columns)
+        if len(group) < 2:
+            continue
+        rows = group.to_dict(orient="records")
+        for previous, current in zip(rows, rows[1:]):
+            phase = str(current["_trajectory_phase"])
+            line_kwargs = {
+                "color": TRAJECTORY_PHASE_COLORS.get(phase, TRAJECTORY_PHASE_COLORS["baseline"]),
+                "alpha": 0.62,
+                "linewidth": 1.15,
+                "zorder": 1,
+            }
+            if dimensions == 3:
+                ax.plot(
+                    [float(previous["LD1"]), float(current["LD1"])],
+                    [float(previous["LD2"]), float(current["LD2"])],
+                    [float(previous["LD3"]), float(current["LD3"])],
+                    **line_kwargs,
+                )
+            else:
+                ax.plot(
+                    [float(previous["LD1"]), float(current["LD1"])],
+                    [float(previous["LD2"]), float(current["LD2"])],
+                    **line_kwargs,
+                )
+
+
+def trajectory_legend_handles(projection: pd.DataFrame) -> list[Line2D]:
+    table = projection.copy()
+    if "calendar_day" not in table.columns:
+        return []
+    table["LD1"] = pd.to_numeric(table.get("LD1"), errors="coerce")
+    table["LD2"] = pd.to_numeric(table.get("LD2"), errors="coerce")
+    time_column = next(
+        (
+            column
+            for column in ("hour_start_datetime", "sample_start_datetime", "minute_start_datetime")
+            if column in table.columns
+        ),
+        None,
+    )
+    table["_trajectory_time"] = (
+        pd.to_datetime(table[time_column], errors="coerce")
+        if time_column is not None
+        else pd.to_numeric(table.get("clock_hour_of_day"), errors="coerce")
+    )
+
+    def category(value: object) -> str:
+        phase = str(value or "").strip()
+        if phase in DRUG_PHASES or phase.startswith("drug_") or phase.endswith("_drug"):
+            return "drug"
+        if phase == "sham" or phase.startswith("sham_") or phase.endswith("_sham"):
+            return "sham"
+        return "baseline"
+
+    table["_trajectory_phase"] = (
+        table["injection_phase"].map(category)
+        if "injection_phase" in table.columns
+        else "baseline"
+    )
+    group_columns = [
+        column
+        for column in ("threshold_run_root", "threshold_run_name", "calendar_day")
+        if column in table.columns
+    ]
+    drawn_categories: set[str] = set()
+    for _group_key, group in table.groupby(group_columns, dropna=False):
+        group = group.sort_values("_trajectory_time").dropna(subset=["LD1", "LD2"])
+        if len(group) >= 2:
+            drawn_categories.update(group["_trajectory_phase"].iloc[1:].astype(str))
+    present_categories = [
+        category_name
+        for category_name in ("baseline", "sham", "drug")
+        if category_name in drawn_categories
+    ]
+    return [
+        Line2D(
+            [0],
+            [0],
+            color=TRAJECTORY_PHASE_COLORS[category],
+            linewidth=2.2,
+            alpha=0.9,
+            label=TRAJECTORY_PHASE_LABELS[category],
+        )
+        for category in present_categories
+    ]
+
+
 def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> list[Path]:
     output_paths: list[Path] = []
     phase_order = [
@@ -2109,8 +2517,27 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             schedule,
             interval_duration=marker_interval_duration,
         )
+        projection = annotate_injection_sessions(projection, schedule)
         phase_counts = projection["injection_phase"].astype(str).value_counts().to_dict()
+        injection_start_hour_counts = (
+            projection.loc[
+                projection["is_selected_injection_session"].astype(bool),
+                "injection_session_role",
+            ]
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
+        selected_recording_counts = {
+            phase: len(identities)
+            for phase, identities in injection_session_identities_by_phase(schedule).items()
+        }
         log_status(f"LDA marker phase counts for {output_dir}: {phase_counts}")
+        log_status(f"Selected injection recording counts for {output_dir}: {selected_recording_counts}")
+        log_status(
+            f"Outlined injection-start clock-hour counts for {output_dir}: "
+            f"{injection_start_hour_counts}"
+        )
         projection.to_csv(projection_csv, index=False)
 
         y_values = (
@@ -2122,8 +2549,14 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             y_values = np.zeros(len(projection), dtype=float)
         x_values = pd.to_numeric(projection["LD1"], errors="coerce").to_numpy(dtype=float)
         hours = pd.to_numeric(projection["clock_hour_of_day"], errors="coerce").to_numpy(dtype=float)
+        projection["LD1"] = x_values
+        projection["LD2"] = y_values
 
         fig, ax = plt.subplots(figsize=(10, 8))
+        trajectory_projection = projection.copy()
+        trajectory_projection["LD1"] = x_values
+        trajectory_projection["LD2"] = y_values
+        draw_calendar_day_trajectories(ax, trajectory_projection, dimensions=2)
         first_scatter = None
         for phase in phase_order:
             mask = projection["injection_phase"].astype(str).to_numpy() == phase
@@ -2144,6 +2577,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             )
             if first_scatter is None:
                 first_scatter = scatter
+        draw_injection_session_outlines(ax, projection, dimensions=2)
         ax.set_xlabel("LD1")
         ax.set_ylabel("LD2")
         ax.set_title(plot_title)
@@ -2176,10 +2610,12 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             for phase in phase_order
             if phase in set(projection["injection_phase"].astype(str))
         ]
+        handles.extend(trajectory_legend_handles(projection))
+        handles.extend(injection_session_legend_handles(projection))
         if handles:
             ax.legend(
                 handles=handles,
-                title="phase",
+                title="phase markers and trajectories",
                 loc="upper center",
                 bbox_to_anchor=(0.5, 1.16),
                 ncol=min(len(handles), 5),
@@ -2199,8 +2635,11 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
         )
         if not np.isfinite(z_values).any():
             z_values = np.zeros(len(projection), dtype=float)
+        projection["LD3"] = z_values
         fig = plt.figure(figsize=(11, 9))
         ax = fig.add_subplot(111, projection="3d")
+        trajectory_projection["LD3"] = z_values
+        draw_calendar_day_trajectories(ax, trajectory_projection, dimensions=3)
         first_scatter = None
         for phase in phase_order:
             mask = projection["injection_phase"].astype(str).to_numpy() == phase
@@ -2222,6 +2661,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
             )
             if first_scatter is None:
                 first_scatter = scatter
+        draw_injection_session_outlines(ax, projection, dimensions=3)
         ax.set_xlabel("LD1")
         ax.set_ylabel("LD2")
         ax.set_zlabel("LD3")
@@ -2241,7 +2681,7 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
         if handles:
             ax.legend(
                 handles=handles,
-                title="phase",
+                title="phase markers and trajectories",
                 loc="upper center",
                 bbox_to_anchor=(0.5, 1.12),
                 ncol=min(len(handles), 5),
@@ -2267,8 +2707,15 @@ def feature_columns_from_population_table(table: pd.DataFrame) -> list[str]:
 def fill_with_training_means(train_matrix: np.ndarray, all_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     train_matrix = np.asarray(train_matrix, dtype=float)
     all_matrix = np.asarray(all_matrix, dtype=float)
-    column_means = np.nanmean(train_matrix, axis=0)
-    column_means = np.where(np.isfinite(column_means), column_means, 0.0)
+    finite = np.isfinite(train_matrix)
+    finite_counts = finite.sum(axis=0)
+    finite_sums = np.where(finite, train_matrix, 0.0).sum(axis=0)
+    column_means = np.divide(
+        finite_sums,
+        finite_counts,
+        out=np.zeros(train_matrix.shape[1], dtype=float),
+        where=finite_counts > 0,
+    )
     train_filled = np.where(np.isfinite(train_matrix), train_matrix, column_means)
     all_filled = np.where(np.isfinite(all_matrix), all_matrix, column_means)
     return train_filled, all_filled, column_means
@@ -2288,8 +2735,13 @@ def baseline_only_feature_preprocessing(
 
     baseline_finite = np.isfinite(x_baseline)
     finite_counts = baseline_finite.sum(axis=0)
-    baseline_means = np.nanmean(x_baseline, axis=0)
-    baseline_means = np.where(np.isfinite(baseline_means), baseline_means, 0.0)
+    baseline_sums = np.where(baseline_finite, x_baseline, 0.0).sum(axis=0)
+    baseline_means = np.divide(
+        baseline_sums,
+        finite_counts,
+        out=np.zeros(x_baseline.shape[1], dtype=float),
+        where=finite_counts > 0,
+    )
     x_baseline_filled = np.where(baseline_finite, x_baseline, baseline_means)
     x_all_filled = np.where(np.isfinite(x_all), x_all, baseline_means)
     baseline_stds = np.nanstd(x_baseline_filled, axis=0)
@@ -2385,33 +2837,7 @@ def plot_baseline_space_projection(
     else:
         fig, ax = plt.subplots(figsize=(10, 8))
 
-    # Draw within-day/session trajectories first, behind the points.
-    group_columns = [column for column in ("calendar_day", "session_ids", "session_names") if column in projection.columns]
-    if "calendar_day" in group_columns:
-        grouped = projection.sort_values(["calendar_day", "clock_hour_of_day"]).groupby(group_columns, dropna=False)
-        for _group_key, group in grouped:
-            group = group.sort_values("clock_hour_of_day")
-            if len(group) < 2:
-                continue
-            if dimensions == 3:
-                ax.plot(
-                    group["LD1"],
-                    group["LD2"],
-                    group["LD3"],
-                    color="0.25",
-                    alpha=0.16,
-                    linewidth=0.8,
-                    zorder=1,
-                )
-            else:
-                ax.plot(
-                    group["LD1"],
-                    group["LD2"],
-                    color="0.25",
-                    alpha=0.16,
-                    linewidth=0.8,
-                    zorder=1,
-                )
+    draw_calendar_day_trajectories(ax, projection, dimensions=dimensions)
 
     first_scatter = None
     for phase in phase_order:
@@ -2450,6 +2876,7 @@ def plot_baseline_space_projection(
         if first_scatter is None:
             first_scatter = scatter
 
+    draw_injection_session_outlines(ax, projection, dimensions=dimensions)
     ax.set_xlabel("LD1")
     ax.set_ylabel("LD2")
     if dimensions == 3:
@@ -2470,10 +2897,12 @@ def plot_baseline_space_projection(
             drawedges=True,
         )
         colorbar.set_label("Hour")
+    handles.extend(trajectory_legend_handles(projection))
+    handles.extend(injection_session_legend_handles(projection))
     if handles:
         ax.legend(
             handles=handles,
-            title="phase",
+            title="phase markers and trajectories",
             loc="upper center",
             bbox_to_anchor=(0.5, 1.14),
             ncol=min(len(handles), 5),
@@ -2641,6 +3070,13 @@ def permutation_geometry_control(
         rows.append(metrics)
     permutation_table = pd.DataFrame(rows)
 
+    def finite_mean_and_sd(metric_name: str) -> tuple[float, float]:
+        values = pd.to_numeric(permutation_table[metric_name], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return float("nan"), float("nan")
+        return float(np.mean(values)), float(np.std(values))
+
     def empirical_p_greater(metric_name: str) -> float:
         observed_value = float(observed.get(metric_name, float("nan")))
         values = pd.to_numeric(permutation_table[metric_name], errors="coerce").to_numpy(dtype=float)
@@ -2657,21 +3093,23 @@ def permutation_geometry_control(
             return float("nan")
         return float((np.count_nonzero(np.abs(values) >= abs(observed_value)) + 1) / (values.size + 1))
 
+    null_ratio_mean, null_ratio_sd = finite_mean_and_sd("separation_ratio")
+    null_correlation_mean, null_correlation_sd = finite_mean_and_sd(
+        "centroid_distance_vs_circular_time_difference_correlation"
+    )
     summary = {
+        "control_type": "fixed_projection_random_label_shuffle",
+        "refits_scaler_or_lda_per_permutation": False,
         "n_permutations": int(n_permutations),
         "random_seed": int(random_seed),
         "observed_separation_ratio": observed["separation_ratio"],
         "observed_distance_time_correlation": observed[
             "centroid_distance_vs_circular_time_difference_correlation"
         ],
-        "null_separation_ratio_mean": float(np.nanmean(permutation_table["separation_ratio"])),
-        "null_separation_ratio_sd": float(np.nanstd(permutation_table["separation_ratio"])),
-        "null_distance_time_correlation_mean": float(
-            np.nanmean(permutation_table["centroid_distance_vs_circular_time_difference_correlation"])
-        ),
-        "null_distance_time_correlation_sd": float(
-            np.nanstd(permutation_table["centroid_distance_vs_circular_time_difference_correlation"])
-        ),
+        "null_separation_ratio_mean": null_ratio_mean,
+        "null_separation_ratio_sd": null_ratio_sd,
+        "null_distance_time_correlation_mean": null_correlation_mean,
+        "null_distance_time_correlation_sd": null_correlation_sd,
         "p_separation_ratio_greater_equal_observed": empirical_p_greater("separation_ratio"),
         "p_abs_distance_time_correlation_greater_equal_observed_abs": empirical_p_abs(
             "centroid_distance_vs_circular_time_difference_correlation"
@@ -2698,6 +3136,7 @@ def add_baseline_geometry_validation_outputs(
     *,
     prefix: str = "baseline_geometry",
     label_centroids: bool = True,
+    analysis_scope_label: str = "Baseline",
 ) -> list[Path]:
     output_paths: list[Path] = []
     required_columns = {"LD1", "clock_hour_of_day"}
@@ -2868,6 +3307,7 @@ def add_baseline_geometry_validation_outputs(
     output_paths.append(delta_path)
 
     summary = {
+        "analysis_scope": str(analysis_scope_label),
         "mean_within_hour_distance": mean_within,
         "mean_between_hour_centroid_distance": mean_between,
         "separation_ratio": separation_ratio,
@@ -2878,6 +3318,10 @@ def add_baseline_geometry_validation_outputs(
         "projection_dimensions": ["LD1", "LD2"],
         "feature_audit": feature_audit_summary,
         "random_label_permutation_control": permutation_summary,
+        "random_label_control_note": (
+            "Clock-hour labels are shuffled within the already fitted LDA projection. "
+            "The scaler and LDA model are not refit for each permutation."
+        ),
     }
     summary_path = output_dir / f"{prefix}_summary_metrics.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -2933,7 +3377,9 @@ def add_baseline_geometry_validation_outputs(
             )
     ax_projection.set_xlabel("LDA1")
     ax_projection.set_ylabel("LDA2")
-    ax_projection.set_title("Baseline samples in LDA space; centroids show clock-hour labels")
+    ax_projection.set_title(
+        f"{analysis_scope_label} samples in LDA space; centroids show clock-hour labels"
+    )
     ax_projection.spines["top"].set_visible(False)
     ax_projection.spines["right"].set_visible(False)
     colorbar = fig.colorbar(
@@ -3005,7 +3451,8 @@ def add_baseline_geometry_validation_outputs(
 
     fig.suptitle(
         (
-            "Baseline LDA Geometry Validation: clock-hour structure vs random labels\n"
+            f"{analysis_scope_label} LDA Geometry Validation: clock-hour structure vs "
+            "fixed-projection random labels\n"
             f"mean within={mean_within:.3g}, mean between={mean_between:.3g}, "
             f"ratio={separation_ratio:.3g}, corr={time_distance_corr:.3g}; "
             f"perm p(ratio)={permutation_summary['p_separation_ratio_greater_equal_observed']:.3g}, "
@@ -3018,7 +3465,7 @@ def add_baseline_geometry_validation_outputs(
     fig.savefig(panel_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     output_paths.append(panel_path)
-    log_status(f"Saved baseline LDA geometry validation panel: {panel_path}")
+    log_status(f"Saved {analysis_scope_label.lower()} LDA geometry validation panel: {panel_path}")
     return output_paths
 
 
@@ -3039,6 +3486,7 @@ def add_all_sample_lda_geometry_validation_outputs(lda_dirs: list[Path]) -> list
                 projection,
                 output_dir,
                 prefix="lda_geometry_all_samples",
+                analysis_scope_label="All-sample",
             )
         )
     return output_paths
@@ -3126,6 +3574,7 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
             "fit_baseline",
             "project_only_" + projection["injection_phase"].astype(str),
         )
+        projection = annotate_injection_sessions(projection, schedule)
         projection_path = output_dir / "baseline_space_projection.csv"
         projection.to_csv(projection_path, index=False)
         output_paths.append(projection_path)
@@ -3232,6 +3681,23 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
                         "baseline_space_projection_diagnostics.csv",
                         "baseline_space_retained_feature_time_label_audit.csv",
                     ],
+                    "filtered_projection_outputs": {
+                        "baseline_all_phases": [
+                            "baseline_space_projection.csv",
+                            "baseline_space_2d.png",
+                            "baseline_space_3d.png",
+                        ],
+                        "baseline_plus_drug_only_no_sham": [
+                            "baseline_space_baseline_plus_drug_projection.csv",
+                            "baseline_space_baseline_plus_drug_2d.png",
+                            "baseline_space_baseline_plus_drug_3d.png",
+                        ],
+                        "fit_baseline_only": [
+                            "baseline_space_fit_baseline_projection.csv",
+                            "baseline_space_fit_baseline_only_2d.png",
+                            "baseline_space_fit_baseline_only_3d.png",
+                        ],
+                    },
                     "retained_feature_time_label_order_audit": baseline_feature_audit_summary,
                     "normal_lda_outputs_note": (
                         "Files named lda_2d.png, lda_3d.png, and lda_2d_sham_drug_markers.png are the normal "
@@ -3260,6 +3726,28 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
             title="Baseline-only fit LDA space - sham/drug projected only",
         )
         output_paths.append(plot_2d_path)
+        baseline_drug_mask = (
+            (projection["injection_phase"].astype(str) == "baseline")
+            | projection["injection_phase"].astype(str).isin(DRUG_PHASES)
+        )
+        baseline_drug_projection = projection.loc[baseline_drug_mask.to_numpy()].copy()
+        baseline_drug_phase_order = [
+            phase
+            for phase in phase_order
+            if phase == "baseline" or phase in DRUG_PHASES
+        ]
+        baseline_drug_projection_path = output_dir / "baseline_space_baseline_plus_drug_projection.csv"
+        baseline_drug_projection.to_csv(baseline_drug_projection_path, index=False)
+        output_paths.append(baseline_drug_projection_path)
+        baseline_drug_plot_2d_path = output_dir / "baseline_space_baseline_plus_drug_2d.png"
+        plot_baseline_space_projection(
+            baseline_drug_projection,
+            baseline_drug_plot_2d_path,
+            dimensions=2,
+            phase_order=baseline_drug_phase_order,
+            title="Baseline-only fit LDA space - baseline plus projected drug only",
+        )
+        output_paths.append(baseline_drug_plot_2d_path)
         baseline_fit_projection = projection.loc[baseline_mask.to_numpy()].copy()
         baseline_fit_projection_path = output_dir / "baseline_space_fit_baseline_projection.csv"
         baseline_fit_projection.to_csv(baseline_fit_projection_path, index=False)
@@ -3282,6 +3770,15 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
             title="Baseline-only fit LDA space 3D - sham/drug projected only",
         )
         output_paths.append(plot_3d_path)
+        baseline_drug_plot_3d_path = output_dir / "baseline_space_baseline_plus_drug_3d.png"
+        plot_baseline_space_projection(
+            baseline_drug_projection,
+            baseline_drug_plot_3d_path,
+            dimensions=3,
+            phase_order=baseline_drug_phase_order,
+            title="Baseline-only fit LDA space 3D - baseline plus projected drug only",
+        )
+        output_paths.append(baseline_drug_plot_3d_path)
         baseline_only_plot_3d_path = output_dir / "baseline_space_fit_baseline_only_3d.png"
         plot_baseline_space_projection(
             baseline_fit_projection,
@@ -3339,15 +3836,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         help=(
-            f"Output folder. Defaults to <run_root>/{DEFAULT_OUTPUT_SUBDIR}, or the common parent "
-            "for multiple inputs. If the folder already exists, interactive runs ask for a suffix."
+            f"Base output folder name. Defaults to a sibling named <run_root>_{DEFAULT_OUTPUT_SUBDIR}, "
+            "or to the common parent for multiple inputs. A unique run suffix is always appended."
         ),
     )
     parser.add_argument(
         "--output-suffix",
         help=(
-            "Text to append to the output folder name if it already exists. "
-            "Useful for non-interactive runs, e.g. --output-suffix channels_12_45."
+            "Required unique text appended to the output folder name for this run. "
+            "Interactive runs prompt when omitted; non-interactive runs must provide it. "
+            "Existing output folders are rejected, e.g. --output-suffix channels_12_45."
         ),
     )
     parser.add_argument("--force-rebuild-population-csv", action="store_true")
@@ -3501,6 +3999,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         skip_lda = not prompt_yes_no("Run LDA clock-hour analysis?", default=not skip_lda)
         skip_tuning_weinan = not prompt_yes_no("Run Tuning_Weinan?", default=not skip_tuning_weinan)
         skip_presentation = not prompt_yes_no("Run presentation summary?", default=not skip_presentation)
+    if skip_lda and skip_tuning_weinan and skip_presentation:
+        raise ValueError("At least one analysis stage must be selected: LDA, tuning, or presentation.")
     if skip_lda:
         selected_threshold_unit_keys = ()
         if args.lda_channels:
@@ -3598,6 +4098,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
 
 
 def run_pipeline(config: PipelineConfig) -> dict:
+    if config.skip_lda and config.skip_tuning_weinan and config.skip_presentation:
+        raise ValueError("At least one analysis stage must be selected: LDA, tuning, or presentation.")
     start_time = time.perf_counter()
     timings: list[dict] = []
     output_dir = resolve_output_dir(config)
@@ -3606,13 +4108,27 @@ def run_pipeline(config: PipelineConfig) -> dict:
         log_status(f"  {run_root}")
     log_status(f"Output folder: {output_dir}")
 
-    with timed_stage("threshold population CSV materialization", timings):
-        population_csv = build_threshold_population_csv(
-            config.run_roots,
-            output_dir,
-            force=not config.reuse_population_csv,
-            selected_unit_keys=config.selected_threshold_unit_keys,
+    population_csv: Path | None = None
+    needs_population_csv = (
+        not config.skip_lda
+        or not config.skip_presentation
+        or bool(config.tuning_baseline_phase_overlays)
+    )
+    if needs_population_csv:
+        include_waveform_features = any(
+            mode in {"FR_WAVEFORM", "WAVEFORM_ONLY"}
+            for mode in config.lda_feature_modes
         )
+        with timed_stage("threshold population CSV materialization", timings):
+            population_csv = build_threshold_population_csv(
+                config.run_roots,
+                output_dir,
+                force=not config.reuse_population_csv,
+                selected_unit_keys=config.selected_threshold_unit_keys,
+                include_waveform_features=include_waveform_features,
+            )
+    else:
+        log_status("Skipping threshold population CSV materialization; tuning-only run does not require it.")
     injection_schedule = None
     marker_stage_label = "treatment marker" if config.analysis_mode == "treatment_markers" else "sham/drug marker"
     needs_injection_schedule = (
@@ -3620,6 +4136,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
         and (not config.skip_lda or bool(config.tuning_baseline_phase_overlays))
     )
     if needs_injection_schedule:
+        if population_csv is None:
+            raise RuntimeError("Injection marker setup requires a threshold population CSV.")
         with timed_stage(f"{marker_stage_label.capitalize()} setup", timings):
             injection_schedule = collect_injection_phase_schedule(population_csv, config, output_dir)
 
@@ -3627,7 +4145,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "input_run_roots": [str(path.resolve()) for path in config.run_roots],
         "output_dir": str(output_dir.resolve()),
         "config": jsonable_config(config),
-        "population_csv": str(population_csv.resolve()),
+        "population_csv": str(population_csv.resolve()) if population_csv is not None else None,
         "lda_output_dirs": [],
         "phase_marker_plots": [],
         "sham_drug_marker_plots": [],
@@ -3643,6 +4161,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
     if config.skip_lda:
         log_status("Skipping LDA by request.")
     else:
+        if population_csv is None:
+            raise RuntimeError("LDA requires a threshold population CSV.")
         with timed_stage("LDA threshold clock-hour analysis", timings):
             lda_dirs = run_lda(population_csv, output_dir, config)
         result["lda_output_dirs"] = [str(path.resolve()) for path in lda_dirs]
@@ -3722,16 +4242,28 @@ def run_pipeline(config: PipelineConfig) -> dict:
     if config.skip_presentation:
         log_status("Skipping threshold presentation summary by request.")
     else:
+        if population_csv is None:
+            raise RuntimeError("Threshold presentation requires a threshold population CSV.")
         with timed_stage("threshold presentation summary", timings):
             result["presentation_manifest"] = str(run_threshold_presentation(population_csv, output_dir).resolve())
 
+    caught_stage_failures = [
+        stage_result
+        for stage_result in [
+            *result["tuning_weinan_results"],
+            result["tuning_baseline_phase_overlay_results"],
+        ]
+        if isinstance(stage_result, dict) and stage_result.get("status") == "failed"
+    ]
+    result["status"] = "completed_with_errors" if caught_stage_failures else "completed"
+    result["n_caught_stage_failures"] = int(len(caught_stage_failures))
     result["elapsed_seconds"] = float(time.perf_counter() - start_time)
     summary_path = output_dir / "threshold_LDA_TuningWN_pre_run_summary.json"
     with timed_stage("write pipeline summary", timings):
         result["timings"] = timings
         summary_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print_runtime_summary(timings, total_elapsed_seconds=float(time.perf_counter() - start_time))
-    log_status(f"Pipeline complete. Summary: {summary_path}")
+    log_status(f"Pipeline status: {result['status']}. Summary: {summary_path}")
     return result
 
 
