@@ -54,7 +54,10 @@ import Tuning_Weinan as tuning_weinan
 _ORIGINAL_TUNING_WEINAN_LOAD_SERIES_FROM_PAIR_DIR = tuning_weinan.load_series_from_pair_dir
 
 DEFAULT_LDA_FEATURE_MODES = ("FR_ONLY", "FR_AMP", "FR_CV2", "FR_PEAK_TO_TROUGH", "MULTI_FEATURE")
+LDA_WAVEFORM_FEATURE_MODES = ("FR_WAVEFORM", "WAVEFORM_ONLY")
+LDA_ALL_SUMMARY_FEATURE_MODE = "FR_AMP_CV2_PEAK_TO_TROUGH"
 DEFAULT_OUTPUT_SUBDIR = "threshold_LDA_TuningWN_pre"
+POPULATION_MANIFEST_VERSION = 2
 PORTABLE_CSV_OUTPUT_PREFIX = "threshold_csvs"
 ANALYSIS_OUTPUT_DIR_NAMES = {
     "LDA_threshold",
@@ -150,11 +153,15 @@ class PipelineConfig:
     selected_threshold_unit_keys: tuple[str, ...] = ()
     analysis_mode: str = "baseline"
     lda_feature_modes: tuple[str, ...] = DEFAULT_LDA_FEATURE_MODES
+    lda_use_waveform_features: bool = False
     min_firing_rate_hz: float = 0.0
+    lda_sample_minutes: int = 60
     min_minutes_per_hour: int = 1
     min_bins_per_label: int = 2
     cv_n_splits: int = 5
     n_permutations: int = 20
+    lda_randomize_labels: bool = False
+    lda_random_seed: int = 42
     apply_zscore: bool = True
     skip_lda: bool = False
     skip_tuning_weinan: bool = False
@@ -187,6 +194,27 @@ def parse_yes_no(raw_text: str, *, default: bool) -> bool:
 def prompt_yes_no(prompt_text: str, *, default: bool) -> bool:
     suffix = " [Y/n]: " if default else " [y/N]: "
     return parse_yes_no(input(prompt_text + suffix), default=default)
+
+
+def prompt_lda_sample_minutes(default: int = 60) -> int:
+    while True:
+        raw = input(
+            f"LDA sample duration in minutes [default {int(default)}]: "
+        ).strip()
+        if not raw:
+            return int(default)
+        try:
+            sample_minutes = int(raw)
+        except ValueError:
+            print("Please enter a whole number of minutes.", flush=True)
+            continue
+        if 1 <= sample_minutes <= 60 and 60 % sample_minutes == 0:
+            return sample_minutes
+        print(
+            "Sample duration must be between 1 and 60 minutes and divide evenly into 60 "
+            "(for example: 1, 2, 5, 10, 15, 20, 30, or 60).",
+            flush=True,
+        )
 
 
 @contextmanager
@@ -482,6 +510,123 @@ def parse_mean_waveform_json(value: object) -> list[float] | None:
     return waveform
 
 
+def detect_waveform_layout(
+    run_roots: tuple[Path, ...],
+    selected_unit_keys: tuple[str, ...] = (),
+) -> dict:
+    selected_set = set(selected_unit_keys)
+    lengths_by_unit: dict[str, int] = {}
+    sampling_rates_hz: set[float] = set()
+    pre_samples_values: set[int] = set()
+    post_samples_values: set[int] = set()
+    portable_roots: list[str] = []
+
+    for run_root in run_roots:
+        run_config = read_run_config(run_root)
+        if run_config.get("output_structure") == "portable_threshold_csv_run_root":
+            portable_roots.append(str(Path(run_root).resolve()))
+        sampling_rate = safe_float(run_config.get("sampling_rate_hz"))
+        pre_samples = safe_int(run_config.get("pre_samples"))
+        post_samples = safe_int(run_config.get("post_samples"))
+        if sampling_rate is not None:
+            sampling_rates_hz.add(float(sampling_rate))
+        if pre_samples is not None:
+            pre_samples_values.add(int(pre_samples))
+        if post_samples is not None:
+            post_samples_values.add(int(post_samples))
+
+        population_csv = Path(run_root) / "threshold_population_minute_features.csv"
+        if population_csv.is_file():
+            columns = pd.read_csv(population_csv, nrows=0).columns
+            for column in columns:
+                match = re.match(r"^(?P<unit>.+)__mean_waveform_uv_s(?P<sample>\d+)$", str(column))
+                if match is None:
+                    continue
+                unit_key = match.group("unit")
+                if selected_set and unit_key not in selected_set:
+                    continue
+                lengths_by_unit[unit_key] = max(
+                    lengths_by_unit.get(unit_key, 0),
+                    int(match.group("sample")) + 1,
+                )
+
+        for pair, pair_dir in discover_threshold_pair_meta(run_root):
+            unit_key = threshold_unit_key_from_dir(pair, pair_dir)
+            if selected_set and unit_key not in selected_set:
+                continue
+            if unit_key in lengths_by_unit:
+                continue
+            for summary_path in minute_summary_paths_for_pair(pair_dir):
+                try:
+                    waveform_series = pd.read_csv(
+                        summary_path,
+                        usecols=["mean_waveform_uv"],
+                        nrows=10,
+                    )["mean_waveform_uv"]
+                except (ValueError, KeyError):
+                    continue
+                for value in waveform_series:
+                    waveform = parse_mean_waveform_json(value)
+                    if waveform:
+                        lengths_by_unit[unit_key] = len(waveform)
+                        break
+                if unit_key in lengths_by_unit:
+                    break
+
+    return {
+        "lengths_by_unit": lengths_by_unit,
+        "sampling_rates_hz": sorted(sampling_rates_hz),
+        "pre_samples_values": sorted(pre_samples_values),
+        "post_samples_values": sorted(post_samples_values),
+        "portable_roots": portable_roots,
+    }
+
+
+def print_waveform_lda_summary(layout: dict) -> None:
+    lengths = sorted(set(layout["lengths_by_unit"].values()))
+    print("\nWaveform LDA feature setup:", flush=True)
+    if lengths:
+        length_text = ", ".join(str(value) for value in lengths)
+        print(
+            f"  Detected mean-waveform length(s): {length_text} samples per threshold unit.",
+            flush=True,
+        )
+    else:
+        print("  No mean_waveform_uv samples were detected in the selected inputs.", flush=True)
+
+    sampling_rates = layout["sampling_rates_hz"]
+    pre_values = layout["pre_samples_values"]
+    post_values = layout["post_samples_values"]
+    if len(sampling_rates) == len(pre_values) == len(post_values) == 1:
+        sampling_rate = float(sampling_rates[0])
+        pre_samples = int(pre_values[0])
+        post_samples = int(post_values[0])
+        print(
+            f"  Window: {pre_samples} samples before + {post_samples} after "
+            f"({pre_samples / sampling_rate * 1000.0:.3g} ms before, "
+            f"{post_samples / sampling_rate * 1000.0:.3g} ms after at "
+            f"{sampling_rate:g} Hz).",
+            flush=True,
+        )
+    print(
+        "  Each waveform time point becomes one LDA feature per threshold unit. "
+        "Minute mean waveforms are averaged into clock-hour samples before LDA.",
+        flush=True,
+    )
+    if lengths:
+        print(
+            f"  Example: {lengths[0]} waveform samples add {lengths[0]} columns per unit; "
+            "FR_WAVEFORM also includes firing rate.",
+            flush=True,
+        )
+    if layout["portable_roots"]:
+        print(
+            "  Portable Threshold_convert_csv.py output detected; its population CSV and "
+            "minute summaries can be used directly.",
+            flush=True,
+        )
+
+
 def default_output_dir(run_roots: tuple[Path, ...]) -> Path:
     if len(run_roots) == 1:
         run_root = Path(run_roots[0])
@@ -674,6 +819,7 @@ def build_threshold_population_csv(
     sample_rows: dict[str, dict] = {}
     unit_rows_by_key: dict[str, dict] = {}
     waveform_lengths_by_unit: dict[str, int] = {}
+    available_units_by_run: dict[str, set[str]] = {}
     skipped_rows = 0
 
     unit_keys = []
@@ -706,9 +852,13 @@ def build_threshold_population_csv(
         unit_rows_by_key[unit_key]["input_run_count"] += 1
         unit_rows_by_key[unit_key]["input_runs"].append(str(run_root_resolved))
         unit_rows_by_key[unit_key]["pair_dirs"].append(str(pair_dir))
+        available_units_by_run.setdefault(str(run_root_resolved), set()).add(unit_key)
         summary_paths = minute_summary_paths_for_pair(pair_dir)
         if not summary_paths:
-            log_status(f"No minute summary CSVs for {unit_key}; falling back to chunk NPZ is not used for LDA CSV.")
+            log_status(
+                f"No minute summary CSVs for {unit_key}; its firing rate will be 0 Hz "
+                "for minutes established by other detectors in this input run."
+            )
             continue
         if pair_position == 1 or pair_position % 25 == 0 or pair_position == total_pair_dirs:
             log_status(
@@ -868,6 +1018,14 @@ def build_threshold_population_csv(
     for column in feature_order:
         if column not in population_df.columns:
             population_df[column] = np.nan
+    zero_filled_firing_rate_values = 0
+    for run_root_text, available_unit_keys in available_units_by_run.items():
+        run_mask = population_df["threshold_run_root"].astype(str) == run_root_text
+        for unit_key in available_unit_keys:
+            firing_rate_column = threshold_feature_columns(unit_key)["firing_rate_hz"]
+            missing_mask = run_mask & population_df[firing_rate_column].isna()
+            zero_filled_firing_rate_values += int(missing_mask.sum())
+            population_df.loc[missing_mask, firing_rate_column] = 0.0
     population_df = population_df.sort_values(["minute_start_datetime", "session_index", "minute_bin_index"])
     population_df["final_sample_id"] = np.arange(1, len(population_df) + 1, dtype=int)
     population_df = population_df[metadata_order + feature_order]
@@ -884,6 +1042,7 @@ def build_threshold_population_csv(
     manifest_json.write_text(
         json.dumps(
             {
+                "manifest_version": POPULATION_MANIFEST_VERSION,
                 "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
                 "input_run_roots": [str(Path(run_root).resolve()) for run_root in run_roots],
                 "selected_threshold_unit_keys": list(selected_unit_keys),
@@ -893,6 +1052,7 @@ def build_threshold_population_csv(
                 "n_minute_samples": int(len(population_df)),
                 "n_recordings": int(population_df["session_key"].nunique()),
                 "skipped_rows_without_recording_datetime": int(skipped_rows),
+                "zero_filled_absent_crossing_firing_rate_values": int(zero_filled_firing_rate_values),
                 "threshold_units": unit_table.to_dict(orient="records"),
             },
             indent=2,
@@ -902,6 +1062,10 @@ def build_threshold_population_csv(
     log_status(
         f"Saved threshold population CSV with {len(population_df)} minute samples "
         f"and {len(unit_table)} threshold units: {population_csv}"
+    )
+    log_status(
+        "Filled absent minute-summary firing rates with 0 Hz for detectors available "
+        f"in that input run ({zero_filled_firing_rate_values} values)."
     )
     return population_csv
 
@@ -922,6 +1086,8 @@ def is_population_csv_reusable(
         manifest = json.loads(manifest_json.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return False, f"manifest could not be read: {exc}"
+    if int(manifest.get("manifest_version", 0)) != POPULATION_MANIFEST_VERSION:
+        return False, "manifest version predates absent-crossing firing-rate zero filling"
 
     requested_roots = [str(Path(path).resolve()) for path in run_roots]
     manifest_roots = [str(Path(path).resolve()) for path in manifest.get("input_run_roots", [])]
@@ -947,18 +1113,26 @@ def run_lda(population_csv: Path, output_dir: Path, config: PipelineConfig) -> l
     lda_config.label_type = "clock_hour_of_day"
     lda_config.feature_modes = tuple(config.lda_feature_modes)
     lda_config.min_firing_rate_hz = float(config.min_firing_rate_hz)
+    lda_config.multi_day_sample_minutes = int(config.lda_sample_minutes)
     lda_config.min_sessions_per_unit = 1
     lda_config.min_minutes_per_hour = int(config.min_minutes_per_hour)
     lda_config.min_bins_per_label = int(config.min_bins_per_label)
     lda_config.cv_n_splits = int(config.cv_n_splits)
     lda_config.n_permutations = int(config.n_permutations)
+    lda_config.randomize_labels = bool(config.lda_randomize_labels)
+    lda_config.random_seed = int(config.lda_random_seed)
     lda_config.apply_zscore = bool(config.apply_zscore)
     lda_config.apply_smoothing = False
     lda_config.separate_hourly_samples_by_run_root = False
     log_status(
         "Starting threshold LDA from precomputed 1-minute population CSV; "
-        "samples are aggregated across all input run roots into real clock-hour bins by "
-        "calendar_day x clock_hour_of_day."
+        f"samples are aggregated into {int(config.lda_sample_minutes)}-minute bins. "
+        + (
+            "Clock-hour labels will be randomly permuted across samples for this "
+            f"sanity-check run (seed {int(config.lda_random_seed)})."
+            if config.lda_randomize_labels
+            else "The LDA class label remains clock_hour_of_day."
+        )
     )
     return [Path(path) for path in lda_threshold.run_pipeline(lda_config)]
 
@@ -2202,10 +2376,10 @@ def annotate_injection_sessions(projection: pd.DataFrame, schedule: dict) -> pd.
     table = projection.copy()
     identities_by_phase = injection_session_identities_by_phase(schedule)
     time_column = (
-        "hour_start_datetime"
-        if "hour_start_datetime" in table.columns
-        else "sample_start_datetime"
+        "sample_start_datetime"
         if "sample_start_datetime" in table.columns
+        else "hour_start_datetime"
+        if "hour_start_datetime" in table.columns
         else None
     )
 
@@ -2251,10 +2425,10 @@ def annotate_injection_sessions(projection: pd.DataFrame, schedule: dict) -> pd.
     for _, row in table.iterrows():
         row_names = row_session_names(row)
         row_start = pd.to_datetime(row.get(time_column), errors="coerce") if time_column else pd.NaT
-        if time_column == "hour_start_datetime":
-            row_end = row_start + pd.Timedelta(hours=1)
-        elif "sample_end_datetime" in row.index:
+        if "sample_end_datetime" in row.index:
             row_end = pd.to_datetime(row.get("sample_end_datetime"), errors="coerce")
+        elif time_column == "hour_start_datetime":
+            row_end = row_start + pd.Timedelta(hours=1)
         else:
             row_end = row_start
 
@@ -2264,9 +2438,7 @@ def annotate_injection_sessions(projection: pd.DataFrame, schedule: dict) -> pd.
                 injection_start = pd.to_datetime(identity["start"], errors="coerce")
                 if pd.isna(row_start) or pd.isna(injection_start):
                     continue
-                if time_column == "hour_start_datetime":
-                    contains_start = row_start <= injection_start < row_end
-                elif pd.notna(row_end) and row_end > row_start:
+                if pd.notna(row_end) and row_end > row_start:
                     contains_start = row_start <= injection_start < row_end
                 else:
                     contains_start = row_start == injection_start
@@ -2367,7 +2539,7 @@ def draw_calendar_day_trajectories(
     time_column = next(
         (
             column
-            for column in ("hour_start_datetime", "sample_start_datetime", "minute_start_datetime")
+            for column in ("sample_start_datetime", "hour_start_datetime", "minute_start_datetime")
             if column in table.columns
         ),
         None,
@@ -2438,7 +2610,7 @@ def trajectory_legend_handles(projection: pd.DataFrame) -> list[Line2D]:
     time_column = next(
         (
             column
-            for column in ("hour_start_datetime", "sample_start_datetime", "minute_start_datetime")
+            for column in ("sample_start_datetime", "hour_start_datetime", "minute_start_datetime")
             if column in table.columns
         ),
         None,
@@ -2508,10 +2680,23 @@ def add_phase_markers_to_lda_outputs(lda_dirs: list[Path], schedule: dict) -> li
         if not projection_csv.exists():
             continue
         projection = pd.read_csv(projection_csv)
-        time_column = "hour_start_datetime" if "hour_start_datetime" in projection.columns else "sample_start_datetime"
+        time_column = (
+            "sample_start_datetime"
+            if "sample_start_datetime" in projection.columns
+            else "hour_start_datetime"
+        )
         if time_column not in projection.columns or "LD1" not in projection.columns:
             continue
-        marker_interval_duration = pd.Timedelta(hours=1) if time_column == "hour_start_datetime" else pd.Timedelta(0)
+        marker_interval_duration = (
+            pd.to_timedelta(
+                pd.to_numeric(projection["sample_duration_minutes"], errors="coerce").median(),
+                unit="m",
+            )
+            if "sample_duration_minutes" in projection.columns
+            else pd.Timedelta(hours=1)
+            if time_column == "hour_start_datetime"
+            else pd.Timedelta(0)
+        )
         projection["injection_phase"] = assign_injection_phase_for_times(
             projection[time_column],
             schedule,
@@ -3497,11 +3682,16 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
     phase_order = [phase for phase in schedule.get("phase_order", PHASE_ORDER) if str(phase)]
     for output_dir in lda_dirs:
         output_dir = Path(output_dir)
-        raw_population_csv = output_dir / "lda_hour_raw_population_vectors.csv"
+        raw_population_candidates = sorted(output_dir.glob("lda_*_raw_population_vectors.csv"))
+        raw_population_csv = (
+            raw_population_candidates[0]
+            if len(raw_population_candidates) == 1
+            else output_dir / "lda_hour_raw_population_vectors.csv"
+        )
         if not raw_population_csv.exists():
             log_status(
-                f"Skipping baseline-only marker LDA for {output_dir}; missing {raw_population_csv.name}. "
-                "Rerun LDA with the updated LDA_weinan.py so raw hourly vectors are saved."
+                f"Skipping baseline-only marker LDA for {output_dir}; no raw sample population "
+                "vector CSV was found. Rerun LDA with the updated LDA_weinan.py."
             )
             continue
         table = pd.read_csv(raw_population_csv)
@@ -3509,14 +3699,28 @@ def add_baseline_only_marker_lda_outputs(lda_dirs: list[Path], schedule: dict) -
         if not feature_columns:
             log_status(f"Skipping baseline-only marker LDA for {output_dir}; no feature_* columns found.")
             continue
-        time_column = "hour_start_datetime" if "hour_start_datetime" in table.columns else "sample_start_datetime"
+        time_column = (
+            "sample_start_datetime"
+            if "sample_start_datetime" in table.columns
+            else "hour_start_datetime"
+        )
         if time_column not in table.columns:
             log_status(f"Skipping baseline-only marker LDA for {output_dir}; no sample time column found.")
             continue
+        sample_interval_duration = (
+            pd.to_timedelta(
+                pd.to_numeric(table["sample_duration_minutes"], errors="coerce").median(),
+                unit="m",
+            )
+            if "sample_duration_minutes" in table.columns
+            else pd.Timedelta(hours=1)
+            if time_column == "hour_start_datetime"
+            else pd.Timedelta(0)
+        )
         table["injection_phase"] = assign_injection_phase_for_times(
             table[time_column],
             schedule,
-            interval_duration=pd.Timedelta(hours=1) if time_column == "hour_start_datetime" else pd.Timedelta(0),
+            interval_duration=sample_interval_duration,
         )
         labels = pd.to_numeric(table["clock_hour_of_day"], errors="coerce")
         baseline_phase_mask = (table["injection_phase"].astype(str) == "baseline") & labels.notna()
@@ -3799,6 +4003,34 @@ def parse_feature_modes(raw_value: str | None) -> tuple[str, ...]:
     return tuple(part.strip().upper() for part in raw_value.split(",") if part.strip())
 
 
+def configure_lda_feature_modes(
+    feature_modes: tuple[str, ...],
+    *,
+    use_waveform_features: bool,
+    add_waveform_modes: bool,
+) -> tuple[str, ...]:
+    normalized_modes = list(dict.fromkeys(str(mode).strip().upper() for mode in feature_modes if str(mode).strip()))
+    if use_waveform_features:
+        if add_waveform_modes:
+            for mode in (LDA_ALL_SUMMARY_FEATURE_MODE, *LDA_WAVEFORM_FEATURE_MODES):
+                if mode not in normalized_modes:
+                    normalized_modes.append(mode)
+        return tuple(normalized_modes)
+
+    filtered_modes = [
+        mode
+        for mode in normalized_modes
+        if mode not in LDA_WAVEFORM_FEATURE_MODES
+    ]
+    if filtered_modes:
+        return tuple(filtered_modes)
+    log_status(
+        "Waveform LDA features are disabled, but all requested feature modes require "
+        "waveforms; falling back to FR_ONLY."
+    )
+    return ("FR_ONLY",)
+
+
 def select_threshold_units_by_channels(run_roots: tuple[Path, ...], channel_text: str) -> tuple[str, ...]:
     options = discover_threshold_unit_options(run_roots)
     by_channel: dict[int, list[dict]] = {}
@@ -3826,12 +4058,22 @@ def parse_args() -> argparse.Namespace:
             "Threshold_channel.py threshold_crossings outputs."
         )
     )
-    parser.add_argument("run_roots", nargs="*", help="One or more threshold_crossings_* run folders")
+    parser.add_argument(
+        "run_roots",
+        nargs="*",
+        help=(
+            "One or more threshold_crossings_* run folders, or portable output folders "
+            "created by Threshold_convert_csv.py."
+        ),
+    )
     parser.add_argument(
         "--run-root",
         dest="run_root_opts",
         action="append",
-        help="threshold_crossings_* run folder. May be repeated; comma/semicolon-separated values are accepted.",
+        help=(
+            "threshold_crossings_* run folder or Threshold_convert_csv.py portable output "
+            "folder. May be repeated; comma/semicolon-separated values are accepted."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -3914,12 +4156,65 @@ def parse_args() -> argparse.Namespace:
             "drug_saline/sham_caf/drug_caf."
         ),
     )
-    parser.add_argument("--lda-feature-modes", help="Comma-separated LDA feature modes")
+    parser.add_argument(
+        "--lda-feature-modes",
+        help=(
+            "Comma-separated LDA feature modes. "
+            "FR_AMP_CV2_PEAK_TO_TROUGH uses all four non-waveform summary features. "
+            "Supported waveform modes are FR_WAVEFORM and WAVEFORM_ONLY."
+        ),
+    )
+    parser.add_argument(
+        "--lda-use-waveform-features",
+        choices=["ask", "yes", "no"],
+        default="ask",
+        help=(
+            "Whether to add mean waveform samples from threshold minute summaries as "
+            "LDA features. With yes, the default modes retain a combined summary-only mode, "
+            "add FR_WAVEFORM and WAVEFORM_ONLY, and MULTI_FEATURE includes summary plus "
+            "waveform samples."
+        ),
+    )
     parser.add_argument("--min-firing-rate-hz", type=float, default=0.0)
-    parser.add_argument("--min-minutes-per-hour", type=int, default=1)
+    parser.add_argument(
+        "--lda-sample-minutes",
+        type=int,
+        default=None,
+        help=(
+            "Duration of each multi-day LDA population sample in minutes. "
+            "Must divide evenly into 60; use 10 for six samples per clock hour. "
+            "Interactive runs prompt when omitted; the default is 60."
+        ),
+    )
+    parser.add_argument(
+        "--min-minutes-per-hour",
+        "--min-minutes-per-sample",
+        dest="min_minutes_per_hour",
+        type=int,
+        default=1,
+        help=(
+            "Minimum number of source one-minute rows required in each aggregated LDA sample. "
+            "The --min-minutes-per-hour name is retained for compatibility."
+        ),
+    )
     parser.add_argument("--min-bins-per-label", type=int, default=2)
     parser.add_argument("--cv-n-splits", type=int, default=5)
     parser.add_argument("--n-permutations", type=int, default=20)
+    parser.add_argument(
+        "--lda-randomize-labels",
+        choices=["ask", "yes", "no"],
+        default="ask",
+        help=(
+            "Run only a negative-control LDA with clock-hour labels randomly permuted "
+            "across samples. Interactive runs ask by default."
+        ),
+    )
+    parser.add_argument(
+        "--lda-random-seed",
+        type=int,
+        default=42,
+        help="Random seed used for the randomized-label sanity-check LDA.",
+    )
     parser.add_argument("--no-zscore", action="store_true")
     parser.add_argument("--lda-channels", help="SG channel selection for LDA, e.g. '12,45,337' or 'all'.")
     parser.add_argument("--sham-sessions", help="Comma/semicolon-separated sham recording IDs, names, or tokens.")
@@ -4020,7 +4315,62 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         log_status("Non-interactive mode: using all discovered threshold channels for LDA.")
     else:
         selected_threshold_unit_keys = prompt_threshold_units_for_lda(run_roots)
+    randomize_choice = str(args.lda_randomize_labels)
+    if skip_lda:
+        lda_randomize_labels = False
+    elif randomize_choice == "yes":
+        lda_randomize_labels = True
+    elif randomize_choice == "no" or bool(args.non_interactive):
+        lda_randomize_labels = False
+    else:
+        print("\nLDA label setup:", flush=True)
+        lda_randomize_labels = prompt_yes_no(
+            "Randomize clock-hour labels for a sanity check instead of running normal-label LDA?",
+            default=False,
+        )
+    lda_feature_modes = parse_feature_modes(args.lda_feature_modes)
+    waveform_choice = str(args.lda_use_waveform_features)
+    requested_waveform_mode = any(
+        mode in LDA_WAVEFORM_FEATURE_MODES
+        for mode in lda_feature_modes
+    )
+    waveform_layout = detect_waveform_layout(
+        run_roots,
+        selected_unit_keys=selected_threshold_unit_keys,
+    )
+    if skip_lda:
+        use_waveform_features = False
+    elif waveform_choice == "yes":
+        use_waveform_features = True
+    elif waveform_choice == "no":
+        use_waveform_features = False
+    elif bool(args.non_interactive):
+        use_waveform_features = requested_waveform_mode
+    else:
+        print_waveform_lda_summary(waveform_layout)
+        use_waveform_features = prompt_yes_no(
+            "Add the per-minute mean waveform samples to LDA?",
+            default=requested_waveform_mode,
+        )
+    if use_waveform_features and not waveform_layout["lengths_by_unit"]:
+        raise RuntimeError(
+            "Waveform LDA features were requested, but no mean_waveform_uv data were "
+            "found in the selected threshold inputs. Re-run Threshold_channel.py with "
+            "waveform summaries, or use a Threshold_convert_csv.py portable folder that "
+            "contains mean_waveform_uv in its per-unit minute summary CSVs."
+        )
+    lda_feature_modes = configure_lda_feature_modes(
+        lda_feature_modes,
+        use_waveform_features=use_waveform_features,
+        add_waveform_modes=args.lda_feature_modes is None,
+    )
     marker_choice = str(args.lda_baseline_sham_drug)
+    if lda_randomize_labels and marker_choice != "no":
+        log_status(
+            "Randomized-label LDA selected; disabling injection-marker and baseline-only "
+            "LDA additions for this negative-control run."
+        )
+        marker_choice = "no"
     injection_label_mode = str(args.lda_injection_label_mode)
     baseline_only_marker_lda = False
     tuning_baseline_phase_overlays = False
@@ -4040,6 +4390,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
             )
 
     analysis_mode = str(args.analysis_mode)
+    if lda_randomize_labels:
+        analysis_mode = "baseline"
     marker_mode_requested = marker_choice == "yes" or analysis_mode in {"sham_drug_markers", "treatment_markers"}
     if marker_mode_requested:
         if marker_choice == "yes":
@@ -4066,18 +4418,36 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
             )
     elif marker_choice == "no":
         analysis_mode = "baseline"
+    if args.lda_sample_minutes is not None:
+        lda_sample_minutes = int(args.lda_sample_minutes)
+    elif not skip_lda and not bool(args.non_interactive):
+        print("\nLDA sample setup:", flush=True)
+        lda_sample_minutes = prompt_lda_sample_minutes(default=60)
+    else:
+        lda_sample_minutes = 60
+    if lda_sample_minutes < 1 or lda_sample_minutes > 60 or 60 % lda_sample_minutes != 0:
+        raise ValueError("--lda-sample-minutes must be between 1 and 60 and divide evenly into 60.")
+    if int(args.min_minutes_per_hour) > lda_sample_minutes:
+        raise ValueError(
+            "--min-minutes-per-hour cannot exceed --lda-sample-minutes. "
+            "It is the minimum number of source minute rows required in each LDA sample."
+        )
     return PipelineConfig(
         run_roots=run_roots,
         output_dir=Path(args.output_dir) if args.output_dir else None,
         output_suffix=str(args.output_suffix) if args.output_suffix else None,
         selected_threshold_unit_keys=selected_threshold_unit_keys,
         analysis_mode=analysis_mode,
-        lda_feature_modes=parse_feature_modes(args.lda_feature_modes),
+        lda_feature_modes=lda_feature_modes,
+        lda_use_waveform_features=bool(use_waveform_features),
         min_firing_rate_hz=float(args.min_firing_rate_hz),
+        lda_sample_minutes=lda_sample_minutes,
         min_minutes_per_hour=int(args.min_minutes_per_hour),
         min_bins_per_label=int(args.min_bins_per_label),
         cv_n_splits=int(args.cv_n_splits),
         n_permutations=int(args.n_permutations),
+        lda_randomize_labels=bool(lda_randomize_labels),
+        lda_random_seed=int(args.lda_random_seed),
         apply_zscore=not bool(args.no_zscore),
         skip_lda=skip_lda,
         skip_tuning_weinan=skip_tuning_weinan,
@@ -4115,10 +4485,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         or bool(config.tuning_baseline_phase_overlays)
     )
     if needs_population_csv:
-        include_waveform_features = any(
-            mode in {"FR_WAVEFORM", "WAVEFORM_ONLY"}
-            for mode in config.lda_feature_modes
-        )
+        include_waveform_features = bool(config.lda_use_waveform_features)
         with timed_stage("threshold population CSV materialization", timings):
             population_csv = build_threshold_population_csv(
                 config.run_roots,

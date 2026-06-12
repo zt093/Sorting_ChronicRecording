@@ -16,7 +16,8 @@ multi_day_hourly
 Each sample is a time bin or hourly aggregate. Each feature column is one
 aligned unit-feature pair, such as one unit group's firing rate, amplitude, CV2,
 or peak-to-trough width. Feature modes choose which columns enter LDA:
-FR_ONLY, FR_AMP, FR_CV2, FR_PEAK_TO_TROUGH, or MULTI_FEATURE.
+FR_ONLY, FR_AMP, FR_CV2, FR_PEAK_TO_TROUGH,
+FR_AMP_CV2_PEAK_TO_TROUGH, or MULTI_FEATURE.
 
 Firing-rate features are computed from binned spike counts divided by bin
 duration. Average amplitude is binned from per-spike amplitudes when the
@@ -77,6 +78,7 @@ APPLY_ZSCORE = True
 APPLY_SMOOTHING = False
 SMOOTHING_SIGMA_BINS = 1.0
 HOURLY_WAVEFORM_WEIGHTING = "minute"  # "minute" or "crossing_count"
+MULTI_DAY_SAMPLE_MINUTES = 60
 
 MIN_SESSIONS_PER_UNIT = 48
 MIN_BINS_PER_LABEL = 2
@@ -153,11 +155,13 @@ class Config:
     apply_smoothing: bool = APPLY_SMOOTHING
     smoothing_sigma_bins: float = SMOOTHING_SIGMA_BINS
     hourly_waveform_weighting: str = HOURLY_WAVEFORM_WEIGHTING
+    multi_day_sample_minutes: int = MULTI_DAY_SAMPLE_MINUTES
     separate_hourly_samples_by_run_root: bool = True
     min_sessions_per_unit: int = MIN_SESSIONS_PER_UNIT
     min_bins_per_label: int = MIN_BINS_PER_LABEL
     cv_n_splits: int = CV_N_SPLITS
     random_seed: int = RANDOM_SEED
+    randomize_labels: bool = False
     feature_modes: tuple[str, ...] = FEATURE_MODES
     min_minutes_per_hour: int = MIN_MINUTES_PER_HOUR
     n_permutations: int = N_PERMUTATIONS
@@ -1094,18 +1098,41 @@ def print_clock_hour_sample_pivot(metadata_table: pd.DataFrame, title: str) -> p
 
 
 def print_lda_label_vector(metadata_table: pd.DataFrame, labels: np.ndarray, label_column: str) -> None:
-    label_table = metadata_table[
-        [
-            "final_sample_id",
-            "final_sample_key",
-            "calendar_day",
-            "clock_hour_of_day",
-        ]
-    ].copy()
+    label_columns = [
+        "final_sample_id",
+        "final_sample_key",
+        "calendar_day",
+        f"original_{label_column}",
+        label_column,
+    ]
+    label_columns = list(
+        dict.fromkeys(column for column in label_columns if column in metadata_table.columns)
+    )
+    label_table = metadata_table[label_columns].copy()
     label_table["lda_label"] = labels
     log_status(f"Exact LDA y vector uses label column: {label_column}")
     print(label_table.to_string(index=False), flush=True)
     log_status(f"Exact y vector: {labels.tolist()}")
+
+
+def randomize_lda_labels(
+    metadata_table: pd.DataFrame,
+    labels: np.ndarray,
+    *,
+    label_column: str,
+    random_seed: int,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    randomized_metadata = metadata_table.copy()
+    original_labels = np.asarray(labels).copy()
+    randomized_labels = np.random.default_rng(int(random_seed)).permutation(original_labels)
+    randomized_metadata[f"original_{label_column}"] = original_labels
+    randomized_metadata[label_column] = randomized_labels
+    randomized_metadata["label_randomization_seed"] = int(random_seed)
+    log_status(
+        f"Randomized {label_column} labels across {len(randomized_labels)} samples "
+        f"with seed {int(random_seed)}; class counts are preserved."
+    )
+    return randomized_metadata, randomized_labels
 
 
 def build_date_label_from_session_table(session_table: pd.DataFrame) -> str:
@@ -1260,6 +1287,7 @@ def normalize_feature_modes(feature_modes: tuple[str, ...] | list[str] | str) ->
         "FR_AMP",
         "FR_CV2",
         "FR_PEAK_TO_TROUGH",
+        "FR_AMP_CV2_PEAK_TO_TROUGH",
         "FR_WAVEFORM",
         "WAVEFORM_ONLY",
         "MULTI_FEATURE",
@@ -1294,6 +1322,12 @@ def subset_features_for_mode(
         "FR_AMP": {"firing_rate_hz", "average_amplitude_uv"},
         "FR_CV2": {"firing_rate_hz", "cv2"},
         "FR_PEAK_TO_TROUGH": {"firing_rate_hz", "peak_to_trough_ms"},
+        "FR_AMP_CV2_PEAK_TO_TROUGH": {
+            "firing_rate_hz",
+            "average_amplitude_uv",
+            "cv2",
+            "peak_to_trough_ms",
+        },
         "FR_WAVEFORM": {"firing_rate_hz"},
         "WAVEFORM_ONLY": set(),
         "MULTI_FEATURE": None,
@@ -1338,7 +1372,7 @@ def filter_hourly_samples_by_min_minutes(
     config: Config,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     if "n_available_minutes_used" not in metadata_table.columns:
-        raise KeyError("Hourly metadata is missing n_available_minutes_used.")
+        raise KeyError("Aggregated metadata is missing n_available_minutes_used.")
     keep_mask = (
         metadata_table["n_available_minutes_used"].fillna(0).astype(int)
         >= int(config.min_minutes_per_hour)
@@ -1347,7 +1381,7 @@ def filter_hourly_samples_by_min_minutes(
     filtered_metadata = metadata_table.loc[keep_mask].reset_index(drop=True)
     if filtered_metadata.empty:
         raise RuntimeError(
-            "No hourly samples remained after applying MIN_MINUTES_PER_HOUR. "
+            "No aggregated samples remained after applying MIN_MINUTES_PER_HOUR. "
             "Lower MIN_MINUTES_PER_HOUR or check the minute-bin coverage."
         )
     return filtered_population, filtered_metadata
@@ -2002,12 +2036,18 @@ def aggregate_minutes_to_hourly_samples(
     feature_table: pd.DataFrame | None = None,
     waveform_weighting: str = "minute",
     separate_by_run_root: bool = True,
+    sample_minutes: int = 60,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     if minute_population_matrix.shape[0] != len(minute_metadata_table):
         raise ValueError("Minute population matrix row count does not match the minute metadata length.")
 
     if minute_population_matrix.size == 0:
         raise RuntimeError("No minute-level population vectors are available for hourly aggregation.")
+    sample_minutes = int(sample_minutes)
+    if sample_minutes < 1 or sample_minutes > 60:
+        raise ValueError("sample_minutes must be between 1 and 60.")
+    if 60 % sample_minutes != 0:
+        raise ValueError("sample_minutes must divide evenly into 60 minutes.")
 
     normalized_weighting = str(waveform_weighting or "minute").strip().lower()
     if normalized_weighting not in {"minute", "crossing_count"}:
@@ -2047,6 +2087,11 @@ def aggregate_minutes_to_hourly_samples(
         ],
         axis=1,
     )
+    minute_datetimes = pd.to_datetime(minute_df["minute_start_datetime"], errors="coerce")
+    if minute_datetimes.isna().any():
+        raise ValueError("Minute metadata contains invalid minute_start_datetime values.")
+    minute_of_day = minute_datetimes.dt.hour * 60 + minute_datetimes.dt.minute
+    minute_df["sample_bin_index_of_day"] = (minute_of_day // sample_minutes).astype(int)
 
     hourly_vectors: list[np.ndarray] = []
     hourly_rows: list[dict] = []
@@ -2057,8 +2102,10 @@ def aggregate_minutes_to_hourly_samples(
             for column in ("threshold_run_name", "threshold_run_root")
             if column in minute_df.columns and minute_df[column].nunique(dropna=False) > 1
         ]
-    grouping_keys = extra_grouping_keys + ["calendar_day", "clock_hour_of_day"]
-    log_status(f"Hourly aggregation grouping keys: {grouping_keys}")
+    grouping_keys = extra_grouping_keys + ["calendar_day", "sample_bin_index_of_day"]
+    log_status(
+        f"Multi-day aggregation grouping keys ({sample_minutes}-minute samples): {grouping_keys}"
+    )
     grouped = minute_df.groupby(grouping_keys, sort=True, dropna=False)
     total_groups = len(grouped)
 
@@ -2067,9 +2114,15 @@ def aggregate_minutes_to_hourly_samples(
             group_values = (group_values,)
         group_lookup = dict(zip(grouping_keys, group_values))
         calendar_day = group_lookup["calendar_day"]
-        clock_hour_of_day = group_lookup["clock_hour_of_day"]
+        sample_bin_index_of_day = int(group_lookup["sample_bin_index_of_day"])
+        sample_start_minute_of_day = sample_bin_index_of_day * sample_minutes
+        sample_start_datetime = pd.Timestamp(calendar_day) + pd.Timedelta(
+            minutes=sample_start_minute_of_day
+        )
+        sample_end_datetime = sample_start_datetime + pd.Timedelta(minutes=sample_minutes)
+        clock_hour_of_day = int(sample_start_datetime.hour)
         if group_index == 1 or group_index % 100 == 0 or group_index == total_groups:
-            log_status(f"Aggregating hourly samples: group {group_index} / {total_groups}")
+            log_status(f"Aggregating samples: group {group_index} / {total_groups}")
 
         if normalized_weighting == "minute" or not waveform_feature_to_weight_column:
             feature_values = group_table[feature_columns].to_numpy(dtype=float)
@@ -2114,7 +2167,15 @@ def aggregate_minutes_to_hourly_samples(
             if safe_int(value) is not None
         )
         n_unique_clock_minutes_present = len(unique_clock_minutes_present)
-        n_missing_clock_minutes = max(0, 60 - n_unique_clock_minutes_present)
+        expected_clock_minutes = {
+            int((sample_start_minute_of_day + offset) % 60)
+            for offset in range(sample_minutes)
+        }
+        n_expected_minutes = sample_minutes
+        n_missing_clock_minutes = max(
+            0,
+            n_expected_minutes - len(expected_clock_minutes.intersection(unique_clock_minutes_present)),
+        )
         run_key_parts = [
             safe_slug(group_lookup[column])
             for column in extra_grouping_keys
@@ -2128,10 +2189,17 @@ def aggregate_minutes_to_hourly_samples(
         hourly_row.update(
             {
                 "final_sample_id": int(group_index),
-                "final_sample_key": f"{sample_key_prefix}__hour_{int(clock_hour_of_day):02d}",
+                "final_sample_key": (
+                    f"{sample_key_prefix}__bin_{sample_start_datetime.strftime('%H%M')}"
+                ),
                 "calendar_day": str(calendar_day),
                 "clock_hour_of_day": int(clock_hour_of_day),
-                "hour_start_datetime": f"{calendar_day} {int(clock_hour_of_day):02d}:00:00",
+                "clock_minute_of_hour": int(sample_start_datetime.minute),
+                "sample_bin_index_of_day": int(sample_bin_index_of_day),
+                "sample_start_datetime": sample_start_datetime.isoformat(sep=" "),
+                "sample_end_datetime": sample_end_datetime.isoformat(sep=" "),
+                "sample_duration_minutes": int(sample_minutes),
+                "hour_start_datetime": sample_start_datetime.isoformat(sep=" "),
                 "n_available_minutes_used": int(n_unique_clock_minutes_present),
                 "n_minute_rows_used": int(len(sorted_group)),
                 "n_unique_clock_minutes_present": int(n_unique_clock_minutes_present),
@@ -2160,11 +2228,12 @@ def aggregate_minutes_to_hourly_samples(
     if duplicate_sample_keys.any():
         duplicate_keys = hourly_metadata_table.loc[duplicate_sample_keys, "final_sample_key"].tolist()
         raise RuntimeError(
-            "Hourly aggregation produced duplicate day x hour sample keys, which indicates "
+            "Multi-day aggregation produced duplicate sample keys, which indicates "
             f"unexpected collapsing logic: {duplicate_keys[:10]}"
         )
     log_status(
-        f"Finished hourly aggregation: created {hourly_population_matrix.shape[0]} day x hour samples"
+        f"Finished aggregation: created {hourly_population_matrix.shape[0]} "
+        f"{sample_minutes}-minute samples"
     )
     return hourly_population_matrix, hourly_metadata_table
 
@@ -2246,6 +2315,7 @@ def hourly_aggregation_cache_payload(
         "csv_mtime_ns": csv_mtime_ns,
         "lda_mode": str(config.lda_mode),
         "min_firing_rate_hz": float(config.min_firing_rate_hz),
+        "multi_day_sample_minutes": int(config.multi_day_sample_minutes),
         "hourly_waveform_weighting": str(config.hourly_waveform_weighting),
         "separate_hourly_samples_by_run_root": bool(config.separate_hourly_samples_by_run_root),
         "n_features": int(len(feature_table)),
@@ -2328,7 +2398,19 @@ def filter_unit_groups_by_binned_firing_rate(
     if not firing_rate_mask.any():
         raise RuntimeError("No firing-rate feature columns were defined for thresholding.")
 
-    mean_binned_firing_rates = population_matrix[:, firing_rate_mask.to_numpy()].mean(axis=0)
+    firing_rate_values = population_matrix[:, firing_rate_mask.to_numpy()]
+    finite_firing_rate_counts = np.isfinite(firing_rate_values).sum(axis=0)
+    finite_firing_rate_sums = np.where(
+        np.isfinite(firing_rate_values),
+        firing_rate_values,
+        0.0,
+    ).sum(axis=0)
+    mean_binned_firing_rates = np.divide(
+        finite_firing_rate_sums,
+        finite_firing_rate_counts,
+        out=np.full(firing_rate_values.shape[1], np.nan, dtype=float),
+        where=finite_firing_rate_counts > 0,
+    )
     firing_rate_groups = ordered_feature_table.loc[
         firing_rate_mask,
         ["final_group_key", "final_unit_id", "shank_id", "local_channel_on_shank"],
@@ -2365,17 +2447,32 @@ def filter_unit_groups_by_binned_firing_rate(
 
 
 def print_and_build_clock_hour_verification(metadata_table: pd.DataFrame) -> pd.DataFrame:
-    verification_table = metadata_table[
-        [
-            "final_sample_key",
-            "calendar_day",
-            "clock_hour_of_day",
-            "n_available_minutes_used",
-            "n_missing_clock_minutes",
-            "any_minutes_missing",
-        ]
-    ].copy().sort_values(["calendar_day", "clock_hour_of_day"], na_position="last").reset_index(drop=True)
-    log_status("Hourly aggregation verification preview (first 20 rows):")
+    verification_columns = [
+        "final_sample_key",
+        "calendar_day",
+        "clock_hour_of_day",
+        "clock_minute_of_hour",
+        "sample_start_datetime",
+        "sample_duration_minutes",
+        "n_available_minutes_used",
+        "n_missing_clock_minutes",
+        "any_minutes_missing",
+    ]
+    verification_columns = [
+        column for column in verification_columns if column in metadata_table.columns
+    ]
+    sort_columns = [
+        column
+        for column in ("sample_start_datetime", "calendar_day", "clock_hour_of_day")
+        if column in metadata_table.columns
+    ]
+    verification_table = (
+        metadata_table[verification_columns]
+        .copy()
+        .sort_values(sort_columns, na_position="last")
+        .reset_index(drop=True)
+    )
+    log_status("Aggregated-sample verification preview (first 20 rows):")
     if verification_table.empty:
         log_status("No verification rows available.")
     else:
@@ -2506,16 +2603,30 @@ def evaluate_decoding(
 # -----------------------------------------------------------------------------
 
 
+def projection_trajectory_sort_columns(metadata_table: pd.DataFrame) -> list[str]:
+    preferred_columns = (
+        "sample_start_datetime",
+        "hour_start_datetime",
+        "minute_start_datetime",
+        "session_id",
+        "minute_bin_index",
+        "sample_bin_index_of_day",
+        "clock_hour_of_day",
+        "clock_minute_of_hour",
+    )
+    return [
+        column
+        for column in preferred_columns
+        if column in metadata_table.columns
+    ]
+
+
 def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(10, 8))
     hours = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
     calendar_days = metadata_table["calendar_day"].astype(str).to_numpy()
     unique_calendar_days = pd.unique(calendar_days)
-    sort_columns = ["clock_hour_of_day"]
-    if "sample_start_datetime" in metadata_table.columns:
-        sort_columns = ["sample_start_datetime", "session_id", "minute_bin_index"]
-    elif "hour_start_datetime" in metadata_table.columns:
-        sort_columns = ["hour_start_datetime"]
+    sort_columns = projection_trajectory_sort_columns(metadata_table)
 
     x_values = projection[:, 0]
     y_values = projection[:, 1] if projection.shape[1] >= 2 else np.zeros(len(projection))
@@ -2523,7 +2634,9 @@ def plot_lda_2d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
     if len(unique_calendar_days) > 1:
         for calendar_day in unique_calendar_days:
             mask = calendar_days == calendar_day
-            session_points = metadata_table.loc[mask].sort_values(sort_columns)
+            session_points = metadata_table.loc[mask]
+            if sort_columns:
+                session_points = session_points.sort_values(sort_columns)
             if len(session_points) < 2:
                 continue
             point_indices = session_points.index.to_numpy()
@@ -2576,11 +2689,7 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
     hours = metadata_table["clock_hour_of_day"].to_numpy(dtype=float)
     calendar_days = metadata_table["calendar_day"].astype(str).to_numpy()
     unique_calendar_days = pd.unique(calendar_days)
-    sort_columns = ["clock_hour_of_day"]
-    if "sample_start_datetime" in metadata_table.columns:
-        sort_columns = ["sample_start_datetime", "session_id", "minute_bin_index"]
-    elif "hour_start_datetime" in metadata_table.columns:
-        sort_columns = ["hour_start_datetime"]
+    sort_columns = projection_trajectory_sort_columns(metadata_table)
 
     x_values = projection[:, 0]
     y_values = projection[:, 1] if projection.shape[1] >= 2 else np.zeros(len(projection))
@@ -2589,7 +2698,9 @@ def plot_lda_3d(projection: np.ndarray, metadata_table: pd.DataFrame, output_pat
     if len(unique_calendar_days) > 1:
         for calendar_day in unique_calendar_days:
             mask = calendar_days == calendar_day
-            session_points = metadata_table.loc[mask].sort_values(sort_columns)
+            session_points = metadata_table.loc[mask]
+            if sort_columns:
+                session_points = session_points.sort_values(sort_columns)
             if len(session_points) < 2:
                 continue
             point_indices = session_points.index.to_numpy()
@@ -2935,13 +3046,33 @@ def save_outputs(
     )
     if config.lda_mode == "single_day_5min":
         file_stem = f"{file_stem}_single_day_5min"
+    elif int(config.multi_day_sample_minutes) != 60:
+        file_stem = f"{file_stem}_{int(config.multi_day_sample_minutes)}min_samples"
+    if config.randomize_labels:
+        file_stem = f"{file_stem}_randomized_labels_seed{int(config.random_seed)}"
     output_dir = config.output_base_dir / file_stem
     output_dir.mkdir(parents=True, exist_ok=True)
     log_status(f"Saving output files to: {output_dir}")
     file_prefix = "lda"
-    sample_output_name = "hour" if config.lda_mode == "multi_day_hourly" else "5min"
+    sample_output_name = (
+        "hour"
+        if config.lda_mode == "multi_day_hourly" and int(config.multi_day_sample_minutes) == 60
+        else (
+            f"{int(config.multi_day_sample_minutes)}min"
+            if config.lda_mode == "multi_day_hourly"
+            else "5min"
+        )
+    )
     binned_output_name = "minute" if config.lda_mode == "multi_day_hourly" else "5min_raw_bin"
-    verification_output_name = "hourly" if config.lda_mode == "multi_day_hourly" else "5min"
+    verification_output_name = (
+        "hourly"
+        if config.lda_mode == "multi_day_hourly" and int(config.multi_day_sample_minutes) == 60
+        else (
+            f"{int(config.multi_day_sample_minutes)}min"
+            if config.lda_mode == "multi_day_hourly"
+            else "5min"
+        )
+    )
 
     population_columns = feature_table["feature_column"].astype(str).tolist()
     binned_population_df = pd.DataFrame(binned_population_matrix, columns=population_columns)
@@ -3071,7 +3202,7 @@ def save_outputs(
 
     hourly_aggregation_grouping_keys = None
     if config.lda_mode == "multi_day_hourly":
-        hourly_aggregation_grouping_keys = ["calendar_day", "clock_hour_of_day"]
+        hourly_aggregation_grouping_keys = ["calendar_day", "sample_bin_index_of_day"]
         if config.separate_hourly_samples_by_run_root:
             hourly_aggregation_grouping_keys = [
                 column
@@ -3086,6 +3217,13 @@ def save_outputs(
         "feature_mode": str(feature_mode),
         "label_type": resolved_label_column,
         "configured_label_type": str(config.label_type),
+        "labels_randomized": bool(config.randomize_labels),
+        "label_randomization_seed": int(config.random_seed) if config.randomize_labels else None,
+        "label_randomization_method": (
+            "Global permutation of labels across retained LDA samples; feature vectors unchanged."
+            if config.randomize_labels
+            else None
+        ),
         "hourly_aggregation_grouping_keys": hourly_aggregation_grouping_keys,
         "bin_size_seconds": float(config.bin_size_seconds),
         "binned_bin_size_seconds": float(config.bin_size_seconds),
@@ -3094,6 +3232,7 @@ def save_outputs(
             if config.lda_mode == "multi_day_hourly"
             else None
         ),
+        "multi_day_sample_minutes": int(config.multi_day_sample_minutes),
         "min_firing_rate_hz": float(config.min_firing_rate_hz),
         "min_minutes_per_hour": int(config.min_minutes_per_hour),
         "apply_zscore": bool(config.apply_zscore),
@@ -3110,7 +3249,17 @@ def save_outputs(
         "n_minute_samples": int(binned_population_matrix.shape[0]) if config.lda_mode == "multi_day_hourly" else 0,
         "n_analysis_samples": int(analysis_population_matrix.shape[0]),
         "analysis_sample_output_name": sample_output_name,
-        "n_hour_samples": int(analysis_population_matrix.shape[0]) if config.lda_mode == "multi_day_hourly" else 0,
+        "n_aggregated_samples": (
+            int(analysis_population_matrix.shape[0])
+            if config.lda_mode == "multi_day_hourly"
+            else 0
+        ),
+        "n_hour_samples": (
+            int(analysis_population_matrix.shape[0])
+            if config.lda_mode == "multi_day_hourly"
+            and int(config.multi_day_sample_minutes) == 60
+            else 0
+        ),
         "n_features": int(analysis_population_matrix.shape[1]),
         "n_selected_unit_groups": int(selected_units["final_group_key"].nunique()),
         "n_sessions": int(binned_metadata_table["session_name"].nunique()),
@@ -3349,6 +3498,7 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
                 feature_table=feature_table,
                 waveform_weighting=config.hourly_waveform_weighting,
                 separate_by_run_root=config.separate_hourly_samples_by_run_root,
+                sample_minutes=config.multi_day_sample_minutes,
             )
             save_hourly_aggregation_cache(
                 config=config,
@@ -3404,6 +3554,13 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
 
     labels, resolved_label_column = resolve_label_series(analysis_metadata_table, config)
     labels = labels.to_numpy()
+    if config.randomize_labels:
+        analysis_metadata_table, labels = randomize_lda_labels(
+            analysis_metadata_table,
+            labels,
+            label_column=resolved_label_column,
+            random_seed=config.random_seed,
+        )
     print_lda_label_vector(analysis_metadata_table, labels=labels, label_column=resolved_label_column)
     config.label_type = resolved_label_column
 
@@ -3547,6 +3704,7 @@ def run_pipeline(config: Config) -> list[Path]:
             feature_table=feature_table,
             waveform_weighting=config.hourly_waveform_weighting,
             separate_by_run_root=config.separate_hourly_samples_by_run_root,
+            sample_minutes=config.multi_day_sample_minutes,
         )
         print_and_build_clock_hour_verification(analysis_metadata_table)
         print_clock_hour_sample_pivot(
@@ -3606,6 +3764,13 @@ def run_pipeline(config: Config) -> list[Path]:
     )
 
     labels = labels.to_numpy()
+    if config.randomize_labels:
+        analysis_metadata_table, labels = randomize_lda_labels(
+            analysis_metadata_table,
+            labels,
+            label_column=resolved_label_column,
+            random_seed=config.random_seed,
+        )
     print_lda_label_vector(analysis_metadata_table, labels=labels, label_column=resolved_label_column)
     config.label_type = resolved_label_column
 

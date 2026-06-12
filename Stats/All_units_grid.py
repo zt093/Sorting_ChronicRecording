@@ -20,9 +20,24 @@ DEFAULT_MS_BEFORE = 1.0
 DEFAULT_MS_AFTER = 2.0
 ACTIVE_WINDOW_LOWER_PERCENTILE = 5.0
 ACTIVE_WINDOW_UPPER_PERCENTILE = 95.0
-DEFAULT_MIN_SESSIONS_PRESENT = 15
-DEFAULT_MIN_SPIKES_AFTER_FILTER = 20
+DEFAULT_MIN_SESSIONS_PRESENT = 120
+DEFAULT_MIN_SPIKES_AFTER_FILTER = 0
 DEFAULT_WAVEFORM_ABS_THRESHOLD_UV = 2500.0
+
+# Easy-run settings for Auto_align_LDA_pre_tuning.py output.
+DEFAULT_INPUT_PATH = Path(r"S:\alignment_days_summary_260221_260226")
+SG_CHANNEL_MIN_AMPLITUDE_UV = {
+    279: 180.0,
+    283: 260.0,
+    311: 160.0,
+    329: 270.0,
+    331: 240.0,
+    332: 340.0,
+    337: 500.0,
+    341: 720.0,
+    348: 860.0,
+    365: 320.0,
+}
 
 # True: make one compact figure where each aligned unit is shown once as a summary cell.
 ALL_UNITS_ONLY = True
@@ -111,6 +126,13 @@ class AlignedUnitsGridConfig:
     min_sessions_present: int = DEFAULT_MIN_SESSIONS_PRESENT
     min_spikes_after_filter: int = DEFAULT_MIN_SPIKES_AFTER_FILTER
     waveform_abs_threshold_uv: float = DEFAULT_WAVEFORM_ABS_THRESHOLD_UV
+    selected_shank_ids: tuple[int, ...] | None = None
+    selected_final_unit_ids: tuple[int, ...] | None = None
+    sg_channel_min_amplitude_uv: dict[int, float] | None = field(
+        default_factory=lambda: dict(SG_CHANNEL_MIN_AMPLITUDE_UV)
+    )
+    min_peak_amplitude_uv: float | None = None
+    max_peak_amplitude_uv: float | None = None
     isi_range_ms: tuple[float, float] = (0.0, 50.0)
     isi_bin_ms: float = 1.0
     waveform_panel_width_ratio: float = 1.0
@@ -188,6 +210,18 @@ def load_alignment_groups_from_export_summary(
     session_order_lookup: dict[str, int] = {}
 
     for row_index, row in enumerate(manifest_rows):
+        sg_channel = row.get("sg_channel")
+        if sg_channel is None:
+            for day_member in row.get("day_members", []):
+                if day_member.get("sg_channel") is not None:
+                    sg_channel = day_member["sg_channel"]
+                    break
+        if sg_channel is None:
+            for member in row.get("members", []):
+                if member.get("sg_channel") is not None:
+                    sg_channel = member["sg_channel"]
+                    break
+
         members: list[AlignedUnitMember] = []
         for member in row.get("members", []):
             original_session_name = str(member["session_name"])
@@ -227,6 +261,7 @@ def load_alignment_groups_from_export_summary(
                     "representative_unit_id": row.get("representative_unit_id"),
                     "shank_id": row.get("shank_id"),
                     "local_channel_on_shank": row.get("local_channel_on_shank"),
+                    "sg_channel": sg_channel,
                     "export_folder": row.get("export_folder"),
                 },
             )
@@ -255,6 +290,48 @@ def filter_aligned_units_by_session_presence(
     return filtered
 
 
+def filter_aligned_units_by_selection(
+    aligned_groups: list[AlignedUnitGroup],
+    *,
+    selected_shank_ids: tuple[int, ...] | None = None,
+    selected_final_unit_ids: tuple[int, ...] | None = None,
+    selected_sg_channels: tuple[int, ...] | None = None,
+) -> list[AlignedUnitGroup]:
+    shank_ids = set(selected_shank_ids) if selected_shank_ids is not None else None
+    final_unit_ids = (
+        set(selected_final_unit_ids)
+        if selected_final_unit_ids is not None
+        else None
+    )
+    sg_channels = set(selected_sg_channels) if selected_sg_channels is not None else None
+
+    filtered: list[AlignedUnitGroup] = []
+    for group in aligned_groups:
+        shank_id = group.metadata.get("shank_id")
+        final_unit_id = group.metadata.get("final_unit_id")
+        sg_channel = group.metadata.get("sg_channel")
+        if shank_ids is not None:
+            try:
+                if int(shank_id) not in shank_ids:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if final_unit_ids is not None:
+            try:
+                if int(final_unit_id) not in final_unit_ids:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if sg_channels is not None:
+            try:
+                if int(sg_channel) not in sg_channels:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        filtered.append(group)
+    return filtered
+
+
 def resolve_output_png_path(
     export_summary_path: str | Path,
     output_png_path: str | Path | None = None,
@@ -264,27 +341,45 @@ def resolve_output_png_path(
     export_summary_path = Path(export_summary_path)
     if output_png_path is not None:
         return Path(output_png_path)
-    batch_root = export_summary_path.parent.parent
-    stats_candidates = [batch_root / "stats", batch_root / "Stats"]
+    summary_root = export_summary_path.parent
+    if summary_root.name == DEFAULT_ALIGNMENT_EXPORT_FOLDER_NAME:
+        output_root = summary_root.parent
+    else:
+        output_root = summary_root
+    stats_candidates = [output_root / "stats", output_root / "Stats"]
     stats_folder = next((path for path in stats_candidates if path.exists()), stats_candidates[0])
     stats_folder.mkdir(parents=True, exist_ok=True)
     return stats_folder / f"{stem}.png"
 
 
 def resolve_export_summary_path_from_batch_root(
-    batch_root: str | Path,
+    input_path: str | Path,
     *,
     export_folder_name: str = DEFAULT_ALIGNMENT_EXPORT_FOLDER_NAME,
     export_summary_name: str = DEFAULT_ALIGNMENT_EXPORT_SUMMARY_NAME,
 ) -> Path:
-    batch_root = Path(batch_root)
-    export_summary_path = batch_root / export_folder_name / export_summary_name
-    log_status(f"Looking for alignment export summary in: {batch_root}")
-    if export_summary_path.exists():
-        log_status(f"Found alignment export summary: {export_summary_path}")
-        return export_summary_path
+    input_path = Path(str(input_path).strip().strip("\"'")).expanduser()
+    log_status(f"Looking for alignment export summary in: {input_path}")
+
+    if input_path.is_file():
+        if input_path.name != export_summary_name:
+            raise FileNotFoundError(
+                f"Expected a file named {export_summary_name}, got: {input_path}"
+            )
+        log_status(f"Found alignment export summary: {input_path}")
+        return input_path
+
+    direct_path = input_path / export_summary_name
+    legacy_batch_path = input_path / export_folder_name / export_summary_name
+    for export_summary_path in (direct_path, legacy_batch_path):
+        if export_summary_path.is_file():
+            log_status(f"Found alignment export summary: {export_summary_path}")
+            return export_summary_path
+
     raise FileNotFoundError(
-        f"Could not find alignment export summary at: {export_summary_path}"
+        "Could not find an alignment export summary. Checked:\n"
+        f"  {direct_path}\n"
+        f"  {legacy_batch_path}"
     )
 
 
@@ -636,15 +731,33 @@ def prepare_aligned_units_grid_data(
         ]
         average_firing_rate_hz = float(np.mean(firing_rates)) if firing_rates else None
 
-        rows.append(
-            ProcessedAlignedUnitRow(
-                group_id=group.group_id,
-                members_present=len(unique_sessions),
-                cells_by_session=cells_by_session,
-                average_firing_rate_hz=average_firing_rate_hz,
-                metadata=dict(group.metadata),
-            )
+        processed_row = ProcessedAlignedUnitRow(
+            group_id=group.group_id,
+            members_present=len(unique_sessions),
+            cells_by_session=cells_by_session,
+            average_firing_rate_hz=average_firing_rate_hz,
+            metadata=dict(group.metadata),
         )
+        peak_amplitude_uv = row_peak_amplitude_uv(processed_row)
+        sg_channel = processed_row.metadata.get("sg_channel")
+        if config.sg_channel_min_amplitude_uv is not None:
+            try:
+                channel_threshold_uv = config.sg_channel_min_amplitude_uv[int(sg_channel)]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if peak_amplitude_uv < channel_threshold_uv:
+                continue
+        if (
+            config.min_peak_amplitude_uv is not None
+            and peak_amplitude_uv < config.min_peak_amplitude_uv
+        ):
+            continue
+        if (
+            config.max_peak_amplitude_uv is not None
+            and peak_amplitude_uv > config.max_peak_amplitude_uv
+        ):
+            continue
+        rows.append(processed_row)
         if group_index == 1 or group_index % 25 == 0 or group_index == len(candidate_groups):
             log_status(
                 f"Prepared row {group_index}/{len(candidate_groups)} "
@@ -693,7 +806,8 @@ def determine_rowwise_isi_y_limits(
             (int(np.max(cell.isi_counts)) for cell in row.cells_by_session.values()),
             default=0,
         )
-        row_limits[row.group_id] = (0.0, float(max(1, int(np.ceil(max_count * 1.05)))))
+        upper_limit = float(max(1, int(np.ceil(max_count * 1.05))))
+        row_limits[row.group_id] = (-0.03 * upper_limit, upper_limit)
     return row_limits
 
 
@@ -907,7 +1021,8 @@ def plot_all_units_only_grid(
         unique_units
     )
     max_isi_count = max((float(np.max(unit.isi_counts)) for unit in unique_units), default=1.0)
-    isi_ylim = (0.0, max(1.0, 1.05 * max_isi_count))
+    isi_upper_limit = max(1.0, 1.05 * max_isi_count)
+    isi_ylim = (-0.03 * isi_upper_limit, isi_upper_limit)
 
     units_per_row = max(1, int(units_per_row))
     grid_rows = int(np.ceil(len(unique_units) / float(units_per_row)))
@@ -1124,10 +1239,12 @@ def plot_aligned_units_summary_grid(
             base_col = 1 + session_index * 2
             ax_wf = fig.add_subplot(outer_grid[grid_row_index, base_col])
             ax_isi = fig.add_subplot(outer_grid[grid_row_index, base_col + 1])
+            for ax in (ax_wf, ax_isi):
+                ax.set_facecolor("white")
             if first_waveform_ax is None:
                 first_waveform_ax = ax_wf
 
-            if config.hide_axes:
+            if config.hide_axes or cell is None:
                 for ax in (ax_wf, ax_isi):
                     ax.set_xticks([])
                     ax.set_yticks([])
@@ -1135,8 +1252,6 @@ def plot_aligned_units_summary_grid(
                         spine.set_visible(False)
 
             if cell is None:
-                ax_wf.axis("off")
-                ax_isi.axis("off")
                 continue
 
             ax_wf.plot(
@@ -1275,6 +1390,54 @@ def save_aligned_units_summary_grid_from_export_summary(
         f"Loaded alignment summary with {len(ordered_sessions)} sessions and "
         f"{len(aligned_groups)} aligned groups."
     )
+    if (
+        config.min_peak_amplitude_uv is not None
+        and config.max_peak_amplitude_uv is not None
+        and config.min_peak_amplitude_uv > config.max_peak_amplitude_uv
+    ):
+        raise ValueError(
+            "min_peak_amplitude_uv cannot be greater than max_peak_amplitude_uv."
+        )
+    unfiltered_group_count = len(aligned_groups)
+    if config.sg_channel_min_amplitude_uv:
+        threshold_summary = ", ".join(
+            f"SG {channel}: >= {threshold:g} uV"
+            for channel, threshold in sorted(config.sg_channel_min_amplitude_uv.items())
+        )
+        log_status(f"Using channel-specific amplitude filters: {threshold_summary}")
+    aligned_groups = filter_aligned_units_by_selection(
+        aligned_groups,
+        selected_shank_ids=config.selected_shank_ids,
+        selected_final_unit_ids=config.selected_final_unit_ids,
+        selected_sg_channels=(
+            tuple(config.sg_channel_min_amplitude_uv)
+            if config.sg_channel_min_amplitude_uv is not None
+            else None
+        ),
+    )
+    if len(aligned_groups) != unfiltered_group_count:
+        log_status(
+            f"SG-channel/shank/unit selection kept {len(aligned_groups)} / "
+            f"{unfiltered_group_count} aligned groups."
+        )
+    if not aligned_groups:
+        raise ValueError(
+            "No aligned groups matched the requested SG-channel, shank, and final-unit filters."
+        )
+    presence_filtered_groups = filter_aligned_units_by_session_presence(
+        aligned_groups,
+        min_sessions_present=config.min_sessions_present,
+    )
+    if len(presence_filtered_groups) != len(aligned_groups):
+        log_status(
+            f"Minimum-session filtering kept {len(presence_filtered_groups)} / "
+            f"{len(aligned_groups)} selected aligned groups before analyzer loading."
+        )
+    aligned_groups = presence_filtered_groups
+    if not aligned_groups:
+        raise ValueError(
+            "No selected aligned groups met the minimum-session requirement."
+        )
     session_unit_data_lookup = load_session_unit_data_from_alignment_groups(
         aligned_groups,
         config=config,
@@ -1285,6 +1448,10 @@ def save_aligned_units_summary_grid_from_export_summary(
         session_unit_data_lookup=session_unit_data_lookup,
         config=config,
     )
+    if not processed_rows:
+        raise ValueError(
+            "No aligned units passed the session, spike-count, and amplitude filters."
+        )
     outputs: dict[str, list[Path]] = {}
 
     if ALL_UNITS_WITH_SESSIONS:
@@ -1385,7 +1552,7 @@ def choose_batch_root() -> Path:
     root.attributes("-topmost", True)
     try:
         selected_folder = filedialog.askdirectory(
-            title="Select a Sorting batch root (for example 260224_Sorting)",
+            title="Select a Sorting batch root or alignment_days_summary folder",
             mustexist=True,
             parent=root,
         )
@@ -1397,29 +1564,100 @@ def choose_batch_root() -> Path:
     return Path(selected_folder)
 
 
+def parse_integer_selection(value: str) -> tuple[int, ...]:
+    selected: set[int] = set()
+    for token in re.split(r"[,;\s]+", value.strip()):
+        if not token:
+            continue
+        if "-" in token:
+            start_text, separator, end_text = token.partition("-")
+            if not separator or not start_text or not end_text:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid integer range {token!r}; use a form such as 2-5."
+                )
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid integer range {token!r}."
+                ) from exc
+            if start > end:
+                raise argparse.ArgumentTypeError(
+                    f"Range start must not exceed range end: {token!r}."
+                )
+            selected.update(range(start, end + 1))
+            continue
+        try:
+            selected.add(int(token))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid integer value {token!r}."
+            ) from exc
+    if not selected:
+        raise argparse.ArgumentTypeError("Provide at least one integer value.")
+    return tuple(sorted(selected))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a compact aligned-units waveform/ISI grid from a Sorting batch root "
-            "(for example 260224_Sorting)."
+            "Build a compact aligned-units waveform/ISI grid from an auto-alignment "
+            "summary folder, export_summary.json, or a Sorting batch root."
         )
     )
     parser.add_argument(
-        "batch_root",
+        "input_path",
         nargs="?",
-        help="Sorting batch root folder that contains units_alignment_summary/export_summary.json",
+        help=(
+            "Auto-align output folder containing export_summary.json, the JSON file itself, "
+            "or a Sorting batch root containing units_alignment_summary/export_summary.json."
+        ),
     )
     parser.add_argument(
         "--output",
         dest="output_png_path",
-        help="Optional output PNG path. Defaults to stats/aligned_units_grid.png under the batch root.",
+        help="Optional output PNG path. Defaults to the resolved summary root's stats folder.",
+    )
+    parser.add_argument(
+        "--shanks",
+        type=parse_integer_selection,
+        help="Only plot these shank_id values; accepts commas and ranges, for example 0,2-4.",
+    )
+    parser.add_argument(
+        "--units",
+        type=parse_integer_selection,
+        help="Only plot these aligned final_unit_id values; for example 3,8,10-12.",
+    )
+    parser.add_argument(
+        "--min-amplitude-uv",
+        type=float,
+        help="Minimum row peak amplitude in uV (maximum absolute average waveform across sessions).",
+    )
+    parser.add_argument(
+        "--max-amplitude-uv",
+        type=float,
+        help="Maximum row peak amplitude in uV (maximum absolute average waveform across sessions).",
     )
     args = parser.parse_args()
+    if (
+        args.min_amplitude_uv is not None
+        and args.max_amplitude_uv is not None
+        and args.min_amplitude_uv > args.max_amplitude_uv
+    ):
+        parser.error("--min-amplitude-uv cannot exceed --max-amplitude-uv.")
 
-    batch_root = Path(args.batch_root) if args.batch_root else choose_batch_root()
+    input_path = Path(args.input_path) if args.input_path else DEFAULT_INPUT_PATH
+    config = AlignedUnitsGridConfig(
+        selected_shank_ids=args.shanks,
+        selected_final_unit_ids=args.units,
+        min_peak_amplitude_uv=args.min_amplitude_uv,
+        max_peak_amplitude_uv=args.max_amplitude_uv,
+    )
     output_png_paths_by_mode = save_aligned_units_summary_grid_from_batch_root(
-        batch_root,
+        input_path,
         output_png_path=args.output_png_path,
+        config=config,
     )
     for mode_name, paths in output_png_paths_by_mode.items():
         if len(paths) == 1:
@@ -1444,6 +1682,7 @@ __all__ = [
     "determine_rowwise_isi_y_limits",
     "determine_shared_waveform_limits",
     "example_usage",
+    "filter_aligned_units_by_selection",
     "filter_aligned_units_by_session_presence",
     "filter_noisy_waveforms",
     "load_alignment_groups_from_export_summary",
@@ -1451,6 +1690,7 @@ __all__ = [
     "load_session_unit_data_from_member",
     "plot_all_units_only_grid",
     "plot_aligned_units_summary_grid",
+    "parse_integer_selection",
     "prepare_aligned_units_grid_data",
     "resolve_export_summary_path_from_batch_root",
     "resolve_output_png_path",
