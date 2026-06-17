@@ -162,7 +162,6 @@ class Config:
     cv_n_splits: int = CV_N_SPLITS
     random_seed: int = RANDOM_SEED
     randomize_labels: bool = False
-    min_feature_finite_fraction: float = 0.10
     feature_modes: tuple[str, ...] = FEATURE_MODES
     min_minutes_per_hour: int = MIN_MINUTES_PER_HOUR
     n_permutations: int = N_PERMUTATIONS
@@ -1125,52 +1124,15 @@ def randomize_lda_labels(
 ) -> tuple[pd.DataFrame, np.ndarray]:
     randomized_metadata = metadata_table.copy()
     original_labels = np.asarray(labels).copy()
-    shuffle_indices = np.random.default_rng(int(random_seed)).permutation(len(original_labels))
-    randomized_labels = original_labels[shuffle_indices]
+    randomized_labels = np.random.default_rng(int(random_seed)).permutation(original_labels)
     randomized_metadata[f"original_{label_column}"] = original_labels
     randomized_metadata[label_column] = randomized_labels
-    randomized_metadata[f"{label_column}_randomization_source_row"] = shuffle_indices
-    randomized_metadata[f"source_original_{label_column}_for_randomized_label"] = original_labels[shuffle_indices]
     randomized_metadata["label_randomization_seed"] = int(random_seed)
-    unchanged_count = int(np.sum(original_labels == randomized_labels))
     log_status(
         f"Randomized {label_column} labels across {len(randomized_labels)} samples "
-        f"with seed {int(random_seed)}; class counts are preserved; "
-        f"{unchanged_count}/{len(randomized_labels)} labels stayed the same by chance."
+        f"with seed {int(random_seed)}; class counts are preserved."
     )
     return randomized_metadata, randomized_labels
-
-
-def summarize_label_randomization(
-    metadata_table: pd.DataFrame,
-    *,
-    label_column: str,
-) -> dict:
-    original_column = f"original_{label_column}"
-    if original_column not in metadata_table.columns or label_column not in metadata_table.columns:
-        return {
-            "enabled": False,
-            "audit_available": False,
-        }
-
-    original_labels = metadata_table[original_column].to_numpy()
-    fit_labels = metadata_table[label_column].to_numpy()
-    same_mask = original_labels == fit_labels
-    original_counts = pd.Series(original_labels).value_counts().sort_index()
-    fit_counts = pd.Series(fit_labels).value_counts().sort_index()
-    return {
-        "enabled": True,
-        "audit_available": True,
-        "original_label_column": original_column,
-        "fit_label_column": label_column,
-        "n_samples": int(len(fit_labels)),
-        "same_label_after_shuffle_count": int(np.sum(same_mask)),
-        "same_label_after_shuffle_fraction": float(np.mean(same_mask)) if len(same_mask) else np.nan,
-        "all_labels_identical_to_original": bool(np.all(same_mask)) if len(same_mask) else False,
-        "label_counts_preserved": bool(original_counts.equals(fit_counts)),
-        "original_label_counts": {str(key): int(value) for key, value in original_counts.items()},
-        "fit_label_counts": {str(key): int(value) for key, value in fit_counts.items()},
-    }
 
 
 def build_date_label_from_session_table(session_table: pd.DataFrame) -> str:
@@ -1402,61 +1364,6 @@ def subset_features_for_mode(
         for feature_index in range(1, len(filtered_feature_table) + 1)
     ]
     return filtered_population, filtered_feature_table
-
-
-def filter_mode_features_by_analysis_support(
-    binned_population_matrix: np.ndarray,
-    analysis_population_matrix: np.ndarray,
-    feature_table: pd.DataFrame,
-    *,
-    min_finite_fraction: float,
-    feature_mode: str,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    if analysis_population_matrix.shape[1] != len(feature_table):
-        raise ValueError("Analysis feature count does not match the feature table length.")
-    if binned_population_matrix.shape[1] != len(feature_table):
-        raise ValueError("Binned feature count does not match the feature table length.")
-    min_finite_fraction = float(min_finite_fraction)
-    if not 0.0 <= min_finite_fraction <= 1.0:
-        raise ValueError("min_feature_finite_fraction must be between 0 and 1.")
-
-    finite_mask = np.isfinite(analysis_population_matrix)
-    finite_counts = finite_mask.sum(axis=0)
-    n_samples = int(analysis_population_matrix.shape[0])
-    required_finite_count = max(2, int(np.ceil(min_finite_fraction * n_samples)))
-    raw_stds = np.nanstd(analysis_population_matrix, axis=0)
-    keep_mask = (
-        (finite_counts >= required_finite_count)
-        & np.isfinite(raw_stds)
-        & (raw_stds > np.finfo(float).eps)
-    )
-    if not np.any(keep_mask):
-        raise RuntimeError(
-            f"Feature mode {feature_mode} has no informative columns after requiring at least "
-            f"{required_finite_count}/{n_samples} finite samples and non-zero variance."
-        )
-
-    filtered_feature_table = feature_table.loc[keep_mask].reset_index(drop=True).copy()
-    filtered_feature_table["analysis_finite_count"] = finite_counts[keep_mask].astype(int)
-    filtered_feature_table["analysis_finite_fraction"] = (
-        finite_counts[keep_mask] / max(1, n_samples)
-    )
-    filtered_feature_table["analysis_raw_std"] = raw_stds[keep_mask]
-    filtered_feature_table["feature_column"] = [
-        f"feature_{feature_index:04d}"
-        for feature_index in range(1, len(filtered_feature_table) + 1)
-    ]
-    dropped_count = int(np.count_nonzero(~keep_mask))
-    log_status(
-        f"{feature_mode}: retained {int(np.count_nonzero(keep_mask))}/{len(keep_mask)} "
-        f"feature columns; dropped {dropped_count} with fewer than "
-        f"{required_finite_count} finite samples or zero variance."
-    )
-    return (
-        binned_population_matrix[:, keep_mask],
-        analysis_population_matrix[:, keep_mask],
-        filtered_feature_table,
-    )
 
 
 def filter_hourly_samples_by_min_minutes(
@@ -2901,9 +2808,6 @@ def feature_label_table(feature_table: pd.DataFrame) -> pd.DataFrame:
             "shank_id",
             "local_channel_on_shank",
             "feature_type",
-            "analysis_finite_count",
-            "analysis_finite_fraction",
-            "analysis_raw_std",
         ]
         if column in feature_table.columns
     ]
@@ -3220,7 +3124,6 @@ def save_outputs(
     log_status(f"Saved {file_prefix}_feature_map.csv")
 
     projection_df = pd.DataFrame(index=np.arange(len(analysis_metadata_table)))
-    projection_df["lda_fit_label"] = analysis_metadata_table[resolved_label_column].to_numpy()
     for dimension_index, column_name in enumerate(["LD1", "LD2", "LD3"]):
         if dimension_index < projection.shape[1]:
             projection_df[column_name] = projection[:, dimension_index]
@@ -3231,37 +3134,6 @@ def save_outputs(
         index=False,
     )
     log_status(f"Saved {file_prefix}_projection.csv")
-    label_randomization_audit = summarize_label_randomization(
-        analysis_metadata_table,
-        label_column=resolved_label_column,
-    )
-    if label_randomization_audit.get("audit_available", False):
-        audit_columns = [
-            column
-            for column in (
-                "final_sample_id",
-                "final_sample_key",
-                "calendar_day",
-                "sample_start_datetime",
-                f"original_{resolved_label_column}",
-                resolved_label_column,
-                f"{resolved_label_column}_randomization_source_row",
-                f"source_original_{resolved_label_column}_for_randomized_label",
-                "label_randomization_seed",
-            )
-            if column in analysis_metadata_table.columns
-        ]
-        label_audit_table = analysis_metadata_table[audit_columns].copy()
-        label_audit_table["lda_fit_label"] = analysis_metadata_table[resolved_label_column].to_numpy()
-        label_audit_table["label_changed_by_shuffle"] = (
-            analysis_metadata_table[f"original_{resolved_label_column}"].to_numpy()
-            != analysis_metadata_table[resolved_label_column].to_numpy()
-        )
-        label_audit_table.to_csv(
-            output_dir / f"{file_prefix}_label_randomization_audit.csv",
-            index=False,
-        )
-        log_status(f"Saved {file_prefix}_label_randomization_audit.csv")
     session_table.to_csv(output_dir / f"{file_prefix}_session_start_sources.csv", index=False)
     log_status(f"Saved {file_prefix}_session_start_sources.csv")
     verification_table.to_csv(output_dir / f"{file_prefix}_{verification_output_name}_verification.csv", index=False)
@@ -3352,7 +3224,6 @@ def save_outputs(
             if config.randomize_labels
             else None
         ),
-        "label_randomization_audit": label_randomization_audit,
         "hourly_aggregation_grouping_keys": hourly_aggregation_grouping_keys,
         "bin_size_seconds": float(config.bin_size_seconds),
         "binned_bin_size_seconds": float(config.bin_size_seconds),
@@ -3363,7 +3234,6 @@ def save_outputs(
         ),
         "multi_day_sample_minutes": int(config.multi_day_sample_minutes),
         "min_firing_rate_hz": float(config.min_firing_rate_hz),
-        "min_feature_finite_fraction": float(config.min_feature_finite_fraction),
         "min_minutes_per_hour": int(config.min_minutes_per_hour),
         "apply_zscore": bool(config.apply_zscore),
         "cross_validation_preprocessing": (
@@ -3707,17 +3577,6 @@ def run_pipeline_from_precomputed_csv(config: Config) -> list[Path]:
             feature_table=feature_table,
             feature_mode=feature_mode,
         )
-        (
-            mode_binned_population_matrix,
-            mode_analysis_population_matrix,
-            mode_feature_table,
-        ) = filter_mode_features_by_analysis_support(
-            binned_population_matrix=mode_binned_population_matrix,
-            analysis_population_matrix=mode_analysis_population_matrix,
-            feature_table=mode_feature_table,
-            min_finite_fraction=config.min_feature_finite_fraction,
-            feature_mode=feature_mode,
-        )
         raw_mode_analysis_population_matrix = mode_analysis_population_matrix.copy()
         mode_analysis_population_matrix = fill_missing_feature_values(mode_analysis_population_matrix)
         if config.apply_zscore:
@@ -3926,17 +3785,6 @@ def run_pipeline(config: Config) -> list[Path]:
         mode_analysis_population_matrix, _ = subset_features_for_mode(
             population_matrix=analysis_population_matrix,
             feature_table=feature_table,
-            feature_mode=feature_mode,
-        )
-        (
-            mode_binned_population_matrix,
-            mode_analysis_population_matrix,
-            mode_feature_table,
-        ) = filter_mode_features_by_analysis_support(
-            binned_population_matrix=mode_binned_population_matrix,
-            analysis_population_matrix=mode_analysis_population_matrix,
-            feature_table=mode_feature_table,
-            min_finite_fraction=config.min_feature_finite_fraction,
             feature_mode=feature_mode,
         )
         raw_mode_analysis_population_matrix = mode_analysis_population_matrix.copy()

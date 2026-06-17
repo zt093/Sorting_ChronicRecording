@@ -155,7 +155,6 @@ class PipelineConfig:
     lda_feature_modes: tuple[str, ...] = DEFAULT_LDA_FEATURE_MODES
     lda_use_waveform_features: bool = False
     min_firing_rate_hz: float = 0.0
-    min_feature_finite_fraction: float = 0.10
     lda_sample_minutes: int = 60
     min_minutes_per_hour: int = 1
     min_bins_per_label: int = 2
@@ -1114,7 +1113,6 @@ def run_lda(population_csv: Path, output_dir: Path, config: PipelineConfig) -> l
     lda_config.label_type = "clock_hour_of_day"
     lda_config.feature_modes = tuple(config.lda_feature_modes)
     lda_config.min_firing_rate_hz = float(config.min_firing_rate_hz)
-    lda_config.min_feature_finite_fraction = float(config.min_feature_finite_fraction)
     lda_config.multi_day_sample_minutes = int(config.lda_sample_minutes)
     lda_config.min_sessions_per_unit = 1
     lda_config.min_minutes_per_hour = int(config.min_minutes_per_hour)
@@ -4179,15 +4177,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-firing-rate-hz", type=float, default=0.0)
     parser.add_argument(
-        "--min-feature-finite-fraction",
-        type=float,
-        default=0.10,
-        help=(
-            "Minimum fraction of retained LDA samples with a finite value required for "
-            "each feature column. Sparse or constant columns are dropped before imputation."
-        ),
-    )
-    parser.add_argument(
         "--lda-sample-minutes",
         type=int,
         default=None,
@@ -4443,9 +4432,6 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
             "--min-minutes-per-hour cannot exceed --lda-sample-minutes. "
             "It is the minimum number of source minute rows required in each LDA sample."
         )
-    min_feature_finite_fraction = float(args.min_feature_finite_fraction)
-    if not 0.0 <= min_feature_finite_fraction <= 1.0:
-        raise ValueError("--min-feature-finite-fraction must be between 0 and 1.")
     return PipelineConfig(
         run_roots=run_roots,
         output_dir=Path(args.output_dir) if args.output_dir else None,
@@ -4455,7 +4441,6 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         lda_feature_modes=lda_feature_modes,
         lda_use_waveform_features=bool(use_waveform_features),
         min_firing_rate_hz=float(args.min_firing_rate_hz),
-        min_feature_finite_fraction=min_feature_finite_fraction,
         lda_sample_minutes=lda_sample_minutes,
         min_minutes_per_hour=int(args.min_minutes_per_hour),
         min_bins_per_label=int(args.min_bins_per_label),
